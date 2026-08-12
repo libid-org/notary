@@ -1,6 +1,6 @@
 [package]
 name = "notary"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # The real floor, inherited from libid-rs (and dyaka before it):
 #   * the `mpz` MPC dependency (via tlsn) uses `cfg_select!`, unstable
