@@ -237,6 +237,67 @@ const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
 /// How often the background sweep runs.
 const SESSION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Overall deadline for one prover connection (TCP or WebSocket), covering
+/// the whole MPC-TLS/ProxyMode session plus the attestation exchange. A real
+/// session completes in well under a minute even on a slow link; 5 minutes is
+/// generous headroom while staying far inside [`SESSION_TTL`] (30 min), which
+/// bounds the session *entry*, not the connection. This is defense in depth:
+/// whatever future bug makes a session pend, no connection can pin a handler
+/// task (and its MPC buffers) forever.
+const CONNECTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Owns a spawned task and aborts it on drop unless the handle was taken back
+/// out with [`AbortOnDrop::into_inner`].
+///
+/// Dropping a bare [`tokio::task::JoinHandle`] DETACHES the task rather than
+/// cancelling it, so every `?` early return below would leave the spawned
+/// driver (or WS pump) running unsupervised — each aborted connection then
+/// retains the task and its buffers. With this guard, cancellation is the
+/// default on every exit path, including panics and the caller dropping the
+/// future; the success path opts out by taking the handle back to join it.
+/// (Same shape as the guard inside `libid-tlsn`'s session functions.)
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// The wrapped handle, for polling the task without disarming the guard.
+    fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
+        self.0.as_mut().expect("handle present until into_inner")
+    }
+
+    /// Disarm the guard and hand the handle back for joining.
+    fn into_inner(mut self) -> tokio::task::JoinHandle<T> {
+        self.0.take().expect("handle present until into_inner")
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Error for a session driver that finished while session setup was still in
+/// flight. The driver only completes once the underlying socket is closed or
+/// dead, so a protocol request submitted to it may never resolve — without
+/// this check a connect-then-close client (the kubelet `tcpSocket` probe
+/// pattern) could wedge the handler forever.
+fn driver_finished_early<T, E: std::fmt::Display>(
+    result: std::result::Result<std::result::Result<T, E>, tokio::task::JoinError>,
+) -> Error {
+    let detail = match result {
+        Ok(Ok(_)) => "driver task finished before the session completed".into(),
+        Ok(Err(e)) => format!("driver task: {e}"),
+        Err(e) => format!("driver task join: {e}"),
+    };
+    Error::NotaryServer { detail }
+}
+
 /// Evict session entries older than [`SESSION_TTL`]. Returns the count evicted.
 /// Age is measured on a monotonic clock (`Instant`), so a wall-clock step never
 /// disables the sweep (unbounded-growth DoS) or early-evicts a live session.
@@ -839,7 +900,10 @@ async fn handle_ws_proxy_notarize(
     let (io_a, io_b) = tokio::io::duplex(1 << 17);
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    tokio::spawn(async move {
+    // Guarded: when this handler returns, the pump is aborted with it —
+    // otherwise a client that keeps the WebSocket open after the session
+    // failed would pin the pump task (and the socket) indefinitely.
+    let _pump_task = AbortOnDrop::new(tokio::spawn(async move {
         let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
         let ws_to_pipe = async {
             while let Some(Ok(msg)) = ws_rx.next().await {
@@ -872,10 +936,16 @@ async fn handle_ws_proxy_notarize(
             }
         };
         tokio::join!(ws_to_pipe, pipe_to_ws);
-    });
+    }));
 
-    if let Err(e) = run_proxy_verifier_session(io_b, &state, session_id).await {
-        error!("ProxyMode verifier error: {}", e);
+    let session = run_proxy_verifier_session(io_b, &state, session_id);
+    match tokio::time::timeout(CONNECTION_DEADLINE, session).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("ProxyMode verifier error: {}", e),
+        Err(_) => error!(
+            "ProxyMode session exceeded the {}s connection deadline; aborting",
+            CONNECTION_DEADLINE.as_secs()
+        ),
     }
 }
 
@@ -889,85 +959,106 @@ where
 {
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
-    let driver_task = tokio::spawn(driver);
+    // Guarded spawn: every exit path below — each `?`, panics, the caller
+    // dropping this future — aborts the driver instead of detaching it.
+    let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
-    let verifier = handle
-        .new_verifier(
-            VerifierConfig::builder()
-                .root_store(libid_tlsn::root_store())
-                .build()
-                .map_err(|e| Error::NotaryServer {
-                    detail: format!("verifier config: {e}"),
-                })?,
-        )
-        .map_err(|e| Error::NotaryServer {
-            detail: format!("new verifier: {e}"),
+    let setup = async {
+        let verifier = handle
+            .new_verifier(
+                VerifierConfig::builder()
+                    .root_store(libid_tlsn::root_store())
+                    .build()
+                    .map_err(|e| Error::NotaryServer {
+                        detail: format!("verifier config: {e}"),
+                    })?,
+            )
+            .map_err(|e| Error::NotaryServer {
+                detail: format!("new verifier: {e}"),
+            })?;
+
+        let verifier = verifier.commit().await.map_err(|e| Error::NotaryServer {
+            detail: format!("verifier commit: {e}"),
         })?;
 
-    let verifier = verifier.commit().await.map_err(|e| Error::NotaryServer {
-        detail: format!("verifier commit: {e}"),
-    })?;
+        let proxy_verifier = match verifier {
+            VerifierCommitStart::Proxy(v) => v,
+            _ => {
+                return Err(Error::NotaryServer {
+                    detail: "expected ProxyTls protocol, got other".into(),
+                });
+            }
+        };
 
-    let proxy_verifier = match verifier {
-        VerifierCommitStart::Proxy(v) => v,
-        _ => {
+        let server_name_str = proxy_verifier.config().server_name().as_str().to_string();
+        info!("ProxyMode: connecting to {server_name_str}:443");
+
+        let server_tcp = tokio::net::TcpStream::connect(format!("{server_name_str}:443"))
+            .await
+            .map_err(|e| Error::NotaryServer {
+                detail: format!("TCP connect to {server_name_str}: {e}"),
+            })?;
+
+        let verifier = proxy_verifier
+            .accept()
+            .await
+            .map_err(|e| Error::NotaryServer {
+                detail: format!("verifier accept: {e}"),
+            })?
+            .run(server_tcp.compat())
+            .await
+            .map_err(|e| Error::NotaryServer {
+                detail: format!("run_proxy: {e}"),
+            })?;
+
+        let verifier = verifier.verify().await.map_err(|e| Error::NotaryServer {
+            detail: format!("verifier verify: {e}"),
+        })?;
+
+        if !verifier.request().server_identity() {
+            verifier
+                .reject(Some("server identity is required"))
+                .await
+                .ok();
             return Err(Error::NotaryServer {
-                detail: "expected ProxyTls protocol, got other".into(),
+                detail: "prover did not request server identity reveal".into(),
             });
+        }
+
+        let (
+            VerifierOutput {
+                server_name,
+                transcript,
+                transcript_commitments,
+            },
+            verifier,
+        ) = verifier.accept().await.map_err(|e| Error::NotaryServer {
+            detail: format!("verifier output accept: {e}"),
+        })?;
+
+        verifier.close().await.map_err(|e| Error::NotaryServer {
+            detail: format!("verifier close: {e}"),
+        })?;
+        handle.close();
+
+        Ok((server_name, transcript, transcript_commitments))
+    };
+    tokio::pin!(setup);
+
+    // Race setup against the driver. The driver only finishes early when the
+    // connection died under the session (e.g. a client that connected and
+    // immediately closed) — a protocol request already submitted to it may
+    // then never resolve, so fail instead of pending forever.
+    let (server_name, transcript, transcript_commitments) = tokio::select! {
+        biased;
+        res = &mut setup => res?,
+        driver_res = driver_task.handle_mut() => {
+            return Err(driver_finished_early(driver_res));
         }
     };
 
-    let server_name_str = proxy_verifier.config().server_name().as_str().to_string();
-    info!("ProxyMode: connecting to {server_name_str}:443");
-
-    let server_tcp = tokio::net::TcpStream::connect(format!("{server_name_str}:443"))
-        .await
-        .map_err(|e| Error::NotaryServer {
-            detail: format!("TCP connect to {server_name_str}: {e}"),
-        })?;
-
-    let verifier = proxy_verifier
-        .accept()
-        .await
-        .map_err(|e| Error::NotaryServer {
-            detail: format!("verifier accept: {e}"),
-        })?
-        .run(server_tcp.compat())
-        .await
-        .map_err(|e| Error::NotaryServer {
-            detail: format!("run_proxy: {e}"),
-        })?;
-
-    let verifier = verifier.verify().await.map_err(|e| Error::NotaryServer {
-        detail: format!("verifier verify: {e}"),
-    })?;
-
-    if !verifier.request().server_identity() {
-        verifier
-            .reject(Some("server identity is required"))
-            .await
-            .ok();
-        return Err(Error::NotaryServer {
-            detail: "prover did not request server identity reveal".into(),
-        });
-    }
-
-    let (
-        VerifierOutput {
-            server_name,
-            transcript,
-            transcript_commitments,
-        },
-        verifier,
-    ) = verifier.accept().await.map_err(|e| Error::NotaryServer {
-        detail: format!("verifier output accept: {e}"),
-    })?;
-
-    verifier.close().await.map_err(|e| Error::NotaryServer {
-        detail: format!("verifier close: {e}"),
-    })?;
-    handle.close();
     driver_task
+        .into_inner()
         .await
         .map_err(|e| Error::NotaryServer {
             detail: format!("driver join: {e}"),
@@ -1290,7 +1381,10 @@ async fn handle_ws_prover(
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    tokio::spawn(async move {
+    // Guarded: when this handler returns, the pump is aborted with it —
+    // otherwise a client that keeps the WebSocket open after the session
+    // failed would pin the pump task (and the socket) indefinitely.
+    let _pump_task = AbortOnDrop::new(tokio::spawn(async move {
         let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
 
         let ws_to_pipe = async {
@@ -1326,10 +1420,16 @@ async fn handle_ws_prover(
         };
 
         tokio::join!(ws_to_pipe, pipe_to_ws);
-    });
+    }));
 
-    if let Err(e) = handle_notary_session(io_b, &state, session_id).await {
-        error!("WS notary handler error: {}", e);
+    let session = handle_notary_session(io_b, &state, session_id);
+    match tokio::time::timeout(CONNECTION_DEADLINE, session).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("WS notary handler error: {}", e),
+        Err(_) => error!(
+            "WS notary session exceeded the {}s connection deadline; aborting",
+            CONNECTION_DEADLINE.as_secs()
+        ),
     }
 }
 
@@ -1393,7 +1493,19 @@ async fn handle_tcp_prover<T>(socket: T, state: &NotaryState) -> Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
 {
-    handle_notary_session(socket, state, None).await
+    // Deadline on the WHOLE connection, not any single step: no TCP client —
+    // however broken — may pin this handler task past [`CONNECTION_DEADLINE`].
+    tokio::time::timeout(
+        CONNECTION_DEADLINE,
+        handle_notary_session(socket, state, None),
+    )
+    .await
+    .map_err(|_| Error::NotaryServer {
+        detail: format!(
+            "connection exceeded the {}s deadline",
+            CONNECTION_DEADLINE.as_secs()
+        ),
+    })?
 }
 
 async fn handle_notary_session<T>(
@@ -1844,5 +1956,62 @@ mod tests {
         // No suffix/substring leniency: only an exact (case-insensitive) match.
         assert!(check_server_identity("api.x.com.evil.example", "api.x.com").is_err());
         assert!(check_server_identity("notapi.x.com", "api.x.com").is_err());
+    }
+
+    /// A client that connects and then goes silent forever must not pin the
+    /// handler past [`CONNECTION_DEADLINE`] — defense in depth over the
+    /// fail-fast fixes, covering whatever future bug makes a session pend.
+    /// Paused time: the runtime auto-advances the clock to the deadline the
+    /// moment everything is blocked, so the test finishes in milliseconds.
+    #[tokio::test(start_paused = true)]
+    async fn silent_connection_hits_the_deadline() {
+        use std::{
+            collections::HashMap,
+            sync::Arc,
+        };
+
+        use libid_signer::SignerSource;
+        use tokio::sync::RwLock;
+
+        use super::{
+            handle_tcp_prover,
+            NotaryState,
+            CONNECTION_DEADLINE,
+        };
+
+        // anvil #0 — public test key.
+        let key_hex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let signer = SignerSource::from_spec(key_hex)
+            .unwrap()
+            .build_managed(None)
+            .await
+            .unwrap();
+        let state = NotaryState {
+            public_key_hex: hex::encode(signer.compressed_public_key()),
+            signer: Arc::new(signer),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            max_sessions: 8,
+            chain_id: 1,
+            zk_verifying_contract: [0x11; 20],
+            mpc_verifying_contract: [0x22; 20],
+            platform_name: "api.x.com".to_string(),
+            jwks_enabled: false,
+        };
+
+        // The client half stays open and never writes a byte.
+        let (_client, server) = tokio::io::duplex(1 << 16);
+
+        let started = tokio::time::Instant::now();
+        let err = handle_tcp_prover(server, &state)
+            .await
+            .expect_err("a silent connection must fail, not pend");
+        assert!(
+            err.to_string().contains("deadline"),
+            "expected the deadline error, got: {err}"
+        );
+        assert!(
+            started.elapsed() >= CONNECTION_DEADLINE,
+            "failed before the deadline — some step errored spuriously"
+        );
     }
 }
