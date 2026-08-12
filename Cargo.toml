@@ -27,9 +27,10 @@ path = "src/main.rs"
 # All five ride the same git source so their intra-workspace `path` deps
 # unify. The upstream `tlsn` git rev is pinned by libid-tlsn and arrives
 # transitively; the direct `tlsn` entry below MUST name the same rev.
-# TODO: switch the four publishable ones (crypto, transcript, attestations,
-# signer) to crates.io versions after libid-rs v0.1.0 releases. libid-tlsn
-# stays git-only until upstream tlsn publishes to crates.io.
+# All five come from the same release tag: libid-tlsn is git-only (upstream
+# tlsn is not on crates.io) and exposes sibling-crate types, so mixing the
+# crates.io copies with the git copy would put two incompatible versions of
+# the same types in the graph.
 libid-attestations = { git = "https://github.com/libid-org/libid-rs", tag = "v0.1.0" }
 libid-crypto = { git = "https://github.com/libid-org/libid-rs", tag = "v0.1.0" }
 libid-signer = { git = "https://github.com/libid-org/libid-rs", tag = "v0.1.0" }
