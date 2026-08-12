@@ -3533,7 +3533,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libid-attestations"
 version = "0.1.0"
-source = "git+https://github.com/libid-org/libid-rs?branch=main#a1e5ec80fff5ac5fc3e35381552a0df43e968314"
+source = "git+https://github.com/libid-org/libid-rs?tag=v0.1.0#a1e5ec80fff5ac5fc3e35381552a0df43e968314"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -3543,7 +3543,7 @@ dependencies = [
 [[package]]
 name = "libid-crypto"
 version = "0.1.0"
-source = "git+https://github.com/libid-org/libid-rs?branch=main#a1e5ec80fff5ac5fc3e35381552a0df43e968314"
+source = "git+https://github.com/libid-org/libid-rs?tag=v0.1.0#a1e5ec80fff5ac5fc3e35381552a0df43e968314"
 dependencies = [
  "hex",
  "k256",
@@ -3555,7 +3555,7 @@ dependencies = [
 [[package]]
 name = "libid-signer"
 version = "0.1.0"
-source = "git+https://github.com/libid-org/libid-rs?branch=main#a1e5ec80fff5ac5fc3e35381552a0df43e968314"
+source = "git+https://github.com/libid-org/libid-rs?tag=v0.1.0#a1e5ec80fff5ac5fc3e35381552a0df43e968314"
 dependencies = [
  "alloy",
  "aws-config",
@@ -3567,7 +3567,7 @@ dependencies = [
 [[package]]
 name = "libid-tlsn"
 version = "0.1.0"
-source = "git+https://github.com/libid-org/libid-rs?branch=main#a1e5ec80fff5ac5fc3e35381552a0df43e968314"
+source = "git+https://github.com/libid-org/libid-rs?tag=v0.1.0#a1e5ec80fff5ac5fc3e35381552a0df43e968314"
 dependencies = [
  "http-body-util",
  "hyper 1.11.0",
@@ -3584,7 +3584,7 @@ dependencies = [
 [[package]]
 name = "libid-transcript"
 version = "0.1.0"
-source = "git+https://github.com/libid-org/libid-rs?branch=main#a1e5ec80fff5ac5fc3e35381552a0df43e968314"
+source = "git+https://github.com/libid-org/libid-rs?tag=v0.1.0#a1e5ec80fff5ac5fc3e35381552a0df43e968314"
 dependencies = [
  "serde",
  "serde_json",

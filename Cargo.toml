@@ -30,11 +30,11 @@ path = "src/main.rs"
 # TODO: switch the four publishable ones (crypto, transcript, attestations,
 # signer) to crates.io versions after libid-rs v0.1.0 releases. libid-tlsn
 # stays git-only until upstream tlsn publishes to crates.io.
-libid-attestations = { git = "https://github.com/libid-org/libid-rs", branch = "main" }
-libid-crypto = { git = "https://github.com/libid-org/libid-rs", branch = "main" }
-libid-signer = { git = "https://github.com/libid-org/libid-rs", branch = "main" }
-libid-tlsn = { git = "https://github.com/libid-org/libid-rs", branch = "main" }
-libid-transcript = { git = "https://github.com/libid-org/libid-rs", branch = "main" }
+libid-attestations = { git = "https://github.com/libid-org/libid-rs", tag = "v0.1.0" }
+libid-crypto = { git = "https://github.com/libid-org/libid-rs", tag = "v0.1.0" }
+libid-signer = { git = "https://github.com/libid-org/libid-rs", tag = "v0.1.0" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.1.0" }
+libid-transcript = { git = "https://github.com/libid-org/libid-rs", tag = "v0.1.0" }
 
 # Upstream TLSNotary. The rev MUST equal libid-tlsn's pin (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible
