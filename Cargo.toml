@@ -1,0 +1,86 @@
+[package]
+name = "notary"
+version = "0.1.0"
+edition = "2021"
+# The real floor, inherited from libid-rs (and dyaka before it):
+#   * the `mpz` MPC dependency (via tlsn) uses `cfg_select!`, unstable
+#     before 1.94;
+#   * the AWS SDK crates (via libid-signer) declare 1.94.1.
+rust-version = "1.94.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/libid-org/notary"
+description = "The libID notary service: MPC-TLS / zkTLS notarization for platform sessions and notarized JWKS (OIDC) readings, under one notary identity."
+# A binary + companion library, never a registry crate: it names `tlsn`
+# (git-only upstream) in its manifest, which cargo refuses to publish.
+publish = false
+
+[lib]
+name = "notary"
+path = "src/lib.rs"
+
+[[bin]]
+name = "notary"
+path = "src/main.rs"
+
+[dependencies]
+# ── libid-rs shared crates ──────────────────────────────────────────────────
+# All five ride the same git source so their intra-workspace `path` deps
+# unify. The upstream `tlsn` git rev is pinned by libid-tlsn and arrives
+# transitively; the direct `tlsn` entry below MUST name the same rev.
+# TODO: switch the four publishable ones (crypto, transcript, attestations,
+# signer) to crates.io versions after libid-rs v0.1.0 releases. libid-tlsn
+# stays git-only until upstream tlsn publishes to crates.io.
+libid-attestations = { git = "https://github.com/libid-org/libid-rs", branch = "main" }
+libid-crypto = { git = "https://github.com/libid-org/libid-rs", branch = "main" }
+libid-signer = { git = "https://github.com/libid-org/libid-rs", branch = "main" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", branch = "main" }
+libid-transcript = { git = "https://github.com/libid-org/libid-rs", branch = "main" }
+
+# Upstream TLSNotary. The rev MUST equal libid-tlsn's pin (same source →
+# cargo unifies to one copy; a divergent rev would produce two incompatible
+# `tlsn` crates and type errors at the libid-tlsn boundary). The wasm bundle
+# script reads this pin back out of Cargo.lock so the browser prover can
+# never drift onto a different tlsn version than the server.
+tlsn = { git = "https://github.com/tlsnotary/tlsn", rev = "040c6881f3ec65ea042de134a0586b23cf382443" }
+
+# ── Solidity ABI mirrors (JwksOracle wire types) ────────────────────────────
+alloy-primitives = { version = "1", features = ["serde"] }
+alloy-sol-types = "1"
+
+# ── server ──────────────────────────────────────────────────────────────────
+anyhow = "1.0"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "signal",
+    "time",
+] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── JWKS role ───────────────────────────────────────────────────────────────
+base64 = "0.22"
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+# Plain-TLS JWKS fetch for the mock prover only.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_with = { version = "3", features = ["hex"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+tokio = { version = "1", features = ["test-util"] }

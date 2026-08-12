@@ -1,0 +1,56 @@
+name: Custom Docker image
+
+# Build and push an image from ANY ref — a branch, a tag, or a bare commit —
+# without cutting a release. The image lands at
+#   ghcr.io/libid-org/notary:custom-<tag-suffix>
+# so a testing deployment can point at exactly the code under review while
+# `:latest` and the version tags keep meaning "released".
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag or commit SHA)"
+        required: true
+        default: "main"
+      tag-suffix:
+        description: "Image tag suffix: the image is pushed as custom-<suffix>"
+        required: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/notary
+
+jobs:
+  docker:
+    name: Build ${{ inputs.ref }} → custom-${{ inputs['tag-suffix'] }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        env:
+          SUFFIX: ${{ inputs['tag-suffix'] }}
+        run: |
+          set -euo pipefail
+          # The suffix becomes a docker tag: restrict it to docker-tag-safe
+          # characters up front so a typo fails here, not deep inside docker.
+          if ! [[ "$SUFFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$ ]]; then
+            echo "::error::tag-suffix '$SUFFIX' is not a valid docker tag fragment"
+            exit 1
+          fi
+          tag="$IMAGE:custom-$SUFFIX"
+          docker build -t "$tag" .
+          docker push "$tag"
+          echo "Pushed $tag ($(git rev-parse HEAD))"
