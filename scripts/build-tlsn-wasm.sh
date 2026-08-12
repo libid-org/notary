@@ -162,7 +162,12 @@ echo "[tlsn-wasm] building (large MPC crate; the first build is slow)…"
 # rewriting the spawn.js snippet's import to ../../../tlsn_wasm.js and copying it
 # to the package root — consumers serve tlsn_wasm.js and spawn.js side by side
 # and rewrite /:path+/spawn.js to the root copy.
-(cd "$SRC/crates/wasm" && CARGO_TARGET_DIR="$CACHE_DIR/target" sh build.sh)
+#
+# RUSTFLAGS is cleared deliberately: an ambient value (CI sets -D warnings)
+# OVERRIDES the crate's .cargo/config.toml rustflags, which carry the
+# +atomics,+bulk-memory,+mutable-globals wasm features web-spawn requires.
+(cd "$SRC/crates/wasm" && env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+    CARGO_TARGET_DIR="$CACHE_DIR/target" sh build.sh)
 
 PKG="$SRC/crates/wasm/pkg"
 for f in tlsn_wasm.js tlsn_wasm_bg.wasm spawn.js; do
