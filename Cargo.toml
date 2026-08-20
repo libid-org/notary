@@ -24,18 +24,19 @@ path = "src/main.rs"
 
 [dependencies]
 # ── libid-rs shared crates ──────────────────────────────────────────────────
-# All five ride the same git source so their intra-workspace `path` deps
+# All six ride the same git source so their intra-workspace `path` deps
 # unify. The upstream `tlsn` git rev is pinned by libid-tlsn and arrives
 # transitively; the direct `tlsn` entry below MUST name the same rev.
-# All five come from the same release tag: libid-tlsn is git-only (upstream
+# All six come from the same release tag: libid-tlsn is git-only (upstream
 # tlsn is not on crates.io) and exposes sibling-crate types, so mixing the
 # crates.io copies with the git copy would put two incompatible versions of
 # the same types in the graph.
-libid-attestations = { git = "https://github.com/libid-org/libid-rs", tag = "v0.2.0" }
-libid-crypto = { git = "https://github.com/libid-org/libid-rs", tag = "v0.2.0" }
-libid-signer = { git = "https://github.com/libid-org/libid-rs", tag = "v0.2.0" }
-libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.2.0" }
-libid-transcript = { git = "https://github.com/libid-org/libid-rs", tag = "v0.2.0" }
+libid-attestations = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
+libid-ceremony = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
+libid-crypto = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
+libid-signer = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
+libid-transcript = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
 
 # Upstream TLSNotary. The rev MUST equal libid-tlsn's pin (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible
@@ -85,3 +86,4 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
 ] }
 tokio = { version = "1", features = ["test-util"] }
+

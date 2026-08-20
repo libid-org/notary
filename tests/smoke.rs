@@ -35,8 +35,6 @@ fn test_config(ws_port: u16) -> NotaryServerConfig {
         &ws_port.to_string(),
         "--signing-key",
         TEST_KEY,
-        "--x-zk-verifier-address",
-        "0x1111111111111111111111111111111111111111",
         "--verifying-contract",
         "0x2222222222222222222222222222222222222222",
     ])

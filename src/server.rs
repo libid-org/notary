@@ -60,13 +60,7 @@ use futures_util::{
     SinkExt,
     StreamExt,
 };
-use libid_attestations::{
-    compute_me_attest_digest,
-    compute_notary_digest,
-    compute_token_attest_digest,
-    MeAttestInput,
-    TokenAttestInput,
-};
+use libid_attestations::compute_notary_digest;
 use libid_crypto::{
     double_hash_leaf,
     keccak256,
@@ -108,6 +102,10 @@ use tlsn::{
         ServerName,
         TranscriptLength,
     },
+    transcript::{
+        PartialTranscript,
+        TranscriptCommitment,
+    },
     verifier::{
         VerifierCommitStart,
         VerifierOutput,
@@ -134,10 +132,7 @@ use tracing::{
 };
 
 use crate::{
-    config::{
-        parse_hex_address,
-        NotaryServerConfig,
-    },
+    config::NotaryServerConfig,
     error::{
         Error,
         Result,
@@ -172,31 +167,24 @@ impl NotaryServerHandle {
 
 // ─── Session state ───────────────────────────────────────────────────────────
 
-/// Raw TLSN reveal data captured during `run_proxy_verifier_session`.
-/// The on-demand attestation handler signs either a token or a /me
-/// attestation digest from this based on the `session_type` hint.
-#[derive(Default, Clone)]
-pub struct RawAttestationData {
-    /// Bearer hash-commit (SHA256(bearer || blinder)) from TLSN.
-    pub bearer_hash: [u8; 32],
-    /// Range covering the bearer in its source direction (sent for /me,
-    /// recv for /token).
-    pub bearer_range_start: u32,
-    /// End offset (exclusive) of the bearer range.
-    pub bearer_range_end: u32,
-    /// All sent-direction bytes the prover revealed (concatenated if multiple
-    /// ranges were revealed; today: prefix range and optional 2-byte CRLF
-    /// trailer for /me's H1 anchor).
-    pub sent_revealed: Vec<u8>,
-    /// End offset (exclusive) of the first revealed sent range.
-    pub sent_prefix_end: u32,
-    /// End offset (exclusive) of the second revealed sent range, or 0 if
-    /// only one range was revealed (e.g. /token path).
-    pub sent_suffix_end: u32,
-    /// All recv-direction bytes the prover revealed.
-    pub recv_revealed: Vec<u8>,
-    /// Unix seconds when the session completed.
-    pub timestamp: u64,
+/// What a completed session hands the attestation endpoint.
+///
+/// The session's own tlsn output, kept whole. The previous shape flattened it
+/// into one bearer hash, one range and two revealed blobs, which cannot express
+/// the attested data of ceremony-common section 9.1: the received direction
+/// carried no offsets at all, only one commitment was admissible, and the
+/// transcript lengths were nowhere. Keeping the tlsn types and mapping them at
+/// signing time is what makes those expressible.
+#[derive(Clone)]
+pub struct SessionAttestation {
+    /// The revealed transcript, with its authenticated ranges and lengths.
+    pub partial: PartialTranscript,
+    /// The DNS name the notary authenticated in the TLS handshake.
+    pub authority: String,
+    /// Every commitment the session produced.
+    pub commitments: Vec<TranscriptCommitment>,
+    /// The notary's OWN clock when the session completed (REQ-COMMON-57).
+    pub created_at: u64,
 }
 
 struct SessionEntry {
@@ -205,7 +193,7 @@ struct SessionEntry {
     /// Raw revealed data captured at session completion. The notary signs an
     /// on-demand token or /me attestation digest from this when the browser
     /// fetches via `GET /zk/proxy/attestation/{session_id}`.
-    raw_attest: Option<RawAttestationData>,
+    raw_attest: Option<SessionAttestation>,
     /// Notified when `evm_proof_result` or `raw_attest` is populated so
     /// fetch-handlers wake up immediately instead of polling.
     ready: Arc<tokio::sync::Notify>,
@@ -336,7 +324,6 @@ struct NotaryState {
     /// deployments without cross-chain replay.
     chain_id: u64,
     /// ZK verifier (e.g. `XZkVerifier`) address for the hash-commit digests.
-    zk_verifying_contract: [u8; 20],
     /// `verifyingContract` for the MPC-TLS digest (`Registry` in wallet
     /// deployments, `GitHubIdentityVerifier` in identity deployments).
     mpc_verifying_contract: [u8; 20],
@@ -406,7 +393,6 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         "notary signer ready"
     );
     let public_key_hex = hex::encode(signer.compressed_public_key());
-    let zk_verifying_contract = parse_hex_address(&config.x_zk_verifier_address)?;
     let mpc_verifying_contract = config.resolve_verifying_contract()?;
     let state = NotaryState {
         signer: Arc::new(signer),
@@ -414,7 +400,6 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         max_sessions: config.max_sessions,
         public_key_hex,
         chain_id: config.chain_id,
-        zk_verifying_contract,
         mpc_verifying_contract,
         platform_name: config.platform_name,
         jwks_enabled: config.jwks_enabled,
@@ -624,67 +609,59 @@ async fn evm_proof_handler(
 /// Query parameters for the on-demand attestation endpoint.
 #[derive(Debug, Deserialize)]
 struct AttestationQuery {
-    /// "token" or "me".
+    /// Which session of the ceremony this attestation covers: `token` or
+    /// `identity`. It selects the `operationTag` and nothing else.
     session_type: Option<String>,
-    /// /me only: claimed handle string (notary signs over its keccak).
-    handle: Option<String>,
-    /// /me only: immutable platform user-id (notary signs over its keccak).
-    user_id: Option<String>,
-    /// /me only: session key the wallet will register (hex `0x...`).
-    session_addr: Option<String>,
 }
 
-/// Token attestation wire JSON.
+/// Attestation wire JSON.
+///
+/// The attested data and the signature over it, and nothing else. The notary
+/// places no handle, account identifier, client identifier or chain address in
+/// the signed bytes (REQ-COMMON-61): every one is derivable from the revealed
+/// ranges, and a second signed representation can disagree with the bytes it
+/// was taken from. That is why this endpoint no longer takes `handle`,
+/// `user_id` or `session_addr` -- the Platform Verifier reads them itself, and
+/// the notary deciding them would be the profile-specific judgement
+/// REQ-COMMON-33 forbids it.
 #[derive(Debug, Serialize)]
-struct TokenAttestationWire {
-    bearer_hash: Vec<u8>,
-    bearer_range_start: u32,
-    bearer_range_end: u32,
-    sent_revealed: Vec<u8>,
-    timestamp: u64,
-    notary_signature: Vec<u8>,
-}
-
-/// /me attestation wire JSON.
-#[derive(Debug, Serialize)]
-struct MeAttestationWire {
-    bearer_hash: Vec<u8>,
-    bearer_range_start: u32,
-    bearer_range_end: u32,
-    sent_revealed: Vec<u8>,
-    sent_prefix_end: u32,
-    sent_suffix_end: u32,
-    recv_revealed: Vec<u8>,
-    handle: String,
-    user_id: String,
-    session_addr: String,
-    timestamp: u64,
+struct AttestationWire {
+    /// The exact bytes of ceremony-common section 9.1.
+    attested_data: Vec<u8>,
+    /// EIP-191 over `keccak256(attested_data)`. The verifying side derives the
+    /// key from this pair alone and accepts no caller-supplied digest
+    /// (REQ-COMMON-49).
     notary_signature: Vec<u8>,
 }
 
 /// Fetch a notary-signed attestation for a completed TLSNotary session.
 ///
-/// `?session_type=` selects the digest shape:
-///   - `token` → returns `TokenAttestationWire` signed with `OP_TOKEN_ATTEST`.
-///   - `me` → returns `MeAttestationWire` signed with `OP_ME_ATTEST`; requires
-///     `handle` + `user_id` + `session_addr` query params.
-///   - missing → 400 BAD_REQUEST.
+/// `?session_type=token|identity` picks which session of the ceremony the
+/// attestation says it covers. That is the only choice a caller gets: the
+/// notary decides nothing profile-specific (REQ-COMMON-33), and everything else
+/// in the attested data comes from what it observed.
 async fn proxy_attestation_handler(
     Path(session_id): Path<String>,
     Query(query): Query<AttestationQuery>,
     State(state): State<NotaryState>,
 ) -> impl IntoResponse {
-    if query.session_type.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "?session_type=token|me required"})),
-        )
-            .into_response();
-    }
+    let operation_tag = match query.session_type.as_deref() {
+        Some("token") => libid_ceremony::profile::TOKEN_SESSION_TAG,
+        Some("identity") => libid_ceremony::profile::IDENTITY_SESSION_TAG,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"error": "?session_type=token|identity required"}),
+                ),
+            )
+                .into_response();
+        }
+    };
 
     let start = tokio::time::Instant::now();
     let budget = tokio::time::Duration::from_secs(60);
-    let raw: RawAttestationData = loop {
+    let session: SessionAttestation = loop {
         let notify = {
             let sessions = state.sessions.read().await;
             let Some(entry) = sessions.get(&session_id) else {
@@ -710,168 +687,53 @@ async fn proxy_attestation_handler(
         let _ = tokio::time::timeout(remaining, notify.notified()).await;
     };
 
-    let session_type = query.session_type.as_deref().unwrap_or("");
-    let platform_name = state.platform_name.as_str();
-    let verifying_contract = state.zk_verifying_contract;
-    let chain_id = state.chain_id;
+    let attested = match libid_tlsn::attest::attested_data(
+        &session.partial,
+        &session.authority,
+        &session.commitments,
+        libid_tlsn::attest::AttestationInput {
+            format_tag: libid_ceremony::profile::FORMAT_TAG,
+            platform_name: state.platform_name.as_str(),
+            operation_tag,
+            created_at: session.created_at,
+        },
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("attested data: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
-    match session_type {
-        "token" => {
-            let input = TokenAttestInput {
-                chain_id,
-                verifying_contract: &verifying_contract,
-                platform_name,
-                bearer_hash: &raw.bearer_hash,
-                bearer_range_start: raw.bearer_range_start,
-                bearer_range_end: raw.bearer_range_end,
-                sent_revealed: &raw.sent_revealed,
-                timestamp: raw.timestamp,
-            };
-            let digest = compute_token_attest_digest(&input);
-            match state.signer.sign_claim(&digest).await.map_err(Error::from) {
-                Ok(sig) => {
-                    let resp = TokenAttestationWire {
-                        bearer_hash: raw.bearer_hash.to_vec(),
-                        bearer_range_start: raw.bearer_range_start,
-                        bearer_range_end: raw.bearer_range_end,
-                        sent_revealed: raw.sent_revealed,
-                        timestamp: raw.timestamp,
-                        notary_signature: sig,
-                    };
-                    (StatusCode::OK, Json(resp)).into_response()
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("sign: {e}")})),
-                )
-                    .into_response(),
-            }
+    let encoded = match attested.encode() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("encode: {e}")})),
+            )
+                .into_response();
         }
-        "me" => {
-            let handle = match query.handle.as_deref() {
-                Some(h) if !h.is_empty() => h,
-                _ => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "?handle= required for me"})),
-                    )
-                        .into_response();
-                }
-            };
-            // Bound handle length + reject control bytes so we
-            // don't sign a runaway string into the digest.
-            if handle.len() > 32
-                || handle.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n')
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "handle must be 1..=32 chars and free of NUL/CR/LF"
-                    })),
-                )
-                    .into_response();
-            }
-            // Immutable platform user-id: REQUIRED (receiver key is id-derived, no
-            // handle fallback). Reject empty up front so it fails actionably
-            // here instead of an opaque on-chain IdNotFound revert later.
-            // Same length/control-byte bound as the handle.
-            let user_id = query.user_id.as_deref().unwrap_or("");
-            if user_id.is_empty()
-                || user_id.len() > 32
-                || user_id.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n')
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "user_id must be 1..=32 chars and free of NUL/CR/LF"
-                    })),
-                )
-                    .into_response();
-            }
-            // Don't attest an id the prover didn't reveal: require `"id":"<id>"`
-            // in recv (mirrors XZkVerifier._verifyIdInRecv).
-            {
-                let needle = format!("\"id\":\"{user_id}\"");
-                let nb = needle.as_bytes();
-                if !raw.recv_revealed.windows(nb.len()).any(|w| w == nb) {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "user_id not found in revealed recv transcript"
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-            let session_addr_str = match query.session_addr.as_deref() {
-                Some(s) => s,
-                None => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(
-                            serde_json::json!({"error": "?session_addr= required for me"}),
-                        ),
-                    )
-                        .into_response();
-                }
-            };
-            let session_addr_bytes = match parse_hex_address(session_addr_str) {
-                Ok(a) => a,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                        .into_response();
-                }
-            };
-            let input = MeAttestInput {
-                chain_id,
-                verifying_contract: &verifying_contract,
-                platform_name,
-                bearer_hash: &raw.bearer_hash,
-                bearer_range_start: raw.bearer_range_start,
-                bearer_range_end: raw.bearer_range_end,
-                sent_revealed: &raw.sent_revealed,
-                sent_prefix_end: raw.sent_prefix_end,
-                sent_suffix_end: raw.sent_suffix_end,
-                recv_revealed: &raw.recv_revealed,
-                handle,
-                user_id,
-                session_addr: &session_addr_bytes,
-                timestamp: raw.timestamp,
-            };
-            let digest = compute_me_attest_digest(&input);
-            match state.signer.sign_claim(&digest).await.map_err(Error::from) {
-                Ok(sig) => {
-                    let resp = MeAttestationWire {
-                        bearer_hash: raw.bearer_hash.to_vec(),
-                        bearer_range_start: raw.bearer_range_start,
-                        bearer_range_end: raw.bearer_range_end,
-                        sent_revealed: raw.sent_revealed,
-                        sent_prefix_end: raw.sent_prefix_end,
-                        sent_suffix_end: raw.sent_suffix_end,
-                        recv_revealed: raw.recv_revealed,
-                        handle: handle.to_string(),
-                        user_id: user_id.to_string(),
-                        session_addr: format!("0x{}", hex::encode(session_addr_bytes)),
-                        timestamp: raw.timestamp,
-                        notary_signature: sig,
-                    };
-                    (StatusCode::OK, Json(resp)).into_response()
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("sign: {e}")})),
-                )
-                    .into_response(),
-            }
-        }
-        other => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!("unknown session_type: {other}")
-            })),
+    };
+
+    // The notary signs `keccak256(attestedData)` and no other preimage
+    // (REQ-COMMON-47).
+    let digest = libid_crypto::keccak256(&encoded);
+    match state.signer.sign_claim(&digest).await.map_err(Error::from) {
+        Ok(notary_signature) => (
+            StatusCode::OK,
+            Json(AttestationWire {
+                attested_data: encoded,
+                notary_signature,
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("sign: {e}")})),
         )
             .into_response(),
     }
@@ -1093,170 +955,28 @@ where
 
     // ── Extract the single hash commit per session ──
     //
-    // Convention (X hash-commit flow, token-only circuit):
-    //   /token: ONE recv hash commit — bearer-value bytes of the
-    //           `"access_token":"..."` JSON range.
-    //   /me:    ONE sent hash commit — bearer bytes only. Username is
-    //           REVEALED on recv (not committed).
-    //
-    // We extract range positions (start/end) from the commit's RangeSet
-    // and stash them in `RawAttestationData`; the typed attestation digest
-    // is signed on demand by `proxy_attestation_handler` when the browser
-    // fetches `GET /zk/proxy/attestation/{session_id}?session_type=`.
-    let mut sent_bearer: Option<([u8; 32], u32, u32)> = None;
-    let mut recv_commit: Option<([u8; 32], u32, u32)> = None;
-    for commit in &transcript_commitments {
-        let tlsn::transcript::TranscriptCommitment::Hash(plaintext_hash) = commit else {
-            continue;
-        };
-        let value: [u8; 32] =
-            plaintext_hash
-                .hash
-                .value
-                .as_bytes()
-                .try_into()
-                .map_err(|_| Error::NotaryServer {
-                    detail: "hash commitment value is not 32 bytes".into(),
-                })?;
-        let start =
-            u32::try_from(plaintext_hash.idx.min().unwrap_or(0)).map_err(|_| {
-                Error::NotaryServer {
-                    detail: "commit range start exceeds u32".into(),
-                }
-            })?;
-        let total_len =
-            u32::try_from(plaintext_hash.idx.len()).map_err(|_| Error::NotaryServer {
-                detail: "commit range length exceeds u32".into(),
-            })?;
-        let end = start
-            .checked_add(total_len)
-            .ok_or_else(|| Error::NotaryServer {
-                detail: "commit range end overflow".into(),
-            })?;
-        // Reject multiple commits per direction: the browser ZK flow emits
-        // exactly one bearer commit per session (/me: Sent, /token: Recv).
-        // Silently taking the last one would yield a notarized hash that
-        // doesn't match what the prover reveals on-chain, surfacing as an
-        // opaque `bearer_hash` mismatch at the verifier instead of an
-        // actionable notary-side error.
-        match plaintext_hash.direction {
-            tlsn::transcript::Direction::Sent => {
-                if sent_bearer.is_some() {
-                    return Err(Error::NotaryServer {
-                        detail: "unexpected extra Sent hash commit \
-                            (browser ZK flow emits exactly one)"
-                            .into(),
-                    });
-                }
-                sent_bearer = Some((value, start, end));
-            }
-            tlsn::transcript::Direction::Received => {
-                if recv_commit.is_some() {
-                    return Err(Error::NotaryServer {
-                        detail: "unexpected extra Recv hash commit \
-                            (browser ZK flow emits exactly one)"
-                            .into(),
-                    });
-                }
-                recv_commit = Some((value, start, end));
-            }
-        }
-    }
+    // Keep the session's own output rather than flattening it. Which ranges a
+    // profile expects, and what their bytes must contain, is the Platform
+    // Verifier's business (REQ-COMMON-51); the notary answers only for what it
+    // observed. The range-count rules that used to live here encoded one
+    // endpoint's shape into the notary, which is exactly the profile-specific
+    // decision REQ-COMMON-33 forbids it from making.
+    let Some(partial) = partial_transcript else {
+        return Err(Error::NotaryServer {
+            detail: "session revealed no transcript".into(),
+        });
+    };
 
-    // `bearer_from_sent` = endpoint shape (/me: Sent header, /token: Recv body).
-    // Used below to bind the sent-range count to the endpoint.
-    let (bearer_hash, bearer_start, bearer_end, bearer_from_sent) =
-        match (sent_bearer, recv_commit) {
-            // /me: sent bearer commit only (username is REVEALED on recv).
-            (Some((bh, bs, be)), None) => (bh, bs, be, true),
-            // /token: recv-only commit (the bearer).
-            (None, Some((rh, rs, re))) => (rh, rs, re, false),
-            _ => {
-                return Err(Error::NotaryServer {
-                    detail: "expected /me (sent-only) or /token (recv-only) commit shape"
-                        .into(),
-                });
-            }
-        };
-
-    // Capture sent + recv revealed bytes SEPARATELY so the on-demand
-    // attestation builder can sign either a TokenAttestation (sent body
-    // with client_id) or a MeAttestation (sent prefix + recv handle chunk).
-    //
-    // SECURITY: enforce a single contiguous sent revealed range. Multiple
-    // ranges would let a prover skip arbitrary middle bytes from the
-    // signed digest while the on-chain prefix/suffix structural check
-    // still passes.
-    // /token reveals exactly 1 sent range (client_id substring). /me reveals
-    // exactly 2 sent ranges: the request prefix ending in `authorization:
-    // Bearer ` AND the 2-byte CRLF after the bearer (H1 end anchor). Anything
-    // else is rejected here so a malformed prover cannot smuggle skipped
-    // middle bytes.
-    let mut sent_revealed: Vec<u8> = Vec::new();
-    let mut recv_revealed: Vec<u8> = Vec::new();
-    let mut sent_prefix_end: u32 = 0;
-    let mut sent_suffix_end: u32 = 0;
-    if let Some(ref pt) = partial_transcript {
-        let sent = pt.sent_unsafe();
-        let recv = pt.received_unsafe();
-        let sent_ranges: Vec<_> = pt.sent_authed().iter().collect();
-        // Range count is tied to the endpoint shape: /token reveals exactly 1
-        // sent range (client_id); /me reveals exactly 2 (prefix + CRLF anchor).
-        match (bearer_from_sent, sent_ranges.len()) {
-            // /token: single client_id range.
-            (false, 1) => {
-                let r = &sent_ranges[0];
-                sent_revealed.extend_from_slice(&sent[r.clone()]);
-                sent_prefix_end =
-                    u32::try_from(r.end).map_err(|_| Error::NotaryServer {
-                        detail: "revealed range end exceeds u32".into(),
-                    })?;
-            }
-            // /me: prefix range + 2-byte CRLF end anchor (H1).
-            (true, 2) => {
-                let r0 = &sent_ranges[0];
-                let r1 = &sent_ranges[1];
-                sent_revealed.extend_from_slice(&sent[r0.clone()]);
-                sent_revealed.extend_from_slice(&sent[r1.clone()]);
-                sent_prefix_end =
-                    u32::try_from(r0.end).map_err(|_| Error::NotaryServer {
-                        detail: "revealed range end exceeds u32".into(),
-                    })?;
-                sent_suffix_end =
-                    u32::try_from(r1.end).map_err(|_| Error::NotaryServer {
-                        detail: "revealed range end exceeds u32".into(),
-                    })?;
-            }
-            (false, n) => {
-                return Err(Error::NotaryServer {
-                    detail: format!("/token expects 1 sent revealed range, got {n}"),
-                });
-            }
-            (true, n) => {
-                return Err(Error::NotaryServer {
-                    detail: format!("/me expects 2 sent revealed ranges, got {n}"),
-                });
-            }
-        }
-        for range in pt.received_authed().iter() {
-            recv_revealed.extend_from_slice(&recv[range.clone()]);
-        }
-    }
-
-    let timestamp = SystemTime::now()
+    let created_at = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    let raw_attest = RawAttestationData {
-        bearer_hash,
-        bearer_range_start: bearer_start,
-        bearer_range_end: bearer_end,
-        sent_revealed,
-        sent_prefix_end,
-        sent_suffix_end,
-        recv_revealed,
-        timestamp,
+    let raw_attest = SessionAttestation {
+        partial,
+        authority: dns_name.as_str().to_string(),
+        commitments: transcript_commitments.clone(),
+        created_at,
     };
 
     if let Some(ref sid) = session_id {
@@ -1728,10 +1448,9 @@ pub async fn run_proxy_verifier_for_test<T>(
     socket: T,
     signer: Arc<ManagedSigner>,
     chain_id: u64,
-    zk_verifying_contract: [u8; 20],
     mpc_verifying_contract: [u8; 20],
     platform_name: String,
-) -> Result<RawAttestationData>
+) -> Result<SessionAttestation>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
@@ -1741,7 +1460,6 @@ where
         max_sessions: 1024,
         public_key_hex: String::new(),
         chain_id,
-        zk_verifying_contract,
         mpc_verifying_contract,
         platform_name,
         jwks_enabled: false,
@@ -1847,11 +1565,22 @@ mod tests {
             time::Duration,
         };
 
+        use tlsn::transcript::Transcript;
+
         use super::{
             sweep_stale_sessions,
-            RawAttestationData,
+            SessionAttestation,
             SessionEntry,
             SESSION_TTL,
+        };
+
+        // Any completed session will do; the sweep only cares that one exists.
+        let produced = SessionAttestation {
+            partial: Transcript::new(&b"GET / HTTP/1.1"[..], &b"HTTP/1.1 200 OK"[..])
+                .to_partial(Default::default(), Default::default()),
+            authority: "api.x.com".to_string(),
+            commitments: Vec::new(),
+            created_at: 0,
         };
 
         let sessions = Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -1864,7 +1593,7 @@ mod tests {
             m.insert(
                 "produced".to_string(),
                 SessionEntry {
-                    raw_attest: Some(RawAttestationData::default()),
+                    raw_attest: Some(produced),
                     ..SessionEntry::default()
                 },
             );

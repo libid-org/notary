@@ -36,13 +36,6 @@ pub struct NotaryServerConfig {
     #[arg(long, env = "CHAIN_ID", default_value = "31337")]
     pub chain_id: u64,
 
-    /// Address (`0x...`) of the ZK verifier contract (e.g. `XZkVerifier`)
-    /// that will recover the notary signature on the hash-commit (token/me)
-    /// attestation digests. Domain-separates the digest — this is the
-    /// per-platform verifier proxy address.
-    #[arg(long, env = "X_ZK_VERIFIER_ADDRESS")]
-    pub x_zk_verifier_address: String,
-
     /// Address (`0x...`) of the contract that recovers the MPC-TLS notary
     /// signature (bound into the digest as the EIP-712-style
     /// `verifyingContract`). In wallet deployments this is the `Registry`;
