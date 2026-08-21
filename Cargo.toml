@@ -2,7 +2,7 @@
 name = "notary"
 version = "0.2.0"
 edition = "2021"
-# The real floor, inherited from libid-rs (and dyaka before it):
+# The real floor, inherited from libid-rs (and the original monorepo before it):
 #   * the `mpz` MPC dependency (via tlsn) uses `cfg_select!`, unstable
 #     before 1.94;
 #   * the AWS SDK crates (via libid-signer) declare 1.94.1.
