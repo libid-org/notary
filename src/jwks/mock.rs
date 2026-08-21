@@ -182,7 +182,7 @@ async fn fetch_jwks(url: &str) -> Result<Vec<u8>> {
 
 /// Compute the same notary digest the contract verifies in `_notaryDigest`.
 /// Thin re-export of [`libid_attestations::compute_jwks_notary_digest`], kept
-/// under the name the dyaka codebase used.
+/// under the name the original codebase used.
 pub fn notary_digest(
     domain_hash: [u8; 32],
     client_random: [u8; 32],
