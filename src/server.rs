@@ -605,7 +605,7 @@ async fn evm_proof_handler(
         .into_response()
 }
 
-// ─── ProxyMode ZK: hash-commit attestation endpoint ──────────────────────────
+// ─── Ceremony attestation endpoint, either transport ─────────────────────────
 
 /// Attestation wire JSON.
 ///
@@ -962,7 +962,7 @@ where
             match sessions.get_mut(sid) {
                 Some(entry) => {
                     entry.raw_attest = Some(raw_attest);
-                    info!("ProxyMode: stored raw attestation data for session {sid}");
+                    info!("ProxyMode: stored attestation source for session {sid}");
                     Some(entry.ready.clone())
                 }
                 None => {
