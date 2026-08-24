@@ -73,6 +73,9 @@ where
                 },
             ))
         },
+        // Nobody waits on a JWKS rotation the way a user waits on a claim: the
+        // keeper runs it on a timer and reads the result.
+        |_| {},
     )
     .await?;
     Ok(result)
