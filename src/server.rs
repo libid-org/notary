@@ -13,15 +13,12 @@
 //!   browser client.
 //! - **GET  /notarize-proxy?sessionId=…** (WS upgrade): ProxyMode session for
 //!   WASM browser client (the primary browser path).
-//! - **GET  /evm-proof/:session_id**: returns the `NotaryResponse` after the
-//!   MPC-TLS session completes (long-poll).
 //! - **GET  /attestation/:session_id**: signs the attested data of a completed
 //!   session, MPC-TLS or ProxyMode alike -- the record is built from what the
 //!   session revealed, and that does not depend on how the bytes reached the
 //!   notary. Takes no parameters: there is nothing in the record a caller
 //!   could choose.
 //! - **GET  /proxy** (WS upgrade): raw TCP proxy used by the tlsn-js MPC path.
-//! - **GET  /notary** (WS upgrade): legacy TCP-over-WS path.
 //!
 //! # Trust model
 //!
@@ -191,15 +188,13 @@ pub struct SessionAttestation {
 }
 
 struct SessionEntry {
-    /// Set once the MPC-TLS session completes and EVM proof is computed.
-    evm_proof_result: Option<NotaryResponse>,
     /// What the session revealed, captured at completion, from which the
     /// notary signs the section 9.1 record on demand at
     /// `GET /attestation/{session_id}`. Both transports fill it: the record
     /// describes what was observed, not how it arrived.
     raw_attest: Option<SessionAttestation>,
-    /// Notified when `evm_proof_result` or `raw_attest` is populated so
-    /// fetch-handlers wake up immediately instead of polling.
+    /// Notified when `raw_attest` is populated so the attestation handler
+    /// wakes up immediately instead of polling.
     ready: Arc<tokio::sync::Notify>,
     /// When the entry was created. Monotonic (`tokio::time::Instant`) so a
     /// wall-clock step can't disable or mis-fire the background sweep. Used to
@@ -210,7 +205,6 @@ struct SessionEntry {
 impl Default for SessionEntry {
     fn default() -> Self {
         Self {
-            evm_proof_result: None,
             raw_attest: None,
             ready: Arc::new(tokio::sync::Notify::new()),
             created_at: tokio::time::Instant::now(),
@@ -490,12 +484,9 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
             .route("/info", get(info_handler))
             .route("/session", post(session_handler))
             .route("/notarize", get(notarize_ws_handler))
-            .route("/evm-proof/{session_id}", get(evm_proof_handler))
             .route("/attestation/{session_id}", get(attestation_handler))
             .route("/proxy", get(ws_proxy_handler))
             .route("/notarize-proxy", get(notarize_proxy_ws_handler))
-            // Legacy path kept for backward compat
-            .route("/notary", get(notary_legacy_ws_handler))
             .layer(cors)
             .with_state(ws_state);
 
@@ -568,41 +559,6 @@ fn admit_session(map: &mut HashMap<String, SessionEntry>, max: usize) -> bool {
         });
     }
     map.len() < max
-}
-
-async fn evm_proof_handler(
-    Path(session_id): Path<String>,
-    State(state): State<NotaryState>,
-) -> impl IntoResponse {
-    let start = tokio::time::Instant::now();
-    let budget = tokio::time::Duration::from_secs(60);
-    loop {
-        let notify = {
-            let sessions = state.sessions.read().await;
-            let Some(entry) = sessions.get(&session_id) else {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": "session not found"})),
-                )
-                    .into_response();
-            };
-            if let Some(ref notary_response) = entry.evm_proof_result {
-                let json = serde_json::to_value(notary_response).unwrap_or_default();
-                return (StatusCode::OK, Json(json)).into_response();
-            }
-            entry.ready.clone()
-        };
-        let remaining = budget.checked_sub(start.elapsed()).unwrap_or_default();
-        if remaining.is_zero() {
-            break;
-        }
-        let _ = tokio::time::timeout(remaining, notify.notified()).await;
-    }
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"error": "proof not yet ready"})),
-    )
-        .into_response()
 }
 
 // ─── Ceremony attestation endpoint, either transport ─────────────────────────
@@ -1061,14 +1017,6 @@ async fn notarize_ws_handler(
     ws.on_upgrade(move |socket| handle_ws_prover(socket, state, query.session_id))
 }
 
-/// Legacy `/notary` endpoint (for the old Rust TCP-over-WS path).
-async fn notary_legacy_ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<NotaryState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_prover(socket, state, None))
-}
-
 async fn handle_ws_prover(
     socket: WebSocket,
     state: NotaryState,
@@ -1390,10 +1338,10 @@ where
         evm_proof,
     };
 
-    // Both results, for browser retrieval by session id: the pre-ceremony EVM
-    // proof, and the ceremony attestation source that `GET /attestation/{id}`
-    // signs on demand. Which one a caller wants is the caller's business; the
-    // transport does not decide it.
+    // The attestation source, for retrieval by session id at
+    // `GET /attestation/{id}`. The pre-ceremony `NotaryResponse` goes over the
+    // wire below and nowhere else -- the REST endpoint that also served it had
+    // no caller, because the only prover on this path reads it from the socket.
     let raw_attest = SessionAttestation {
         partial: ceremony_partial,
         authority: domain.clone(),
@@ -1409,9 +1357,8 @@ where
             let mut sessions = state.sessions.write().await;
             match sessions.get_mut(sid) {
                 Some(entry) => {
-                    entry.evm_proof_result = Some(notary_response.clone());
                     entry.raw_attest = Some(raw_attest);
-                    info!("MPC-TLS: stored EVM proof and attestation source for session {sid}");
+                    info!("MPC-TLS: stored attestation source for session {sid}");
                     Some(entry.ready.clone())
                 }
                 None => {
