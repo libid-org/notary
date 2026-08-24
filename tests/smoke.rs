@@ -86,10 +86,10 @@ async fn info_session_and_longpoll_endpoints_work() {
     // in the record a caller could choose -- so the only thing it can refuse is
     // a session it never observed.
     let resp = client
-        .get(format!("{base}/zk/proxy/attestation/never-observed"))
+        .get(format!("{base}/attestation/never-observed"))
         .send()
         .await
-        .expect("GET /zk/proxy/attestation");
+        .expect("GET /attestation");
     assert_eq!(
         resp.status(),
         404,

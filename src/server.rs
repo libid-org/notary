@@ -15,9 +15,11 @@
 //!   WASM browser client (the primary browser path).
 //! - **GET  /evm-proof/:session_id**: returns the `NotaryResponse` after the
 //!   MPC-TLS session completes (long-poll).
-//! - **GET  /zk/proxy/attestation/:session_id**: signs the attested data of a
-//!   completed ProxyMode session. Takes no parameters -- there is nothing in
-//!   the record a caller could choose.
+//! - **GET  /attestation/:session_id**: signs the attested data of a completed
+//!   session, MPC-TLS or ProxyMode alike -- the record is built from what the
+//!   session revealed, and that does not depend on how the bytes reached the
+//!   notary. Takes no parameters: there is nothing in the record a caller
+//!   could choose.
 //! - **GET  /proxy** (WS upgrade): raw TCP proxy used by the tlsn-js MPC path.
 //! - **GET  /notary** (WS upgrade): legacy TCP-over-WS path.
 //!
@@ -191,9 +193,10 @@ pub struct SessionAttestation {
 struct SessionEntry {
     /// Set once the MPC-TLS session completes and EVM proof is computed.
     evm_proof_result: Option<NotaryResponse>,
-    /// Raw revealed data captured at session completion. The notary signs an
-    /// on-demand token or /me attestation digest from this when the browser
-    /// fetches via `GET /zk/proxy/attestation/{session_id}`.
+    /// What the session revealed, captured at completion, from which the
+    /// notary signs the section 9.1 record on demand at
+    /// `GET /attestation/{session_id}`. Both transports fill it: the record
+    /// describes what was observed, not how it arrived.
     raw_attest: Option<SessionAttestation>,
     /// Notified when `evm_proof_result` or `raw_attest` is populated so
     /// fetch-handlers wake up immediately instead of polling.
@@ -488,10 +491,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
             .route("/session", post(session_handler))
             .route("/notarize", get(notarize_ws_handler))
             .route("/evm-proof/{session_id}", get(evm_proof_handler))
-            .route(
-                "/zk/proxy/attestation/{session_id}",
-                get(proxy_attestation_handler),
-            )
+            .route("/attestation/{session_id}", get(attestation_handler))
             .route("/proxy", get(ws_proxy_handler))
             .route("/notarize-proxy", get(notarize_proxy_ws_handler))
             // Legacy path kept for backward compat
@@ -627,14 +627,15 @@ struct AttestationWire {
     notary_signature: Vec<u8>,
 }
 
-/// Fetch a notary-signed attestation for a completed TLSNotary session.
+/// Fetch a notary-signed attestation for a completed TLSNotary session, of
+/// either transport.
 ///
 /// The caller gets no choice at all. Everything in the attested data is either
 /// something the notary observed -- the authenticated server name, the
 /// transcript lengths, the ranges the client revealed and the commitments over
 /// the rest -- or its own clock reading, which REQ-COMMON-57 requires it to
 /// supply. There is nothing left for a query parameter to select.
-async fn proxy_attestation_handler(
+async fn attestation_handler(
     Path(session_id): Path<String>,
     State(state): State<NotaryState>,
 ) -> impl IntoResponse {
@@ -1243,6 +1244,14 @@ where
         return Ok(());
     }
 
+    // The ceremony record is transport-agnostic. It is built from what the
+    // session revealed, the server the notary authenticated, the commitments
+    // over the rest, and the notary's own clock -- and an MPC-TLS session
+    // produces all four exactly as a ProxyMode one does. Captured here, before
+    // `result` is taken apart for the tlsn attestation below.
+    let ceremony_partial = result.partial_transcript.clone();
+    let ceremony_commitments = result.transcript_commitments.clone();
+
     let mut io = result.recovered_io;
     let att_request: Request = read_msg(&mut io).await?;
     info!("Received attestation request from prover");
@@ -1381,14 +1390,28 @@ where
         evm_proof,
     };
 
-    // Store EVM proof for browser retrieval via REST if sessionId is provided
+    // Both results, for browser retrieval by session id: the pre-ceremony EVM
+    // proof, and the ceremony attestation source that `GET /attestation/{id}`
+    // signs on demand. Which one a caller wants is the caller's business; the
+    // transport does not decide it.
+    let raw_attest = SessionAttestation {
+        partial: ceremony_partial,
+        authority: domain.clone(),
+        commitments: ceremony_commitments,
+        created_at: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+
     if let Some(ref sid) = session_id {
         let notify = {
             let mut sessions = state.sessions.write().await;
             match sessions.get_mut(sid) {
                 Some(entry) => {
                     entry.evm_proof_result = Some(notary_response.clone());
-                    info!("Stored EVM proof for session {}", sid);
+                    entry.raw_attest = Some(raw_attest);
+                    info!("MPC-TLS: stored EVM proof and attestation source for session {sid}");
                     Some(entry.ready.clone())
                 }
                 None => {
@@ -1417,7 +1440,7 @@ where
 /// `libid_attestations::compute_*_attest_digest`.
 ///
 /// The browser path runs this implicitly via the `/notarize-proxy` WS
-/// handler + `GET /zk/proxy/attestation/{sid}` HTTP fetch; this helper
+/// handler + `GET /attestation/{sid}` HTTP fetch; this helper
 /// short-circuits both for in-process e2e tests.
 #[doc(hidden)]
 pub async fn run_proxy_verifier_for_test<T>(
