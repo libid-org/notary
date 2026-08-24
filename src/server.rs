@@ -6,7 +6,9 @@
 //!   Dispatches on the TLS-cert-verified server name after verification:
 //!   `www.googleapis.com` sessions are answered with a signed
 //!   [`crate::jwks::JwksNotaryResponse`] (JWKS rotation duty); every other
-//!   session with the platform [`NotaryResponse`].
+//!   session with the pre-ceremony [`NotaryResponse`] followed by the section
+//!   9.1 ceremony attestation, both written back down the socket the prover
+//!   opened.
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
 //! - **POST /session**: creates a session, returns `{sessionId}` — tlsn-js API.
 //! - **GET  /notarize-proxy?sessionId=…** (WS upgrade): ProxyMode session for
@@ -18,10 +20,15 @@
 //!
 //! # Trust model
 //!
-//! The notary is one half of a 2-of-2 trust scheme. It signs the
-//! transcript root after participating as the MPC-TLS verifier or ProxyMode
-//! verifier. Its signature alone does NOT register an identity on-chain — the
-//! ZK circuit or smart contract verifies the signature against the notary pubkey.
+//! The notary is one half of a 2-of-2 trust scheme. Having taken part as the
+//! MPC-TLS or ProxyMode verifier, it signs what it observed: the section 9.1
+//! attested data for a ceremony, and a Merkle transcript root for the
+//! pre-ceremony path that has not been retired yet.
+//!
+//! Its signature alone registers nothing. A contract on the Consumer Chain
+//! authenticates it -- the Notary Service of ceremony-common section 9.1 --
+//! and NOT the proving circuit: an attestation is authenticated on chain, and
+//! the circuit proves only what cannot be read from authenticated evidence.
 
 use std::{
     collections::HashMap,
@@ -316,14 +323,16 @@ struct NotaryState {
     /// Max concurrent live sessions (`NOTARY_MAX_SESSIONS`).
     max_sessions: usize,
     public_key_hex: String,
-    /// EVM chain id the contracts that consume these attestations run on.
-    /// Baked into the signed digest as part of the EIP-712-style domain
-    /// separator so a single notary signing key can serve multiple
-    /// deployments without cross-chain replay.
+    /// EVM chain id, and the `verifyingContract` that goes with it, for the
+    /// pre-ceremony [`compute_notary_digest`] and nothing else.
+    ///
+    /// The ceremony record carries neither, deliberately: it describes an
+    /// observed session and says nothing about where the evidence will be
+    /// spent, so one attestation serves every chain that trusts the key. These
+    /// two fields are the last thing here that names one chain, and they go
+    /// with the digest that needs them.
     chain_id: u64,
-    /// ZK verifier (e.g. `XZkVerifier`) address for the hash-commit digests.
-    /// `verifyingContract` for the MPC-TLS digest (`Registry` in wallet
-    /// deployments, `GitHubIdentityVerifier` in identity deployments).
+    /// See [`Self::chain_id`].
     mpc_verifying_contract: [u8; 20],
     /// SNI / `platformName` the verifier on-chain is configured for.
     platform_name: String,
@@ -674,8 +683,9 @@ async fn attestation_handler(
 //
 // The browser (prover) connects here as a WebSocket. The notary runs the
 // ProxyMode verifier: it forwards raw TLS bytes between the browser and the
-// target server, verifies the TLS transcript via ZK tags, then receives the
-// prover's reveal request and captures the raw attestation data.
+// target server, authenticates the transcript against the record layer's own
+// tags, then receives the prover's reveal request and captures what the
+// session disclosed.
 
 async fn notarize_proxy_ws_handler(
     ws: WebSocketUpgrade,
@@ -860,17 +870,22 @@ where
             detail: format!("driver: {e}"),
         })?;
 
-    // Both sessions reveal authed sent bytes: /token the `client_id=` slice,
-    // /me the request prefix + CRLF end anchor (H1) plus the recv username.
+    // What the prover chose to reveal is not read here and not judged here.
+    // Which ranges a profile expects belongs to the Platform Verifier
+    // (REQ-COMMON-51), and this used to name them -- one endpoint's shape
+    // written into the notary, which is the profile-specific decision
+    // REQ-COMMON-33 forbids it from making.
     let server_name = server_name.ok_or_else(|| Error::NotaryServer {
         detail: "prover did not reveal server name".into(),
     })?;
     let ServerName::Dns(ref dns_name) = server_name;
     let domain = dns_name.as_str().to_string();
 
-    // The digest attests `platform_name`, but the prover picks the server_name
-    // and any WebPKI-valid cert passes. Pin the cert-verified server identity
-    // to the platform, else a prover attests api.x.com from an attacker server.
+    // The record attests the cert-verified server name as `authorityId`, and
+    // the prover picks which server that is -- any WebPKI-valid certificate
+    // passes. This notary instance serves one platform, so pin the verified
+    // identity to it: otherwise a prover reaches an attacker's server and
+    // walks away with an attestation naming it, signed by this key.
     check_server_identity(&domain, &state.platform_name)?;
 
     let partial_transcript = transcript;
