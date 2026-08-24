@@ -995,24 +995,17 @@ where
 {
     // Deadline on the WHOLE connection, not any single step: no TCP client —
     // however broken — may pin this handler task past [`CONNECTION_DEADLINE`].
-    tokio::time::timeout(
-        CONNECTION_DEADLINE,
-        handle_notary_session(socket, state, None),
-    )
-    .await
-    .map_err(|_| Error::NotaryServer {
-        detail: format!(
-            "connection exceeded the {}s deadline",
-            CONNECTION_DEADLINE.as_secs()
-        ),
-    })?
+    tokio::time::timeout(CONNECTION_DEADLINE, handle_notary_session(socket, state))
+        .await
+        .map_err(|_| Error::NotaryServer {
+            detail: format!(
+                "connection exceeded the {}s deadline",
+                CONNECTION_DEADLINE.as_secs()
+            ),
+        })?
 }
 
-async fn handle_notary_session<T>(
-    socket: T,
-    state: &NotaryState,
-    session_id: Option<String>,
-) -> Result<()>
+async fn handle_notary_session<T>(socket: T, state: &NotaryState) -> Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
 {
@@ -1193,45 +1186,41 @@ where
         evm_proof,
     };
 
-    // The attestation source, for retrieval by session id at
-    // `GET /attestation/{id}`. The pre-ceremony `NotaryResponse` goes over the
-    // wire below and nowhere else -- the REST endpoint that also served it had
-    // no caller, because the only prover on this path reads it from the socket.
-    let raw_attest = SessionAttestation {
-        partial: ceremony_partial,
-        authority: domain.clone(),
-        commitments: ceremony_commitments,
-        created_at: SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+    // The ceremony record goes over the wire, to the prover that asked for it.
+    //
+    // It used to be stashed in the session map for `GET /attestation/{id}` to
+    // pick up, which was unreachable here: the only entry to this function is
+    // the TCP listener, and it has no session id to stash under. That was the
+    // browser's mechanism, and the browser does not do MPC. The prover on this
+    // path opened the socket and reads its results off it.
+    let attested = libid_tlsn::attest::attested_data(
+        &ceremony_partial,
+        &domain,
+        &ceremony_commitments,
+        libid_tlsn::attest::AttestationInput {
+            created_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        },
+    )
+    .map_err(|e| Error::NotaryServer {
+        detail: format!("attested data: {e}"),
+    })?;
+    let encoded = attested.encode().map_err(|e| Error::NotaryServer {
+        detail: format!("encode attested data: {e}"),
+    })?;
+    let ceremony_attestation = AttestationWire {
+        notary_signature: state
+            .signer
+            .sign_claim(&libid_crypto::keccak256(&encoded))
+            .await?,
+        attested_data: encoded,
     };
 
-    if let Some(ref sid) = session_id {
-        let notify = {
-            let mut sessions = state.sessions.write().await;
-            match sessions.get_mut(sid) {
-                Some(entry) => {
-                    entry.raw_attest = Some(raw_attest);
-                    info!("MPC-TLS: stored attestation source for session {sid}");
-                    Some(entry.ready.clone())
-                }
-                None => {
-                    warn!(
-                        "session {sid} gone before EVM proof could be stored (evicted/abandoned) — proof dropped"
-                    );
-                    None
-                }
-            }
-        };
-        if let Some(n) = notify {
-            n.notify_one();
-        }
-    }
-
-    // For TCP/legacy connections: send over the wire (Rust client protocol)
     write_msg(&mut io, &notary_response).await?;
-    info!("NotaryResponse sent to prover");
+    write_msg(&mut io, &ceremony_attestation).await?;
+    info!("NotaryResponse and ceremony attestation sent to prover");
 
     Ok(())
 }
