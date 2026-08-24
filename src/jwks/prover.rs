@@ -5,7 +5,10 @@ use libid_tlsn::{
     HttpRequestSpec,
     ProverResult,
 };
-use libid_transcript::read_msg;
+use libid_transcript::{
+    ceremony::Layout,
+    read_msg,
+};
 use tokio::io::{
     AsyncRead,
     AsyncWrite,
@@ -45,13 +48,21 @@ where
         },
         // The JWKS session is not part of a ceremony: it reads a public
         // document, no credential passes through it, and no Platform Verifier
-        // ever sees the result. The ceremony layouts have nothing to say here,
-        // so the ranges below are this caller's own.
-        libid_tlsn::RevealMode::CallerSelected,
-        // One range covering the whole recv transcript — NOT a range of
-        // numbers, which is what the clippy lint guards against.
-        #[allow(clippy::single_range_in_vec_init)]
-        |recv| Ok(vec![0..recv.len()]),
+        // ever sees the result. So it states its own layout rather than calling
+        // `libid_transcript::ceremony` -- the whole response is revealed,
+        // because there is nothing in a public key set to hide.
+        |sent, recv| {
+            Ok((
+                Layout {
+                    reveal: libid_transcript::find_notary_reveal_ranges(sent),
+                    commit: libid_transcript::find_presentation_commit_ranges(sent),
+                },
+                Layout {
+                    reveal: core::iter::once(0..recv.len()).collect(),
+                    commit: Vec::new(),
+                },
+            ))
+        },
         |_| {},
     )
     .await?;
