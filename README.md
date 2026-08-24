@@ -77,15 +77,21 @@ be built from any ref via the *Custom Docker image* workflow (inputs: `ref`,
 ## Browser wasm bundle
 
 Each release also ships `tlsn-wasm-<version>.tar.gz` as a release asset:
-`tlsn_wasm.js`, `tlsn_wasm_bg.wasm` and `spawn.js`, built from upstream
+`tlsn_wasm.js` and `tlsn_wasm_bg.wasm`, built from upstream
 TLSNotary's `crates/wasm` at the **exact tlsn revision this server pins** —
 prover and notary can never drift onto different protocol versions. Serve the
-three files side by side (with a rewrite of `/:path+/spawn.js` to the root
-copy) and the bundle is a drop-in for tlsn-js-style workers; unlike the npm
-`tlsn-js` build it includes `set_progress_callback`.
+two files side by side. The wrapper embeds web-spawn and creates its recursive
+workers from blob URLs, so consumers need no `spawn.js` route or rewrite.
+Unlike the npm `tlsn-js` build it includes `set_progress_callback`.
+
+The browser prover is upstream code rather than a second libID implementation:
+`tlsn_wasm.js` is wasm-bindgen glue generated from TLSNotary's Rust `crates/wasm`,
+`tlsn_wasm_bg.wasm` contains the protocol implementation, and its embedded
+worker bootstrap comes from TLSNotary's pinned `web-spawn` dependency. This
+repository only pins, builds, checks and packages that graph.
 
 To build locally: `./scripts/build-tlsn-wasm.sh --out <dir>` (needs rustup,
-wasm-pack 0.15.0, and a clang with a wasm32 backend — the script explains
+wasm-pack 0.15.0, Python 3, and a clang with a wasm32 backend — the script explains
 exactly what is missing if something is).
 
 ## Library use
