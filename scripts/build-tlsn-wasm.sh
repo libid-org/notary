@@ -16,7 +16,8 @@
 # Usage:
 #   ./scripts/build-tlsn-wasm.sh [--out <dir>]     (TLSN_WASM_FORCE=1 to rebuild)
 #
-# Outputs tlsn_wasm.js, tlsn_wasm_bg.wasm and spawn.js into the --out dir
+# Outputs tlsn_wasm.js and tlsn_wasm_bg.wasm into the --out dir. The generated
+# wrapper embeds web-spawn so worker creation needs no separately served script.
 # (default: tlsn-wasm/ in the repo root; gitignored). Set TLSN_WASM_CACHE to
 # relocate the tlsn checkout + cargo target dir (default: system temp).
 
@@ -46,7 +47,9 @@ IN_CI="${CI:-}"
 # staged AND carries the symbol we need is accepted as-is.
 if [ -z "${TLSN_WASM_FORCE:-}" ] \
    && [ -f "$OUT_DIR/tlsn_wasm_bg.wasm" ] \
-   && grep -q "set_progress_callback" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null; then
+   && grep -q "set_progress_callback" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null \
+   && grep -q "const workerSource =" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null \
+   && [ ! -e "$OUT_DIR/spawn.js" ]; then
     echo "[tlsn-wasm] already staged — skipping (TLSN_WASM_FORCE=1 to rebuild)"
     exit 0
 fi
@@ -158,10 +161,9 @@ if [ "$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo none)" != "$TLSN_REV" ]
 fi
 
 echo "[tlsn-wasm] building (large MPC crate; the first build is slow)…"
-# Use the crate's own build.sh: it applies post-processing we depend on, notably
-# rewriting the spawn.js snippet's import to ../../../tlsn_wasm.js and copying it
-# to the package root — consumers serve tlsn_wasm.js and spawn.js side by side
-# and rewrite /:path+/spawn.js to the root copy.
+# Use the crate's own build.sh, then embed its web-spawn helper into the wrapper.
+# Keeping the helper in the release build means every consumer gets the same
+# recursive blob-worker fix and needs no spawn.js route or rewrite.
 #
 # RUSTFLAGS is cleared deliberately: an ambient value (CI sets -D warnings)
 # OVERRIDES the crate's .cargo/config.toml rustflags, which carry the
@@ -178,6 +180,12 @@ for f in tlsn_wasm.js tlsn_wasm_bg.wasm spawn.js; do
     fi
 done
 
+python3 "$REPO_ROOT/scripts/embed-tlsn-spawn.py" "$PKG"
+if [ -e "$PKG/spawn.js" ] || ! grep -q "const workerSource =" "$PKG/tlsn_wasm.js"; then
+    echo "ERROR: failed to embed web-spawn into tlsn_wasm.js."
+    exit 1
+fi
+
 # The guarantee that matters. A bundle without this symbol is the npm build, not
 # this one, and shipping it breaks platform linking at runtime with an error
 # that points nowhere near the cause.
@@ -189,10 +197,10 @@ if ! grep -q "set_progress_callback" "$PKG/tlsn_wasm.js"; then
 fi
 
 mkdir -p "$OUT_DIR"
-cp "$PKG/tlsn_wasm.js" "$PKG/tlsn_wasm_bg.wasm" "$PKG/spawn.js" "$OUT_DIR/"
+rm -f "$OUT_DIR/spawn.js"
+cp "$PKG/tlsn_wasm.js" "$PKG/tlsn_wasm_bg.wasm" "$OUT_DIR/"
 
 echo ""
 echo "[tlsn-wasm] staged from tlsn @ ${TLSN_REV:0:8} into $OUT_DIR:"
 echo "  tlsn_wasm.js"
 echo "  tlsn_wasm_bg.wasm"
-echo "  spawn.js"
