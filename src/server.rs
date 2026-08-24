@@ -9,8 +9,6 @@
 //!   session with the platform [`NotaryResponse`].
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
 //! - **POST /session**: creates a session, returns `{sessionId}` — tlsn-js API.
-//! - **GET  /notarize?sessionId=…** (WS upgrade): MPC-TLS session for tlsn-js
-//!   browser client.
 //! - **GET  /notarize-proxy?sessionId=…** (WS upgrade): ProxyMode session for
 //!   WASM browser client (the primary browser path).
 //! - **GET  /attestation/:session_id**: signs the attested data of a completed
@@ -18,7 +16,6 @@
 //!   session revealed, and that does not depend on how the bytes reached the
 //!   notary. Takes no parameters: there is nothing in the record a caller
 //!   could choose.
-//! - **GET  /proxy** (WS upgrade): raw TCP proxy used by the tlsn-js MPC path.
 //!
 //! # Trust model
 //!
@@ -483,9 +480,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         let app = Router::new()
             .route("/info", get(info_handler))
             .route("/session", post(session_handler))
-            .route("/notarize", get(notarize_ws_handler))
             .route("/attestation/{session_id}", get(attestation_handler))
-            .route("/proxy", get(ws_proxy_handler))
             .route("/notarize-proxy", get(notarize_proxy_ws_handler))
             .layer(cors)
             .with_state(ws_state);
@@ -936,146 +931,6 @@ where
 
     info!("ProxyMode: hash-commit attestation built for {domain}");
     Ok(())
-}
-
-// ─── WebSocket proxy ─────────────────────────────────────────────────────────
-//
-// Forwards browser WebSocket connections to a remote HTTPS/TLS server.
-// tlsn-js sends raw TLS bytes over this proxy to reach the platform API.
-// Query: ?token=<hostname>  (e.g. ?token=api.x.com)
-
-#[derive(Deserialize)]
-struct ProxyQuery {
-    token: Option<String>,
-}
-
-async fn ws_proxy_handler(
-    ws: WebSocketUpgrade,
-    Query(query): Query<ProxyQuery>,
-    State(state): State<NotaryState>,
-) -> impl IntoResponse {
-    let host = query.token.unwrap_or_else(|| state.platform_name.clone());
-    ws.on_upgrade(move |socket| proxy_ws_to_tcp(socket, host))
-}
-
-async fn proxy_ws_to_tcp(socket: WebSocket, host: String) {
-    let addr = format!("{host}:443");
-    let tcp = match tokio::net::TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Proxy: failed to connect to {}: {}", addr, e);
-            return;
-        }
-    };
-
-    info!("Proxy: forwarding WS ↔ TCP to {}", addr);
-
-    let (mut ws_tx, mut ws_rx) = socket.split();
-    let (mut tcp_rx, mut tcp_tx) = tokio::io::split(tcp);
-
-    let ws_to_tcp = async {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                Message::Binary(data) if tcp_tx.write_all(&data).await.is_err() => {
-                    break;
-                }
-                Message::Close(_) => break,
-                _ => {}
-            }
-        }
-    };
-
-    let tcp_to_ws = async {
-        let mut buf = vec![0u8; 65536];
-        loop {
-            match tcp_rx.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if ws_tx
-                        .send(Message::Binary(buf[..n].to_vec().into()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    };
-
-    tokio::join!(ws_to_tcp, tcp_to_ws);
-    info!("Proxy: connection to {} closed", addr);
-}
-
-// ─── WebSocket handlers ──────────────────────────────────────────────────────
-
-async fn notarize_ws_handler(
-    ws: WebSocketUpgrade,
-    Query(query): Query<NotarizeQuery>,
-    State(state): State<NotaryState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_prover(socket, state, query.session_id))
-}
-
-async fn handle_ws_prover(
-    socket: WebSocket,
-    state: NotaryState,
-    session_id: Option<String>,
-) {
-    let (io_a, io_b) = tokio::io::duplex(1 << 17); // 128 KB buffer
-
-    let (mut ws_tx, mut ws_rx) = socket.split();
-
-    // Guarded: when this handler returns, the pump is aborted with it —
-    // otherwise a client that keeps the WebSocket open after the session
-    // failed would pin the pump task (and the socket) indefinitely.
-    let _pump_task = AbortOnDrop::new(tokio::spawn(async move {
-        let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
-
-        let ws_to_pipe = async {
-            while let Some(Ok(msg)) = ws_rx.next().await {
-                match msg {
-                    Message::Binary(data)
-                        if pipe_writer.write_all(&data).await.is_err() =>
-                    {
-                        break;
-                    }
-                    Message::Close(_) => break,
-                    _ => {}
-                }
-            }
-        };
-
-        let pipe_to_ws = async {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                match pipe_reader.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if ws_tx
-                            .send(Message::Binary(buf[..n].to_vec().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-        };
-
-        tokio::join!(ws_to_pipe, pipe_to_ws);
-    }));
-
-    let session = handle_notary_session(io_b, &state, session_id);
-    match tokio::time::timeout(CONNECTION_DEADLINE, session).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("WS notary handler error: {}", e),
-        Err(_) => error!(
-            "WS notary session exceeded the {}s connection deadline; aborting",
-            CONNECTION_DEADLINE.as_secs()
-        ),
-    }
 }
 
 // ─── tlsn attestation signing ────────────────────────────────────────────────
