@@ -32,7 +32,6 @@ path = "src/main.rs"
 # crates.io copies with the git copy would put two incompatible versions of
 # the same types in the graph.
 libid-attestations = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
-libid-ceremony = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
 libid-crypto = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
 libid-signer = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
 libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }

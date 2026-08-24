@@ -51,8 +51,6 @@ fn probe_connections_leave_no_live_tasks() {
             "0",
             "--signing-key",
             TEST_KEY,
-            "--x-zk-verifier-address",
-            "0x1111111111111111111111111111111111111111",
             "--verifying-contract",
             "0x2222222222222222222222222222222222222222",
         ]);

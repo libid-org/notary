@@ -15,8 +15,9 @@
 //!   WASM browser client (the primary browser path).
 //! - **GET  /evm-proof/:session_id**: returns the `NotaryResponse` after the
 //!   MPC-TLS session completes (long-poll).
-//! - **GET  /zk/proxy/attestation/:session_id?session_type=token|me&…**: signs
-//!   an on-demand token/me attestation from a completed ProxyMode session.
+//! - **GET  /zk/proxy/attestation/:session_id**: signs the attested data of a
+//!   completed ProxyMode session. Takes no parameters -- there is nothing in
+//!   the record a caller could choose.
 //! - **GET  /proxy** (WS upgrade): raw TCP proxy used by the tlsn-js MPC path.
 //! - **GET  /notary** (WS upgrade): legacy TCP-over-WS path.
 //!
@@ -606,14 +607,6 @@ async fn evm_proof_handler(
 
 // ─── ProxyMode ZK: hash-commit attestation endpoint ──────────────────────────
 
-/// Query parameters for the on-demand attestation endpoint.
-#[derive(Debug, Deserialize)]
-struct AttestationQuery {
-    /// Which session of the ceremony this attestation covers: `token` or
-    /// `identity`. It selects the `operationTag` and nothing else.
-    session_type: Option<String>,
-}
-
 /// Attestation wire JSON.
 ///
 /// The attested data and the signature over it, and nothing else. The notary
@@ -636,29 +629,15 @@ struct AttestationWire {
 
 /// Fetch a notary-signed attestation for a completed TLSNotary session.
 ///
-/// `?session_type=token|identity` picks which session of the ceremony the
-/// attestation says it covers. That is the only choice a caller gets: the
-/// notary decides nothing profile-specific (REQ-COMMON-33), and everything else
-/// in the attested data comes from what it observed.
+/// The caller gets no choice at all. Everything in the attested data is either
+/// something the notary observed -- the authenticated server name, the
+/// transcript lengths, the ranges the client revealed and the commitments over
+/// the rest -- or its own clock reading, which REQ-COMMON-57 requires it to
+/// supply. There is nothing left for a query parameter to select.
 async fn proxy_attestation_handler(
     Path(session_id): Path<String>,
-    Query(query): Query<AttestationQuery>,
     State(state): State<NotaryState>,
 ) -> impl IntoResponse {
-    let operation_tag = match query.session_type.as_deref() {
-        Some("token") => libid_ceremony::profile::TOKEN_SESSION_TAG,
-        Some("identity") => libid_ceremony::profile::IDENTITY_SESSION_TAG,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({"error": "?session_type=token|identity required"}),
-                ),
-            )
-                .into_response();
-        }
-    };
-
     let start = tokio::time::Instant::now();
     let budget = tokio::time::Duration::from_secs(60);
     let session: SessionAttestation = loop {
@@ -692,9 +671,6 @@ async fn proxy_attestation_handler(
         &session.authority,
         &session.commitments,
         libid_tlsn::attest::AttestationInput {
-            format_tag: libid_ceremony::profile::FORMAT_TAG,
-            platform_name: state.platform_name.as_str(),
-            operation_tag,
             created_at: session.created_at,
         },
     ) {
@@ -1721,7 +1697,6 @@ mod tests {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             max_sessions: 8,
             chain_id: 1,
-            zk_verifying_contract: [0x11; 20],
             mpc_verifying_contract: [0x22; 20],
             platform_name: "api.x.com".to_string(),
             jwks_enabled: false,
