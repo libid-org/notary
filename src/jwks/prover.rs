@@ -45,8 +45,9 @@ where
         },
         // The JWKS session is not part of a ceremony: it reads a public
         // document, no credential passes through it, and no Platform Verifier
-        // ever sees the result. The ceremony layouts have nothing to say here.
-        libid_tlsn::RevealMode::Legacy,
+        // ever sees the result. The ceremony layouts have nothing to say here,
+        // so the ranges below are this caller's own.
+        libid_tlsn::RevealMode::CallerSelected,
         // One range covering the whole recv transcript — NOT a range of
         // numbers, which is what the clippy lint guards against.
         #[allow(clippy::single_range_in_vec_init)]
