@@ -11,11 +11,10 @@
 //! - **POST /session**: creates a session, returns `{sessionId}` — tlsn-js API.
 //! - **GET  /notarize-proxy?sessionId=…** (WS upgrade): ProxyMode session for
 //!   WASM browser client (the primary browser path).
-//! - **GET  /attestation/:session_id**: signs the attested data of a completed
-//!   session, MPC-TLS or ProxyMode alike -- the record is built from what the
-//!   session revealed, and that does not depend on how the bytes reached the
-//!   notary. Takes no parameters: there is nothing in the record a caller
-//!   could choose.
+//! - **GET  /attestation/:session_id**: signs the attested data of a ProxyMode
+//!   session the browser completed. Takes no parameters: there is nothing in
+//!   the record a caller could choose. A server-side MPC-TLS prover needs no
+//!   route -- it opened the socket, and the record is written back to it.
 //!
 //! # Trust model
 //!
@@ -185,10 +184,14 @@ pub struct SessionAttestation {
 }
 
 struct SessionEntry {
-    /// What the session revealed, captured at completion, from which the
-    /// notary signs the section 9.1 record on demand at
-    /// `GET /attestation/{session_id}`. Both transports fill it: the record
-    /// describes what was observed, not how it arrived.
+    /// What a ProxyMode session revealed, captured at completion, from which
+    /// the notary signs the section 9.1 record on demand at
+    /// `GET /attestation/{session_id}`.
+    ///
+    /// Only that path fills it. The record itself says nothing about how the
+    /// bytes arrived, but the retrieval does: a browser has a session id and
+    /// comes back for the result, while an MPC-TLS prover opened the socket and
+    /// is still holding it, so its record is written straight back.
     raw_attest: Option<SessionAttestation>,
     /// Notified when `raw_attest` is populated so the attestation handler
     /// wakes up immediately instead of polling.
@@ -1225,14 +1228,13 @@ where
     Ok(())
 }
 
-/// Test-only helper: run one ProxyMode verifier session over `socket`
-/// and return the captured `RawAttestationData`. Caller is responsible
-/// for signing the typed token or /me attestation digest via
-/// `libid_attestations::compute_*_attest_digest`.
+/// Test-only helper: run one ProxyMode verifier session over `socket` and
+/// return the [`SessionAttestation`] it captured. The caller builds and signs
+/// the section 9.1 record from it, as [`attestation_handler`] does.
 ///
-/// The browser path runs this implicitly via the `/notarize-proxy` WS
-/// handler + `GET /attestation/{sid}` HTTP fetch; this helper
-/// short-circuits both for in-process e2e tests.
+/// The browser reaches the same thing through the `/notarize-proxy` WS handler
+/// followed by a `GET /attestation/{sid}` fetch; this short-circuits both for
+/// in-process end-to-end tests.
 #[doc(hidden)]
 pub async fn run_proxy_verifier_for_test<T>(
     socket: T,
