@@ -6,9 +6,8 @@
 //!   Dispatches on the TLS-cert-verified server name after verification:
 //!   `www.googleapis.com` sessions are answered with a signed
 //!   [`crate::jwks::JwksNotaryResponse`] (JWKS rotation duty); every other
-//!   session with the pre-ceremony [`NotaryResponse`] followed by the section
-//!   9.1 ceremony attestation, both written back down the socket the prover
-//!   opened.
+//!   session with the section 9.1 ceremony attestation, written back down the
+//!   socket the prover opened.
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
 //! - **POST /session**: creates a session, returns `{sessionId}` — tlsn-js API.
 //! - **GET  /notarize-proxy?sessionId=…** (WS upgrade): ProxyMode session for
@@ -21,9 +20,10 @@
 //! # Trust model
 //!
 //! The notary is one half of a 2-of-2 trust scheme. Having taken part as the
-//! MPC-TLS or ProxyMode verifier, it signs what it observed: the section 9.1
-//! attested data for a ceremony, and a Merkle transcript root for the
-//! pre-ceremony path that has not been retired yet.
+//! MPC-TLS or ProxyMode verifier, it signs what it observed, and one thing
+//! only: the section 9.1 attested data. Both transports produce the same
+//! record, because the transport says nothing about the TLS session it
+//! describes.
 //!
 //! Its signature alone registers nothing. A contract on the Consumer Chain
 //! authenticates it -- the Notary Service of ceremony-common section 9.1 --
@@ -63,48 +63,19 @@ use futures_util::{
     SinkExt,
     StreamExt,
 };
-use libid_attestations::compute_notary_digest;
-use libid_crypto::{
-    double_hash_leaf,
-    keccak256,
-};
 use libid_signer::{
     ManagedSigner,
     SignerSource,
 };
-use libid_transcript::{
-    find_request_line_range,
-    read_msg,
-    write_msg,
-    EvmProof,
-    NotaryResponse,
-};
+use libid_transcript::write_msg;
 use rand::RngCore;
 use serde::{
     Deserialize,
     Serialize,
 };
 use tlsn::{
-    attestation::{
-        request::Request,
-        signing::{
-            KeyAlgId,
-            Signature as TlsnSignature,
-            SignatureAlgId,
-            SignatureError as TlsnSignatureError,
-            Signer as TlsnSigner,
-            VerifyingKey as TlsnVerifyingKey,
-        },
-        Attestation,
-        AttestationConfig,
-        CryptoProvider,
-    },
     config::verifier::VerifierConfig,
-    connection::{
-        ConnectionInfo,
-        ServerName,
-        TranscriptLength,
-    },
+    connection::ServerName,
     transcript::{
         PartialTranscript,
         TranscriptCommitment,
@@ -316,27 +287,14 @@ async fn sweep_stale_sessions(sessions: &SessionMap) -> usize {
 
 #[derive(Clone)]
 struct NotaryState {
-    /// Notary signing identity (local hex key or AWS KMS). The one path KMS
-    /// cannot serve directly is tlsn attestation — see [`HeaderCaptureSigner`].
+    /// Notary signing identity (local hex key or AWS KMS).
     signer: Arc<ManagedSigner>,
     sessions: SessionMap,
     /// Max concurrent live sessions (`NOTARY_MAX_SESSIONS`).
     max_sessions: usize,
     public_key_hex: String,
-    /// EVM chain id, and the `verifyingContract` that goes with it, for the
-    /// pre-ceremony [`compute_notary_digest`] and nothing else.
-    ///
-    /// The ceremony record carries neither, deliberately: it describes an
-    /// observed session and says nothing about where the evidence will be
-    /// spent, so one attestation serves every chain that trusts the key. These
-    /// two fields are the last thing here that names one chain, and they go
-    /// with the digest that needs them.
-    chain_id: u64,
-    /// See [`Self::chain_id`].
-    mpc_verifying_contract: [u8; 20],
-    /// SNI / `platformName` the verifier on-chain is configured for.
+    /// The SNI a session's TLS-verified server name must match.
     platform_name: String,
-    /// Whether the TCP listener also serves JWKS notarization sessions.
     jwks_enabled: bool,
 }
 
@@ -400,14 +358,11 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         "notary signer ready"
     );
     let public_key_hex = hex::encode(signer.compressed_public_key());
-    let mpc_verifying_contract = config.resolve_verifying_contract()?;
     let state = NotaryState {
         signer: Arc::new(signer),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         max_sessions: config.max_sessions,
         public_key_hex,
-        chain_id: config.chain_id,
-        mpc_verifying_contract,
         platform_name: config.platform_name,
         jwks_enabled: config.jwks_enabled,
     };
@@ -978,39 +933,6 @@ where
 // tlsn's own `Secp256k1EthSigner`: keccak256 the message, sign the bare
 // digest, 65 bytes r || s || v with v ∈ {27, 28}.
 
-/// Captures the header bytes `AttestationBuilder::build` asks it to sign.
-struct HeaderCaptureSigner {
-    /// Real compressed public key — embedded in the attestation body, so it
-    /// must be truthful even though this signer never really signs.
-    public_key: [u8; 33],
-    /// The serialized header, recorded for the async signer.
-    captured: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
-}
-
-impl TlsnSigner for HeaderCaptureSigner {
-    fn alg_id(&self) -> SignatureAlgId {
-        SignatureAlgId::SECP256K1ETH
-    }
-
-    fn sign(&self, msg: &[u8]) -> std::result::Result<TlsnSignature, TlsnSignatureError> {
-        *self.captured.lock().expect("capture mutex") = Some(msg.to_vec());
-        // Placeholder, overwritten immediately after build(). 65 zero bytes is
-        // structurally a signature but can never verify — if a bug ever ships
-        // it, verification fails loudly rather than accepting a forgery.
-        Ok(TlsnSignature {
-            alg: SignatureAlgId::SECP256K1ETH,
-            data: vec![0u8; 65],
-        })
-    }
-
-    fn verifying_key(&self) -> TlsnVerifyingKey {
-        TlsnVerifyingKey {
-            alg: KeyAlgId::K256,
-            data: self.public_key.to_vec(),
-        }
-    }
-}
-
 // ─── Core notary logic (transport-agnostic) ─────────────────────────────────
 
 /// TCP client (Rust backend prover) — uses the full custom wire protocol.
@@ -1068,161 +990,12 @@ where
     // The ceremony record is transport-agnostic. It is built from what the
     // session revealed, the server the notary authenticated, the commitments
     // over the rest, and the notary's own clock -- and an MPC-TLS session
-    // produces all four exactly as a ProxyMode one does. Captured here, before
-    // `result` is taken apart for the tlsn attestation below.
-    let ceremony_partial = result.partial_transcript.clone();
-    let ceremony_commitments = result.transcript_commitments.clone();
-
-    let mut io = result.recovered_io;
-    let att_request: Request = read_msg(&mut io).await?;
-    info!("Received attestation request from prover");
-
-    // See the "tlsn attestation signing" section: build() runs with a
-    // capture-only signer, then the real (possibly KMS) signature is applied
-    // with an ordinary await — no sync-over-async bridging.
-    let captured_header: Arc<std::sync::Mutex<Option<Vec<u8>>>> = Arc::default();
-    let mut provider = CryptoProvider::default();
-    provider.signer.set_signer(Box::new(HeaderCaptureSigner {
-        public_key: state.signer.compressed_public_key(),
-        captured: Arc::clone(&captured_header),
-    }));
-
-    let mut att_config = AttestationConfig::builder();
-    att_config.supported_signature_algs(vec![SignatureAlgId::SECP256K1ETH]);
-    let att_config = att_config.build().map_err(|e| Error::NotaryServer {
-        detail: format!("attestation config: {e}"),
-    })?;
-
-    let tls_tx = &result.tls_transcript;
-    let sent_len = u32::try_from(sent.len()).map_err(|_| Error::NotaryServer {
-        detail: "sent transcript too large for u32".into(),
-    })?;
-    let recv_len = u32::try_from(recv.len()).map_err(|_| Error::NotaryServer {
-        detail: "recv transcript too large for u32".into(),
-    })?;
-
-    let mut att_builder = Attestation::builder(&att_config)
-        .accept_request(att_request)
-        .map_err(|e| Error::NotaryServer {
-            detail: format!("accept attestation request: {e}"),
-        })?;
-    att_builder
-        .connection_info(ConnectionInfo {
-            time: tls_tx.time(),
-            version: *tls_tx.version(),
-            transcript_length: TranscriptLength {
-                sent: sent_len,
-                received: recv_len,
-            },
-        })
-        .server_ephemeral_key(tls_tx.server_ephemeral_key().clone())
-        .transcript_commitments(result.transcript_commitments);
-
-    let mut attestation =
-        att_builder
-            .build(&provider)
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("attestation build: {e}"),
-            })?;
-
-    // Sign the captured header for real — an actual async call, KMS or local.
-    let header_bytes = captured_header
-        .lock()
-        .expect("capture mutex")
-        .take()
-        .ok_or_else(|| Error::NotaryServer {
-            detail: "attestation build never requested a signature".into(),
-        })?;
-    let digest = keccak256(&header_bytes);
-    attestation.signature = TlsnSignature {
-        alg: SignatureAlgId::SECP256K1ETH,
-        data: state.signer.sign_prehash(&digest).await?,
-    };
-    let attestation_bytes = serde_json::to_vec(&attestation)?;
-    info!("Attestation built");
-
-    let handshake = libid_tlsn::extract_handshake_data(tls_tx)?;
-
-    let request_line = &sent[find_request_line_range(sent)];
-    let request_line_str =
-        std::str::from_utf8(request_line).map_err(|e| Error::MalformedRequestLine {
-            detail: format!("not valid UTF-8: {e}"),
-        })?;
-    let (method_path, _version) =
-        request_line_str
-            .rsplit_once(' ')
-            .ok_or_else(|| Error::MalformedRequestLine {
-                detail: "missing HTTP version".into(),
-            })?;
-    let request_path = method_path
-        .split_once(' ')
-        .map_or(method_path, |(_, path)| path);
-    info!("Endpoint from transcript: {}", request_path);
-
-    let mut leaves = vec![
-        double_hash_leaf("domain:", domain.as_bytes()),
-        double_hash_leaf("endpoint:", request_path.as_bytes()),
-    ];
-    let recv_authed = transcript.received_authed();
-    let recv_data = transcript.received_unsafe();
-    let mut recv_segments: Vec<Vec<u8>> = Vec::new();
-    for range in recv_authed.iter() {
-        let segment = &recv_data[range.clone()];
-        leaves.push(double_hash_leaf("recv:", segment));
-        recv_segments.push(segment.to_vec());
-    }
-
-    let transcript_root = libid_crypto::build_merkle_tree(&leaves);
-
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let notary_digest = compute_notary_digest(
-        state.chain_id,
-        &state.mpc_verifying_contract,
-        &domain,
-        &handshake.client_random,
-        &handshake.server_random,
-        &handshake.server_ephemeral_key,
-        &transcript_root,
-        timestamp,
-    );
-    let notary_signature = state.signer.sign_claim(&notary_digest).await?;
-
-    let evm_proof = EvmProof {
-        domain: domain.clone(),
-        endpoint: request_path.to_string(),
-        client_random: handshake.client_random,
-        server_random: handshake.server_random,
-        server_ephemeral_key: handshake.server_ephemeral_key,
-        transcript_root,
-        leaves,
-        timestamp,
-        notary_signature,
-        recv_segments,
-        explicit_nonce: Vec::new(),
-        app_ciphertext: Vec::new(),
-    };
-
-    let notary_response = NotaryResponse {
-        attestation: attestation_bytes,
-        evm_proof,
-    };
-
-    // The ceremony record goes over the wire, to the prover that asked for it.
-    //
-    // It used to be stashed in the session map for `GET /attestation/{id}` to
-    // pick up, which was unreachable here: the only entry to this function is
-    // the TCP listener, and it has no session id to stash under. That was the
-    // browser's mechanism, and the browser does not do MPC. The prover on this
-    // path opened the socket and reads its results off it.
+    // produces all four exactly as a ProxyMode one does.
     let ceremony_attestation = sign_ceremony_attestation(
         &state.signer,
-        &ceremony_partial,
+        &result.partial_transcript,
         &domain,
-        &ceremony_commitments,
+        &result.transcript_commitments,
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1230,9 +1003,9 @@ where
     )
     .await?;
 
-    write_msg(&mut io, &notary_response).await?;
+    let mut io = result.recovered_io;
     write_msg(&mut io, &ceremony_attestation).await?;
-    info!("NotaryResponse and ceremony attestation sent to prover");
+    info!("Ceremony attestation sent to prover");
 
     Ok(())
 }
@@ -1476,8 +1249,6 @@ mod tests {
             signer: Arc::new(signer),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             max_sessions: 8,
-            chain_id: 1,
-            mpc_verifying_contract: [0x22; 20],
             platform_name: "api.x.com".to_string(),
             jwks_enabled: false,
         };

@@ -51,8 +51,6 @@ fn probe_connections_leave_no_live_tasks() {
             "0",
             "--signing-key",
             TEST_KEY,
-            "--verifying-contract",
-            "0x2222222222222222222222222222222222222222",
         ]);
         let handle = server::run(config).await.expect("server starts");
         let addr = handle.local_addr();
