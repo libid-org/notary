@@ -104,6 +104,7 @@ use tlsn::{
     },
     config::verifier::VerifierConfig,
     connection::{
+        CertBinding,
         ConnectionInfo,
         ServerName,
         TranscriptLength,
@@ -1583,13 +1584,20 @@ where
     att_builder
         .connection_info(ConnectionInfo {
             time: tls_tx.time(),
-            version: *tls_tx.version(),
+            version: tls_tx.version(),
             transcript_length: TranscriptLength {
                 sent: sent_len,
                 received: recv_len,
             },
         })
-        .server_ephemeral_key(tls_tx.server_ephemeral_key().clone())
+        .server_ephemeral_key(match tls_tx.certificate_binding() {
+            CertBinding::V1_2(binding) => binding.server_ephemeral_key.clone(),
+            _ => {
+                return Err(Error::NotaryServer {
+                    detail: "unsupported TLS certificate binding".into(),
+                });
+            }
+        })
         .transcript_commitments(result.transcript_commitments);
 
     let mut attestation =
