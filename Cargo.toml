@@ -1,12 +1,11 @@
 [package]
 name = "notary"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # The real floor, inherited from libid-rs (and the original monorepo before it):
-#   * the `mpz` MPC dependency (via tlsn) uses `cfg_select!`, unstable
-#     before 1.94;
+#   * TLSNotary alpha.15's `mpz` graph declares Rust 1.95;
 #   * the AWS SDK crates (via libid-signer) declare 1.94.1.
-rust-version = "1.94.1"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/libid-org/notary"
 description = "The libID notary service: MPC-TLS / zkTLS notarization for platform sessions and notarized JWKS (OIDC) readings, under one notary identity."
