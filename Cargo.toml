@@ -38,18 +38,18 @@ path = "src/main.rs"
 # instead. This returns to `tag = "v0.3.0"` the moment the tag is cut -- and it
 # must, before this is released: a rev is reachable only while the branch that
 # carries it is, and squash-merging the PR would strand it.
-libid-attestations = { git = "https://github.com/libid-org/libid-rs", rev = "351b144b4d4f72c0e0d6c8da20a8e1699efa8cca" }
-libid-crypto = { git = "https://github.com/libid-org/libid-rs", rev = "351b144b4d4f72c0e0d6c8da20a8e1699efa8cca" }
-libid-signer = { git = "https://github.com/libid-org/libid-rs", rev = "351b144b4d4f72c0e0d6c8da20a8e1699efa8cca" }
-libid-tlsn = { git = "https://github.com/libid-org/libid-rs", rev = "351b144b4d4f72c0e0d6c8da20a8e1699efa8cca" }
-libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "351b144b4d4f72c0e0d6c8da20a8e1699efa8cca" }
+libid-attestations = { git = "https://github.com/libid-org/libid-rs", rev = "239a4bb426ac72591fe30006f22660e164a98d96" }
+libid-crypto = { git = "https://github.com/libid-org/libid-rs", rev = "239a4bb426ac72591fe30006f22660e164a98d96" }
+libid-signer = { git = "https://github.com/libid-org/libid-rs", rev = "239a4bb426ac72591fe30006f22660e164a98d96" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", rev = "239a4bb426ac72591fe30006f22660e164a98d96" }
+libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "239a4bb426ac72591fe30006f22660e164a98d96" }
 
-# Upstream TLSNotary. The rev MUST equal libid-tlsn's pin (same source →
+# Upstream TLSNotary. The pin MUST equal libid-tlsn's (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible
 # `tlsn` crates and type errors at the libid-tlsn boundary). The wasm bundle
 # script reads this pin back out of Cargo.lock so the browser prover can
 # never drift onto a different tlsn version than the server.
-tlsn = { git = "https://github.com/tlsnotary/tlsn", rev = "040c6881f3ec65ea042de134a0586b23cf382443" }
+tlsn = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15" }
 
 # ── Solidity ABI mirrors (JwksOracle wire types) ────────────────────────────
 alloy-primitives = { version = "1", features = ["serde"] }
