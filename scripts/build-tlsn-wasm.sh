@@ -51,7 +51,7 @@ if [ -z "${TLSN_WASM_FORCE:-}" ] \
     exit 0
 fi
 
-# ONE source of truth for the revision: the pin this workspace's Cargo.lock
+# ONE source of truth for the revision: the source this workspace's Cargo.lock
 # already resolved (it arrives via libid-tlsn and the direct dependency, which
 # cargo unifies), so the browser prover and the notary cannot drift onto
 # different tlsn versions.
