@@ -24,18 +24,25 @@ path = "src/main.rs"
 
 [dependencies]
 # ── libid-rs shared crates ──────────────────────────────────────────────────
-# All six ride the same git source so their intra-workspace `path` deps
-# unify. The upstream `tlsn` git rev is pinned by libid-tlsn and arrives
-# transitively; the direct `tlsn` entry below MUST name the same rev.
-# All six come from the same release tag: libid-tlsn is git-only (upstream
-# tlsn is not on crates.io) and exposes sibling-crate types, so mixing the
-# crates.io copies with the git copy would put two incompatible versions of
-# the same types in the graph.
-libid-attestations = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
-libid-crypto = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
-libid-signer = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
-libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
-libid-transcript = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
+# All five ride the same git source, at the same pin, so their intra-workspace
+# `path` deps unify. libid-tlsn is git-only (upstream tlsn is not on crates.io)
+# and exposes sibling-crate types, so mixing the crates.io copies with the git
+# copy would put two incompatible versions of the same types in the graph.
+# libid-ceremony arrives transitively through libid-tlsn, from the same pin.
+# The upstream `tlsn` git rev is pinned by libid-tlsn and arrives the same way;
+# the direct `tlsn` entry below MUST name the same rev.
+#
+# A REV, NOT A TAG, AND ON PURPOSE. The ceremony wire constructions this server
+# encodes live in libid-rs PR #2, and v0.3.0 does not exist yet. A tag that has
+# not been cut resolves to nothing, so the pin below is the head of that PR
+# instead. This returns to `tag = "v0.3.0"` the moment the tag is cut -- and it
+# must, before this is released: a rev is reachable only while the branch that
+# carries it is, and squash-merging the PR would strand it.
+libid-attestations = { git = "https://github.com/libid-org/libid-rs", rev = "1fe2b76e1ccde14738351b2ac5f6e7adc0a3a670" }
+libid-crypto = { git = "https://github.com/libid-org/libid-rs", rev = "1fe2b76e1ccde14738351b2ac5f6e7adc0a3a670" }
+libid-signer = { git = "https://github.com/libid-org/libid-rs", rev = "1fe2b76e1ccde14738351b2ac5f6e7adc0a3a670" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", rev = "1fe2b76e1ccde14738351b2ac5f6e7adc0a3a670" }
+libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "1fe2b76e1ccde14738351b2ac5f6e7adc0a3a670" }
 
 # Upstream TLSNotary. The rev MUST equal libid-tlsn's pin (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible
