@@ -38,11 +38,11 @@ path = "src/main.rs"
 # instead. This returns to `tag = "v0.3.0"` the moment the tag is cut -- and it
 # must, before this is released: a rev is reachable only while the branch that
 # carries it is, and squash-merging the PR would strand it.
-libid-attestations = { git = "https://github.com/libid-org/libid-rs", rev = "81d6e3702a8fd5febd7fa3ddd49618633c949131" }
-libid-crypto = { git = "https://github.com/libid-org/libid-rs", rev = "81d6e3702a8fd5febd7fa3ddd49618633c949131" }
-libid-signer = { git = "https://github.com/libid-org/libid-rs", rev = "81d6e3702a8fd5febd7fa3ddd49618633c949131" }
-libid-tlsn = { git = "https://github.com/libid-org/libid-rs", rev = "81d6e3702a8fd5febd7fa3ddd49618633c949131" }
-libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "81d6e3702a8fd5febd7fa3ddd49618633c949131" }
+libid-attestations = { git = "https://github.com/libid-org/libid-rs", rev = "351b144b4d4f72c0e0d6c8da20a8e1699efa8cca" }
+libid-crypto = { git = "https://github.com/libid-org/libid-rs", rev = "351b144b4d4f72c0e0d6c8da20a8e1699efa8cca" }
+libid-signer = { git = "https://github.com/libid-org/libid-rs", rev = "351b144b4d4f72c0e0d6c8da20a8e1699efa8cca" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", rev = "351b144b4d4f72c0e0d6c8da20a8e1699efa8cca" }
+libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "351b144b4d4f72c0e0d6c8da20a8e1699efa8cca" }
 
 # Upstream TLSNotary. The rev MUST equal libid-tlsn's pin (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible
