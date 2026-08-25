@@ -25,13 +25,6 @@ pub struct NotaryServerConfig {
     #[arg(long, env = "SIGNING_KEY")]
     pub signing_key: String,
 
-    /// SNI / `platformName` the ZK verifier on-chain is configured for.
-    /// The notary hashes this value into the token + me attestation digests
-    /// so a deployment that changes `platformName` will not accidentally
-    /// accept signatures issued for a different platform.
-    #[arg(long, env = "NOTARY_PLATFORM_NAME", default_value = "api.x.com")]
-    pub platform_name: String,
-
     /// Max concurrent live sessions before `POST /session` is rejected (503).
     /// A capacity / DoS-defense knob — tune per deployment (notary RAM,
     /// expected concurrent provers). The background sweep bounds each entry's

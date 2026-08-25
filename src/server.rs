@@ -293,8 +293,6 @@ struct NotaryState {
     /// Max concurrent live sessions (`NOTARY_MAX_SESSIONS`).
     max_sessions: usize,
     public_key_hex: String,
-    /// The SNI a session's TLS-verified server name must match.
-    platform_name: String,
     jwks_enabled: bool,
 }
 
@@ -328,22 +326,6 @@ struct NotarizeQuery {
     session_id: Option<String>,
 }
 
-/// Reject a ProxyMode session whose TLS-cert-verified server identity does not
-/// match the platform baked into the attestation digest. Without this a prover
-/// could connect the notary to any WebPKI-valid host and obtain a signature
-/// claiming `platform` (e.g. "api.x.com"). Case-insensitive: DNS is.
-fn check_server_identity(domain: &str, platform_name: &str) -> Result<()> {
-    if domain.eq_ignore_ascii_case(platform_name) {
-        Ok(())
-    } else {
-        Err(Error::NotaryServer {
-            detail: format!(
-                "server identity '{domain}' does not match configured platform '{platform_name}'"
-            ),
-        })
-    }
-}
-
 // ─── Server startup ──────────────────────────────────────────────────────────
 
 /// Start the notary server (TCP + optional WebSocket with tlsn-js API).
@@ -363,7 +345,6 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         max_sessions: config.max_sessions,
         public_key_hex,
-        platform_name: config.platform_name,
         jwks_enabled: config.jwks_enabled,
     };
 
@@ -843,12 +824,18 @@ where
     let ServerName::Dns(ref dns_name) = server_name;
     let domain = dns_name.as_str().to_string();
 
-    // The record attests the cert-verified server name as `authorityId`, and
-    // the prover picks which server that is -- any WebPKI-valid certificate
-    // passes. This notary instance serves one platform, so pin the verified
-    // identity to it: otherwise a prover reaches an attacker's server and
-    // walks away with an attestation naming it, signed by this key.
-    check_server_identity(&domain, &state.platform_name)?;
+    // Which host answered is attested, not restricted. The record carries the
+    // cert-verified server name as `authorityId`, and each Platform Verifier
+    // compares that against the authority its own profile pins -- so an
+    // attestation naming an attacker's server is refused on chain, by the
+    // contract that knows which host the session was supposed to reach.
+    //
+    // Pinning one hostname here would add nothing to that and would cost
+    // something real: GitHub alone needs two authorities (`github.com` for the
+    // exchange, `api.github.com` for the identity session), so a single
+    // platform identity cannot serve even one platform, let alone a notary
+    // shared by X and GitHub. Limiting who may use a public notary is access
+    // control, and belongs where access control lives.
 
     let partial_transcript = transcript;
     if let Some(ref pt) = partial_transcript {
@@ -1012,7 +999,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::check_server_identity;
 
     /// Pins the lifted-out attestation signing (HeaderCaptureSigner +
     /// ManagedSigner::sign_prehash) byte-identical to tlsn's own
@@ -1191,31 +1177,6 @@ mod tests {
             .expect("waiter task panicked");
     }
 
-    #[test]
-    fn server_identity_accepts_exact_platform() {
-        assert!(check_server_identity("api.x.com", "api.x.com").is_ok());
-    }
-
-    #[test]
-    fn server_identity_accepts_case_insensitive() {
-        // DNS names are case-insensitive; a cert SAN may differ in case.
-        assert!(check_server_identity("API.X.COM", "api.x.com").is_ok());
-    }
-
-    #[test]
-    fn server_identity_rejects_attacker_host() {
-        // Core of the critical fix: a WebPKI-valid attacker server must not be
-        // attested as the configured platform.
-        assert!(check_server_identity("evil.example", "api.x.com").is_err());
-    }
-
-    #[test]
-    fn server_identity_rejects_subdomain_lookalike() {
-        // No suffix/substring leniency: only an exact (case-insensitive) match.
-        assert!(check_server_identity("api.x.com.evil.example", "api.x.com").is_err());
-        assert!(check_server_identity("notapi.x.com", "api.x.com").is_err());
-    }
-
     /// A client that connects and then goes silent forever must not pin the
     /// handler past [`CONNECTION_DEADLINE`] — defense in depth over the
     /// fail-fast fixes, covering whatever future bug makes a session pend.
@@ -1249,7 +1210,6 @@ mod tests {
             signer: Arc::new(signer),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             max_sessions: 8,
-            platform_name: "api.x.com".to_string(),
             jwks_enabled: false,
         };
 

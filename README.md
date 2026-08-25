@@ -50,7 +50,6 @@ Flags or environment variables:
 | `--ws-port` | `NOTARY_WS_PORT` | `7048` | HTTP/WS port (`0` disables) |
 | `--signing-key` | `SIGNING_KEY` | — | Hex secp256k1 key, or `kms:<key-id-or-alias>` for AWS KMS |
 | `--x-zk-verifier-address` | `X_ZK_VERIFIER_ADDRESS` | — | ZK verifier contract recovering token/me attestations |
-| `--platform-name` | `NOTARY_PLATFORM_NAME` | `api.x.com` | TLS server identity ProxyMode sessions must present |
 | `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent-session cap |
 | `--jwks-enabled` | `NOTARY_JWKS_ENABLED` | `true` | Serve JWKS notarization sessions on the TCP listener |
 
