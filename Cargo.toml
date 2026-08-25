@@ -30,11 +30,11 @@ path = "src/main.rs"
 # (upstream tlsn is not on crates.io) and exposes sibling-crate types. Mixing
 # crates.io copies with the git copy would put two incompatible versions of
 # the same types in the graph.
-libid-attestations = { git = "https://github.com/libid-org/libid-rs", rev = "ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db" }
-libid-crypto = { git = "https://github.com/libid-org/libid-rs", rev = "ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db" }
-libid-signer = { git = "https://github.com/libid-org/libid-rs", rev = "ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db" }
-libid-tlsn = { git = "https://github.com/libid-org/libid-rs", rev = "ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db" }
-libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db" }
+libid-attestations = { git = "https://github.com/libid-org/libid-rs", rev = "bb14ad34d438975363bad516453cc22348ecd2b2" }
+libid-crypto = { git = "https://github.com/libid-org/libid-rs", rev = "bb14ad34d438975363bad516453cc22348ecd2b2" }
+libid-signer = { git = "https://github.com/libid-org/libid-rs", rev = "bb14ad34d438975363bad516453cc22348ecd2b2" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", rev = "bb14ad34d438975363bad516453cc22348ecd2b2" }
+libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "bb14ad34d438975363bad516453cc22348ecd2b2" }
 
 # Upstream TLSNotary. The rev MUST equal libid-tlsn's pin (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible

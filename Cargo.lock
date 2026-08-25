@@ -3539,7 +3539,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libid-attestations"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db#ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db"
+source = "git+https://github.com/libid-org/libid-rs?rev=bb14ad34d438975363bad516453cc22348ecd2b2#bb14ad34d438975363bad516453cc22348ecd2b2"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -3549,7 +3549,7 @@ dependencies = [
 [[package]]
 name = "libid-crypto"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db#ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db"
+source = "git+https://github.com/libid-org/libid-rs?rev=bb14ad34d438975363bad516453cc22348ecd2b2#bb14ad34d438975363bad516453cc22348ecd2b2"
 dependencies = [
  "hex",
  "k256",
@@ -3561,7 +3561,7 @@ dependencies = [
 [[package]]
 name = "libid-signer"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db#ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db"
+source = "git+https://github.com/libid-org/libid-rs?rev=bb14ad34d438975363bad516453cc22348ecd2b2#bb14ad34d438975363bad516453cc22348ecd2b2"
 dependencies = [
  "alloy",
  "aws-config",
@@ -3573,7 +3573,7 @@ dependencies = [
 [[package]]
 name = "libid-tlsn"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db#ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db"
+source = "git+https://github.com/libid-org/libid-rs?rev=bb14ad34d438975363bad516453cc22348ecd2b2#bb14ad34d438975363bad516453cc22348ecd2b2"
 dependencies = [
  "http-body-util",
  "hyper 1.11.0",
@@ -3590,7 +3590,7 @@ dependencies = [
 [[package]]
 name = "libid-transcript"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db#ad508b2ff5ffeacdfcbf3f4ae1876a43c379a6db"
+source = "git+https://github.com/libid-org/libid-rs?rev=bb14ad34d438975363bad516453cc22348ecd2b2#bb14ad34d438975363bad516453cc22348ecd2b2"
 dependencies = [
  "serde",
  "serde_json",
