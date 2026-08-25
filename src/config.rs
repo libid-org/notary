@@ -38,10 +38,13 @@ pub struct NotaryServerConfig {
 
     /// Address (`0x...`) of the contract that recovers the MPC-TLS notary
     /// signature (bound into the digest as the EIP-712-style
-    /// `verifyingContract`). In wallet deployments this is the `Registry`;
-    /// in identity deployments it is `GitHubIdentityVerifier` — hence the
-    /// honest name. `--registry-contract-address` and the
-    /// `REGISTRY_CONTRACT_ADDRESS` env var are accepted as legacy aliases.
+    /// `verifyingContract`). In wallet deployments this is the `Registry`.
+    /// `--registry-contract-address` and the `REGISTRY_CONTRACT_ADDRESS` env
+    /// var are accepted as legacy aliases.
+    ///
+    /// Reaches the pre-ceremony path only. A ceremony attestation binds no
+    /// chain and no contract: the Authorization Digest does that, on the chain
+    /// itself, so nothing the notary signs names either (REQ-COMMON-61).
     #[arg(
         long = "verifying-contract",
         visible_alias = "registry-contract-address",

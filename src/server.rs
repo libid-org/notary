@@ -598,6 +598,44 @@ struct AttestationWire {
 /// transcript lengths, the ranges the client revealed and the commitments over
 /// the rest -- or its own clock reading, which REQ-COMMON-57 requires it to
 /// supply. There is nothing left for a query parameter to select.
+/// Build the section 9.1 attested data for one completed session and sign it.
+///
+/// Both transports end here. A ProxyMode browser fetches the result by session
+/// id; an MPC prover reads it off the socket it opened. What they receive is the
+/// same record, because the transport says nothing about the TLS session it
+/// describes -- so building it twice would be two chances to disagree about the
+/// format the notary's key vouches for.
+async fn sign_ceremony_attestation(
+    signer: &ManagedSigner,
+    partial: &PartialTranscript,
+    authority: &str,
+    commitments: &[TranscriptCommitment],
+    created_at: u64,
+) -> Result<AttestationWire> {
+    let attested = libid_tlsn::attest::attested_data(
+        partial,
+        authority,
+        commitments,
+        libid_tlsn::attest::AttestationInput { created_at },
+    )
+    .map_err(|e| Error::NotaryServer {
+        detail: format!("attested data: {e}"),
+    })?;
+    let encoded = attested.encode().map_err(|e| Error::NotaryServer {
+        detail: format!("encode attested data: {e}"),
+    })?;
+
+    // The notary signs `keccak256(attestedData)` and no other preimage
+    // (REQ-COMMON-47).
+    let notary_signature = signer
+        .sign_claim(&libid_crypto::keccak256(&encoded))
+        .await?;
+    Ok(AttestationWire {
+        attested_data: encoded,
+        notary_signature,
+    })
+}
+
 async fn attestation_handler(
     Path(session_id): Path<String>,
     State(state): State<NotaryState>,
@@ -630,50 +668,19 @@ async fn attestation_handler(
         let _ = tokio::time::timeout(remaining, notify.notified()).await;
     };
 
-    let attested = match libid_tlsn::attest::attested_data(
+    match sign_ceremony_attestation(
+        &state.signer,
         &session.partial,
         &session.authority,
         &session.commitments,
-        libid_tlsn::attest::AttestationInput {
-            created_at: session.created_at,
-        },
-    ) {
-        Ok(a) => a,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("attested data: {e}")})),
-            )
-                .into_response();
-        }
-    };
-
-    let encoded = match attested.encode() {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("encode: {e}")})),
-            )
-                .into_response();
-        }
-    };
-
-    // The notary signs `keccak256(attestedData)` and no other preimage
-    // (REQ-COMMON-47).
-    let digest = libid_crypto::keccak256(&encoded);
-    match state.signer.sign_claim(&digest).await.map_err(Error::from) {
-        Ok(notary_signature) => (
-            StatusCode::OK,
-            Json(AttestationWire {
-                attested_data: encoded,
-                notary_signature,
-            }),
-        )
-            .into_response(),
+        session.created_at,
+    )
+    .await
+    {
+        Ok(wire) => (StatusCode::OK, Json(wire)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("sign: {e}")})),
+            Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
     }
@@ -1211,81 +1218,23 @@ where
     // the TCP listener, and it has no session id to stash under. That was the
     // browser's mechanism, and the browser does not do MPC. The prover on this
     // path opened the socket and reads its results off it.
-    let attested = libid_tlsn::attest::attested_data(
+    let ceremony_attestation = sign_ceremony_attestation(
+        &state.signer,
         &ceremony_partial,
         &domain,
         &ceremony_commitments,
-        libid_tlsn::attest::AttestationInput {
-            created_at: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        },
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
     )
-    .map_err(|e| Error::NotaryServer {
-        detail: format!("attested data: {e}"),
-    })?;
-    let encoded = attested.encode().map_err(|e| Error::NotaryServer {
-        detail: format!("encode attested data: {e}"),
-    })?;
-    let ceremony_attestation = AttestationWire {
-        notary_signature: state
-            .signer
-            .sign_claim(&libid_crypto::keccak256(&encoded))
-            .await?,
-        attested_data: encoded,
-    };
+    .await?;
 
     write_msg(&mut io, &notary_response).await?;
     write_msg(&mut io, &ceremony_attestation).await?;
     info!("NotaryResponse and ceremony attestation sent to prover");
 
     Ok(())
-}
-
-/// Test-only helper: run one ProxyMode verifier session over `socket` and
-/// return the [`SessionAttestation`] it captured. The caller builds and signs
-/// the section 9.1 record from it, as [`attestation_handler`] does.
-///
-/// The browser reaches the same thing through the `/notarize-proxy` WS handler
-/// followed by a `GET /attestation/{sid}` fetch; this short-circuits both for
-/// in-process end-to-end tests.
-#[doc(hidden)]
-pub async fn run_proxy_verifier_for_test<T>(
-    socket: T,
-    signer: Arc<ManagedSigner>,
-    chain_id: u64,
-    mpc_verifying_contract: [u8; 20],
-    platform_name: String,
-) -> Result<SessionAttestation>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-{
-    let state = NotaryState {
-        signer,
-        sessions: Arc::new(RwLock::new(HashMap::new())),
-        max_sessions: 1024,
-        public_key_hex: String::new(),
-        chain_id,
-        mpc_verifying_contract,
-        platform_name,
-        jwks_enabled: false,
-    };
-    let session_id = "test-session".to_string();
-    {
-        let mut sessions = state.sessions.write().await;
-        sessions.insert(session_id.clone(), SessionEntry::default());
-    }
-    run_proxy_verifier_session(socket, &state, Some(session_id.clone())).await?;
-    let sessions = state.sessions.read().await;
-    let entry = sessions
-        .get(&session_id)
-        .ok_or_else(|| Error::NotaryServer {
-            detail: "session entry missing".into(),
-        })?;
-    entry.raw_attest.clone().ok_or_else(|| Error::NotaryServer {
-        detail: "raw attestation not populated".into(),
-    })
 }
 
 #[cfg(test)]
