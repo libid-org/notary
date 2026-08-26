@@ -57,7 +57,10 @@ use libid_signer::{
     SignerSource,
 };
 use libid_transcript::write_msg;
-use serde::Serialize;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use tlsn::{
     config::verifier::VerifierConfig,
     connection::ServerName,
@@ -327,7 +330,7 @@ async fn info_handler(State(state): State<NotaryState>) -> Json<InfoResponse> {
 /// the signed bytes (REQ-COMMON-61): every one is derivable from the revealed
 /// ranges, and a second signed representation can disagree with the bytes it
 /// was taken from.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct AttestationWire {
     /// The exact bytes of ceremony-common section 9.1.
     attested_data: Vec<u8>,
@@ -706,6 +709,16 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
 {
     let result = libid_tlsn::verifier(socket).await?;
+    handle_verified_session(result, state).await
+}
+
+async fn handle_verified_session<T>(
+    result: libid_tlsn::VerifierResult<T>,
+    state: &NotaryState,
+) -> Result<()>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+{
     let transcript = &result.partial_transcript;
     let sent = transcript.sent_unsafe();
     let recv = transcript.received_unsafe();
@@ -789,6 +802,174 @@ mod tests {
         assert_eq!(frame["notary_signature"].as_array().unwrap().len(), 65);
         assert_eq!(browser.read(&mut [0]).await.unwrap(), 0);
         send.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mpc_protocol_returns_attestation_on_the_recovered_socket() {
+        use std::{
+            sync::Arc,
+            time::Duration,
+        };
+
+        use libid_signer::SignerSource;
+        use libid_transcript::read_msg;
+        use tlsn::{
+            config::verifier::VerifierConfig,
+            verifier::{
+                VerifierCommitStart,
+                VerifierOutput,
+            },
+            webpki::{
+                CertificateDer,
+                RootCertStore,
+            },
+            Session,
+        };
+        use tlsn_sdk_core::{
+            HttpRequest,
+            ProverConfig,
+            Reveal,
+            SdkProver,
+        };
+        use tlsn_server_fixture_certs::{
+            CA_CERT_DER,
+            SERVER_DOMAIN,
+        };
+        use tokio::io::AsyncReadExt;
+        use tokio_util::compat::{
+            FuturesAsyncReadCompatExt,
+            TokioAsyncReadCompatExt,
+        };
+
+        use super::{
+            handle_verified_session,
+            AttestationWire,
+            NotaryState,
+        };
+
+        const TEST_KEY: &str =
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+        let signer = SignerSource::from_spec(TEST_KEY)
+            .unwrap()
+            .build_managed(None)
+            .await
+            .unwrap();
+        let expected_pubkey = signer.compressed_public_key().to_vec();
+        let state = NotaryState {
+            signer: Arc::new(signer),
+            proxy_sessions: Arc::new(tokio::sync::Semaphore::new(1)),
+            public_key_hex: String::new(),
+            jwks_enabled: false,
+            proxy_test: None,
+        };
+
+        let (prover_io, notary_io) = tokio::io::duplex(2 << 23);
+        let (target_io, fixture_io) = tokio::io::duplex(1 << 17);
+        let fixture_task = tokio::spawn(async move {
+            tlsn_server_fixture::bind(fixture_io.compat())
+                .await
+                .unwrap();
+        });
+
+        let notary_task = tokio::spawn(async move {
+            let session = Session::new(notary_io.compat());
+            let (driver, mut handle) = session.split();
+            let driver_task = tokio::spawn(driver);
+            let verifier = handle
+                .new_verifier(
+                    VerifierConfig::builder()
+                        .root_store(RootCertStore {
+                            roots: vec![CertificateDer(CA_CERT_DER.to_vec())],
+                        })
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
+            let verifier = verifier.commit().await.unwrap();
+            let VerifierCommitStart::Mpc(verifier) = verifier else {
+                panic!("expected MPC mode");
+            };
+            let verifier = verifier.accept().await.unwrap().run().await.unwrap();
+            let tls_transcript = verifier.tls_transcript().clone();
+            let (output, verifier) =
+                verifier.verify().await.unwrap().accept().await.unwrap();
+            verifier.close().await.unwrap();
+            handle.close();
+
+            let VerifierOutput {
+                server_name,
+                transcript,
+                transcript_commitments,
+                ..
+            } = output;
+            let recovered_io = driver_task.await.unwrap().unwrap().into_inner();
+            handle_verified_session(
+                libid_tlsn::VerifierResult {
+                    partial_transcript: transcript.unwrap(),
+                    server_name: server_name.unwrap(),
+                    tls_transcript,
+                    transcript_commitments,
+                    recovered_io,
+                },
+                &state,
+            )
+            .await
+            .unwrap();
+        });
+
+        let protocol = async {
+            let mut prover = SdkProver::new(
+                ProverConfig::builder(SERVER_DOMAIN)
+                    .root_certs(vec![CA_CERT_DER.to_vec()])
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+            prover.setup(prover_io.compat()).await.unwrap();
+            let response = prover
+                .send_request_mpc(
+                    target_io.compat(),
+                    HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
+                        .header("Host", SERVER_DOMAIN)
+                        .header("Connection", "close"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+
+            let transcript = prover.transcript().unwrap();
+            prover
+                .reveal(
+                    Reveal::new()
+                        .sent(0..transcript.sent.len())
+                        .recv(0..transcript.recv.len())
+                        .server_identity(true),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let mut io = prover.finish().await.unwrap().compat();
+            let attestation: AttestationWire = read_msg(&mut io).await.unwrap();
+            assert_eq!(
+                &attestation.attested_data[..32],
+                &libid_crypto::keccak256(SERVER_DOMAIN.as_bytes())
+            );
+            let recovered = libid_crypto::recover_eth_claim(
+                &attestation.notary_signature,
+                &libid_crypto::keccak256(&attestation.attested_data),
+            )
+            .unwrap();
+            assert_eq!(recovered.to_encoded_point(true).as_bytes(), expected_pubkey);
+            assert_eq!(io.read(&mut [0]).await.unwrap(), 0);
+        };
+
+        tokio::time::timeout(Duration::from_secs(60), protocol)
+            .await
+            .expect("local MPC smoke timed out");
+        notary_task.await.unwrap();
+        fixture_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
