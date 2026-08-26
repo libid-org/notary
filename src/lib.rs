@@ -3,8 +3,8 @@
 //! One binary, one signing identity, two notary duties:
 //!
 //! * **Platform sessions** — MPC-TLS / zkTLS (ProxyMode) notarization of
-//!   platform API sessions (X, GitHub, …), producing tlsn attestations,
-//!   `EvmProof`s and on-demand token/me hash-commit attestations.
+//!   platform API sessions (X, GitHub, …), producing the signed canonical
+//!   ceremony section 9.1 attestation for the authenticated transcript.
 //! * **JWKS readings** — notarized readings of Google's OIDC JWKS
 //!   (`https://www.googleapis.com/oauth2/v3/certs`), producing signed
 //!   `JwksRotationProof`s for the on-chain `JwksOracle`.
@@ -12,7 +12,7 @@
 //! Both duties are served by the same TCP wire listener: the notary runs the
 //! MPC-TLS verifier first, then dispatches on the TLS-cert-verified server
 //! name — `www.googleapis.com` gets the JWKS response shape, everything else
-//! the platform response shape. The browser-facing HTTP/WS API (tlsn-js /
+//! gets the ceremony attestation. The browser-facing HTTP/WS API (tlsn-js /
 //! tlsn_wasm compatible) lives on a second port.
 //!
 //! The crate is a library too: [`jwks`] exposes the prover-side helpers a
