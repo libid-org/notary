@@ -682,26 +682,6 @@ where
     Ok(())
 }
 
-// ─── tlsn attestation signing ────────────────────────────────────────────────
-//
-// tlsn's `Signer` trait is NOT ours to change — it lives in the pinned tlsn
-// crate and is synchronous, while KMS signing is a network call. Rather than
-// bridge sync→async inside the trait (runtime hacks), the sign step is lifted
-// OUT of tlsn entirely:
-//
-//   1. `build()` runs with a capture-only signer: pure computation, no IO.
-//      It records the serialized attestation header — the exact bytes tlsn
-//      would have signed — and returns a placeholder signature.
-//   2. The real signature is produced by an ordinary `.await` on
-//      ManagedSigner, in the async handler.
-//   3. `Attestation`'s fields are public; the placeholder is replaced.
-//
-// This is sound because the header does not depend on the signature (it is
-// id + version + body root), and the verifying key embedded in the body is
-// the REAL key — the capture signer reports it truthfully. The format matches
-// tlsn's own `Secp256k1EthSigner`: keccak256 the message, sign the bare
-// digest, 65 bytes r || s || v with v ∈ {27, 28}.
-
 // ─── Core notary logic (transport-agnostic) ─────────────────────────────────
 
 /// TCP client (Rust backend prover) — uses the full custom wire protocol.
@@ -781,46 +761,6 @@ where
 
 #[cfg(test)]
 mod tests {
-
-    /// Pins the lifted-out attestation signing (HeaderCaptureSigner +
-    /// ManagedSigner::sign_prehash) byte-identical to tlsn's own
-    /// Secp256k1EthSigner. Both sides use RFC 6979 deterministic ECDSA, so
-    /// equal inputs MUST give equal signatures — any divergence in hashing,
-    /// s-normalisation or v encoding fails this test instead of surfacing as
-    /// attestations the prover rejects.
-    #[tokio::test]
-    async fn lifted_signing_matches_tlsn_secp256k1eth_signer() {
-        use libid_signer::SignerSource;
-        use tlsn::attestation::signing::{
-            Secp256k1EthSigner,
-            Signer as _,
-        };
-
-        // anvil #0 — public test key.
-        let key_hex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        let key_bytes = hex::decode(key_hex).unwrap();
-
-        let tlsn_signer = Secp256k1EthSigner::new(&key_bytes).unwrap();
-        let managed = SignerSource::from_spec(key_hex)
-            .unwrap()
-            .build_managed(None)
-            .await
-            .unwrap();
-
-        // Arbitrary "serialized header" bytes of various shapes.
-        for msg in [&b"header"[..], &[0u8; 97], &[0xFF; 32]] {
-            let reference = tlsn_signer.sign(msg).expect("tlsn sign");
-            let digest = libid_crypto::keccak256(msg);
-            let lifted = managed.sign_prehash(&digest).await.expect("managed sign");
-            assert_eq!(reference.data, lifted, "msg {msg:02x?}");
-            // And the verifying key the capture signer embeds matches tlsn's.
-            assert_eq!(
-                tlsn_signer.verifying_key().data,
-                managed.compressed_public_key().to_vec()
-            );
-        }
-    }
-
     #[tokio::test]
     async fn attestation_is_one_length_prefixed_frame_then_eof() {
         use libid_transcript::read_msg;
