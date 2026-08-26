@@ -470,10 +470,7 @@ async fn handle_ws_proxy_notarize(
     }
 }
 
-async fn run_proxy_verifier_session<T>(
-    socket: T,
-    state: &NotaryState,
-) -> Result<()>
+async fn run_proxy_verifier_session<T>(socket: T, state: &NotaryState) -> Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
@@ -529,11 +526,12 @@ where
             .unwrap_or_else(|| format!("{server_name_str}:443"));
         #[cfg(not(test))]
         let server_addr = format!("{server_name_str}:443");
-        let server_tcp = tokio::net::TcpStream::connect(server_addr)
-            .await
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("TCP connect to {server_name_str}: {e}"),
-            })?;
+        let server_tcp =
+            tokio::net::TcpStream::connect(server_addr)
+                .await
+                .map_err(|e| Error::NotaryServer {
+                    detail: format!("TCP connect to {server_name_str}: {e}"),
+                })?;
 
         let verifier = proxy_verifier
             .accept()
@@ -934,11 +932,9 @@ mod tests {
             .unwrap();
         });
 
-        let (websocket, _) = connect_async(format!(
-            "ws://{notary_addr}/notarize-proxy"
-        ))
-        .await
-        .unwrap();
+        let (websocket, _) = connect_async(format!("ws://{notary_addr}/notarize-proxy"))
+            .await
+            .unwrap();
         let (mut ws_tx, mut ws_rx) = websocket.split();
         let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
         let pump_task = tokio::spawn(async move {
@@ -1025,10 +1021,7 @@ mod tests {
                 &libid_crypto::keccak256(&attested_data),
             )
             .unwrap();
-            assert_eq!(
-                recovered.to_encoded_point(true).as_bytes(),
-                expected_pubkey
-            );
+            assert_eq!(recovered.to_encoded_point(true).as_bytes(), expected_pubkey);
             assert_eq!(io.read(&mut [0]).await.unwrap(), 0);
         };
 
