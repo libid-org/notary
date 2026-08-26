@@ -4,9 +4,8 @@ The libID notary service. One binary, one signing identity, two duties:
 
 * **Platform session notarization** — the notary acts as the MPC-TLS or
   ProxyMode (zkTLS) verifier for a prover's HTTPS session with a platform API
-  (X, GitHub, …) and signs what was proven: tlsn attestations, EVM-ready
-  transcript proofs, and on-demand token / user-identity attestations whose
-  digests on-chain verifiers recover.
+  (X, GitHub, …) and signs the canonical ceremony section 9.1 attested data
+  for the authenticated transcript.
 * **Notarized JWKS readings** — the notary co-fetches Google's OIDC signing
   keys (`https://www.googleapis.com/oauth2/v3/certs`) over MPC-TLS and signs a
   `JwksRotationProof` that a `JwksOracle` contract accepts, so an on-chain
@@ -15,9 +14,9 @@ The libID notary service. One binary, one signing identity, two duties:
 Both duties share one TCP listener: the notary verifies the MPC-TLS session
 first, then dispatches on the TLS-certificate-verified server name. A session
 with `www.googleapis.com` is answered with the JWKS proof shape; every other
-session with the platform proof shape. The notary's signature alone registers
-nothing — on-chain verifiers recover it against the notary public key served
-at `/info`.
+session with the ceremony attestation. The notary's signature alone registers
+nothing — on-chain verifiers recover it against the notary public key served at
+`/info`.
 
 ## Endpoints
 
@@ -50,8 +49,7 @@ Flags or environment variables:
 | `--jwks-enabled` | `NOTARY_JWKS_ENABLED` | `true` | Serve JWKS notarization sessions on the TCP listener |
 
 With a KMS key the private material never enters the process: every signature
-is a `kms:Sign` call, including tlsn attestations (the sign step is lifted out
-of tlsn and applied asynchronously, byte-identical to tlsn's own signer).
+is a `kms:Sign` call, including ceremony attestations and JWKS rotation proofs.
 
 ## Docker
 
