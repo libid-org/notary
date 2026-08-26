@@ -1,5 +1,14 @@
 # notary
 
+libID does not implement notarization itself. It relies on
+[TLSNotary](https://tlsnotary.org/) and its upstream
+[`tlsn`](https://github.com/tlsnotary/tlsn) implementation for the
+notarization protocol and cryptography. This repository is a thin integration
+wrapper that retains completed attestations for retrieval and exposes the
+HTTP/WebSocket server used by browser clients, including ProxyMode support. We
+are grateful to the TLSNotary contributors for building and sharing the
+excellent protocol that makes this service possible.
+
 The libID notary service. One binary, one signing identity, two duties:
 
 * **Platform session notarization** — the notary acts as the MPC-TLS or
