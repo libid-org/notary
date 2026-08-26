@@ -34,8 +34,7 @@ HTTP / WebSocket on `NOTARY_WS_PORT` (default **7048**) — browser TLSNotary:
 A server-side MPC-TLS prover needs no route: it opens the TCP listener itself,
 and the same record is written back down that socket.
 
-Browser sessions carry no session ID and expose no polling route. The live
-WebSocket correlates the TLSNotary session with its final attestation.
+The live WebSocket carries the TLSNotary session and its final attestation.
 
 ## Configuration
 

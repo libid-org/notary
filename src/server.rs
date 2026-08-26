@@ -38,7 +38,6 @@ use axum::{
             WebSocket,
             WebSocketUpgrade,
         },
-        OriginalUri,
         State,
     },
     http::StatusCode,
@@ -392,12 +391,8 @@ async fn send_attestation<W: tokio::io::AsyncWrite + Unpin>(
 
 async fn notarize_proxy_ws_handler(
     ws: WebSocketUpgrade,
-    OriginalUri(uri): OriginalUri,
     State(state): State<NotaryState>,
 ) -> impl IntoResponse {
-    if uri.query().is_some() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
     let Ok(permit) = Arc::clone(&state.proxy_sessions).try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
