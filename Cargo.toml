@@ -90,7 +90,11 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",
 ] }
+tlsn-sdk-core = { git = "https://github.com/grndd-systems/tlsn", rev = "ab632378c35a30794dcbf1caecc3176450f4d0a1" }
+tlsn-server-fixture = { git = "https://github.com/grndd-systems/tlsn", rev = "ab632378c35a30794dcbf1caecc3176450f4d0a1" }
+tlsn-server-fixture-certs = { git = "https://github.com/grndd-systems/tlsn", rev = "ab632378c35a30794dcbf1caecc3176450f4d0a1" }
 tokio = { version = "1", features = ["test-util"] }
+tokio-tungstenite = "0.29"
 
 [patch."https://github.com/tlsnotary/tlsn"]
 # WIP: TLSNotary #1178 adds finish() so the browser can reclaim this same

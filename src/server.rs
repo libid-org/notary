@@ -190,6 +190,15 @@ struct NotaryState {
     proxy_sessions: Arc<Semaphore>,
     public_key_hex: String,
     jwks_enabled: bool,
+    #[cfg(test)]
+    proxy_test: Option<ProxyTestConfig>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ProxyTestConfig {
+    server_addr: SocketAddr,
+    root_store: tlsn::webpki::RootCertStore,
 }
 
 #[derive(Serialize)]
@@ -218,6 +227,8 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         proxy_sessions: Arc::new(Semaphore::new(config.max_sessions)),
         public_key_hex,
         jwks_enabled: config.jwks_enabled,
+        #[cfg(test)]
+        proxy_test: None,
     };
 
     // Broadcast shutdown to the TCP and WebSocket servers.
@@ -473,10 +484,18 @@ where
     let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
     let setup = async {
+        #[cfg(test)]
+        let root_store = state
+            .proxy_test
+            .as_ref()
+            .map(|config| config.root_store.clone())
+            .unwrap_or_else(libid_tlsn::root_store);
+        #[cfg(not(test))]
+        let root_store = libid_tlsn::root_store();
         let verifier = handle
             .new_verifier(
                 VerifierConfig::builder()
-                    .root_store(libid_tlsn::root_store())
+                    .root_store(root_store)
                     .build()
                     .map_err(|e| Error::NotaryServer {
                         detail: format!("verifier config: {e}"),
@@ -502,7 +521,15 @@ where
         let server_name_str = proxy_verifier.config().server_name().as_str().to_string();
         info!("ProxyMode: connecting to {server_name_str}:443");
 
-        let server_tcp = tokio::net::TcpStream::connect(format!("{server_name_str}:443"))
+        #[cfg(test)]
+        let server_addr = state
+            .proxy_test
+            .as_ref()
+            .map(|config| config.server_addr.to_string())
+            .unwrap_or_else(|| format!("{server_name_str}:443"));
+        #[cfg(not(test))]
+        let server_addr = format!("{server_name_str}:443");
+        let server_tcp = tokio::net::TcpStream::connect(server_addr)
             .await
             .map_err(|e| Error::NotaryServer {
                 detail: format!("TCP connect to {server_name_str}: {e}"),
@@ -811,6 +838,208 @@ mod tests {
         send.await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_protocol_returns_attestation_on_the_reclaimed_websocket() {
+        use std::{
+            sync::Arc,
+            time::Duration,
+        };
+
+        use axum::{
+            routing::get,
+            Router,
+        };
+        use futures_util::{
+            SinkExt,
+            StreamExt,
+        };
+        use libid_signer::SignerSource;
+        use libid_transcript::read_msg;
+        use tlsn_sdk_core::{
+            HttpRequest,
+            ProverConfig,
+            ProverMode,
+            Reveal,
+            SdkProver,
+        };
+        use tlsn_server_fixture_certs::{
+            CA_CERT_DER,
+            SERVER_DOMAIN,
+        };
+        use tokio::{
+            io::{
+                AsyncReadExt,
+                AsyncWriteExt,
+            },
+            net::TcpListener,
+            sync::Semaphore,
+        };
+        use tokio_tungstenite::{
+            connect_async,
+            tungstenite::Message as WsMessage,
+        };
+        use tokio_util::compat::{
+            FuturesAsyncReadCompatExt,
+            TokioAsyncReadCompatExt,
+        };
+
+        use super::{
+            notarize_proxy_ws_handler,
+            NotaryState,
+            ProxyTestConfig,
+        };
+
+        const TEST_KEY: &str =
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+        let prover_config = ProverConfig::builder(SERVER_DOMAIN)
+            .mode(ProverMode::Proxy)
+            .root_certs(vec![CA_CERT_DER.to_vec()])
+            .build()
+            .unwrap();
+
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (socket, _) = target_listener.accept().await.unwrap();
+            tlsn_server_fixture::bind(socket.compat()).await.unwrap();
+        });
+
+        let signer = SignerSource::from_spec(TEST_KEY)
+            .unwrap()
+            .build_managed(None)
+            .await
+            .unwrap();
+        let expected_pubkey = signer.compressed_public_key().to_vec();
+        let state = NotaryState {
+            signer: Arc::new(signer),
+            proxy_sessions: Arc::new(Semaphore::new(1)),
+            public_key_hex: String::new(),
+            jwks_enabled: false,
+            proxy_test: Some(ProxyTestConfig {
+                server_addr: target_addr,
+                root_store: prover_config.root_store.clone(),
+            }),
+        };
+        let notary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let notary_addr = notary_listener.local_addr().unwrap();
+        let notary_task = tokio::spawn(async move {
+            axum::serve(
+                notary_listener,
+                Router::new()
+                    .route("/notarize-proxy", get(notarize_proxy_ws_handler))
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+
+        let (websocket, _) = connect_async(format!(
+            "ws://{notary_addr}/notarize-proxy"
+        ))
+        .await
+        .unwrap();
+        let (mut ws_tx, mut ws_rx) = websocket.split();
+        let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
+        let pump_task = tokio::spawn(async move {
+            let (mut pipe_reader, mut pipe_writer) = tokio::io::split(pump_io);
+            let ws_to_pipe = async {
+                while let Some(message) = ws_rx.next().await {
+                    match message.unwrap() {
+                        WsMessage::Binary(data) => {
+                            pipe_writer.write_all(&data).await.unwrap();
+                        }
+                        WsMessage::Close(_) => {
+                            pipe_writer.shutdown().await.unwrap();
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            let pipe_to_ws = async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match pipe_reader.read(&mut buf).await.unwrap() {
+                        0 => break,
+                        n => ws_tx
+                            .send(WsMessage::Binary(buf[..n].to_vec().into()))
+                            .await
+                            .unwrap(),
+                    }
+                }
+            };
+            tokio::select! {
+                _ = ws_to_pipe => {}
+                _ = pipe_to_ws => {}
+            }
+        });
+
+        let protocol = async {
+            let mut prover = SdkProver::new(prover_config).unwrap();
+            prover.setup(browser_io.compat()).await.unwrap();
+            let response = prover
+                .send_request_proxy(
+                    HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
+                        .header("Host", SERVER_DOMAIN)
+                        .header("Connection", "close"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+
+            let transcript = prover.transcript().unwrap();
+            prover
+                .reveal(
+                    Reveal::new()
+                        .sent(0..transcript.sent.len())
+                        .recv(0..transcript.recv.len())
+                        .server_identity(true),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let mut io = prover.finish().await.unwrap().compat();
+            let attestation: serde_json::Value = read_msg(&mut io).await.unwrap();
+            let attested_data: Vec<u8> = attestation["attested_data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|byte| byte.as_u64().unwrap() as u8)
+                .collect();
+            let signature: Vec<u8> = attestation["notary_signature"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|byte| byte.as_u64().unwrap() as u8)
+                .collect();
+
+            assert_eq!(
+                &attested_data[..32],
+                &libid_crypto::keccak256(SERVER_DOMAIN.as_bytes())
+            );
+            assert_eq!(signature.len(), 65);
+            let recovered = libid_crypto::recover_eth_claim(
+                &signature,
+                &libid_crypto::keccak256(&attested_data),
+            )
+            .unwrap();
+            assert_eq!(
+                recovered.to_encoded_point(true).as_bytes(),
+                expected_pubkey
+            );
+            assert_eq!(io.read(&mut [0]).await.unwrap(), 0);
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), protocol)
+            .await
+            .expect("local ProxyMode smoke timed out");
+        pump_task.await.unwrap();
+        target_task.await.unwrap();
+        notary_task.abort();
+    }
+
     /// A client that connects and then goes silent forever must not pin the
     /// handler past [`CONNECTION_DEADLINE`] — defense in depth over the
     /// fail-fast fixes, covering whatever future bug makes a session pend.
@@ -841,6 +1070,7 @@ mod tests {
             signer: Arc::new(signer),
             proxy_sessions: Arc::new(Semaphore::new(8)),
             jwks_enabled: false,
+            proxy_test: None,
         };
 
         // The client half stays open and never writes a byte.
