@@ -2721,6 +2721,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-rustls"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8d8a2499f0fecc0492eb3e47eab4e92da7875e1028ad2528f214ac3346ca04e"
+dependencies = [
+ "futures-io",
+ "rustls 0.22.4",
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4146,7 +4157,11 @@ dependencies = [
  "serde_with",
  "thiserror 2.0.20",
  "tlsn",
+ "tlsn-sdk-core",
+ "tlsn-server-fixture",
+ "tlsn-server-fixture-certs",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tower-http",
  "tracing",
@@ -4344,6 +4359,38 @@ checksum = "7df728be843c7070fab6ab7c328c4e9e9d78e23bf749c0669c86ee7ebfa050a2"
 dependencies = [
  "memchr",
  "ucd-trie",
+]
+
+[[package]]
+name = "pest_derive"
+version = "2.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e2dd6fc3b26b3462ee188aac870f5a41d398f1cd5e2408d16531bd71c9591fd"
+dependencies = [
+ "pest",
+ "pest_generator",
+]
+
+[[package]]
+name = "pest_generator"
+version = "2.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a7a9205cfb6f596a9e8b689c0a15f9ceb7a1aafae7aaf788150ac65b29975b6"
+dependencies = [
+ "pest",
+ "pest_meta",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "pest_meta"
+version = "2.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85abd351c0de1e8384fc791a0737111a350394937e92b956b743dac12429f57c"
+dependencies = [
+ "pest",
 ]
 
 [[package]]
@@ -4991,6 +5038,19 @@ dependencies = [
 
 [[package]]
 name = "rustls"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf4ef73721ac7bcd79b2b315da7779d8fc09718c6b3d2d1b2d94850eb8c18432"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki 0.102.8",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "rustls"
 version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
@@ -5042,6 +5102,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
 dependencies = [
  "ring",
+ "untrusted",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.102.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
  "untrusted",
 ]
 
@@ -5482,6 +5553,19 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spansy"
+version = "0.1.0"
+source = "git+https://github.com/tlsnotary/tlsn-utils?rev=64722f7#64722f7de999cbd41c0cab7312dade306d50ea5f"
+dependencies = [
+ "bytes",
+ "httparse",
+ "pest",
+ "pest_derive",
+ "rangeset",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -5961,6 +6045,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "tlsn-sdk-core"
+version = "0.1.0-alpha.16-pre"
+source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+dependencies = [
+ "bytes",
+ "futures",
+ "http-body-util",
+ "hyper 1.11.0",
+ "pin-project-lite",
+ "rangeset",
+ "regex",
+ "rustls-pki-types",
+ "rustls-webpki 0.103.14",
+ "serde",
+ "serde_json",
+ "spansy",
+ "thiserror 1.0.69",
+ "tlsn",
+ "tlsn-core",
+ "tlsn-tls-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "tlsn-server-fixture"
+version = "0.0.0"
+source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures",
+ "futures-rustls",
+ "hyper 1.11.0",
+ "hyper-util",
+ "serde_json",
+ "tlsn-server-fixture-certs",
+ "tokio",
+ "tokio-util",
+ "tower-http",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "tlsn-server-fixture-certs"
+version = "0.0.0"
+source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+
+[[package]]
 name = "tlsn-tls-core"
 version = "0.1.0-alpha.16-pre"
 source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
@@ -6115,6 +6251,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 
