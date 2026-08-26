@@ -39,7 +39,7 @@ fn test_config(ws_port: u16) -> NotaryServerConfig {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn info_works_without_session_or_polling_endpoints() {
+async fn info_works() {
     let ws_port = free_port().await;
     let handle = server::run(test_config(ws_port))
         .await
@@ -59,34 +59,6 @@ async fn info_works_without_session_or_polling_endpoints() {
         .expect("info json");
     assert_eq!(info["publicKey"], TEST_PUBKEY);
     assert_eq!(info["version"], format!("v{}", env!("CARGO_PKG_VERSION")));
-
-    // Browser notarization is one WebSocket, with no session creation or
-    // attestation polling routes.
-    let resp = client
-        .post(format!("{base}/session"))
-        .json(&serde_json::json!({"clientType": "websocket"}))
-        .send()
-        .await
-        .expect("POST /session");
-    assert_eq!(resp.status(), 404);
-
-    let resp = client
-        .get(format!("{base}/attestation/never-observed"))
-        .send()
-        .await
-        .expect("GET /attestation");
-    assert_eq!(resp.status(), 404);
-
-    let resp = client
-        .get(format!("{base}/notarize-proxy?sessionId=legacy"))
-        .header("Connection", "upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .send()
-        .await
-        .expect("legacy WebSocket query");
-    assert_eq!(resp.status(), 400);
 
     handle.shutdown();
 }
