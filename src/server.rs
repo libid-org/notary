@@ -465,7 +465,12 @@ async fn handle_ws_proxy_notarize(
                 error!("ProxyMode WebSocket pump join error: {e}");
             }
         }
-        Ok(Err(e)) => error!("ProxyMode verifier error: {}", e),
+        Ok(Err(e)) => {
+            error!("ProxyMode verifier error: {}", e);
+            if let Err(join_error) = pump_task.into_inner().await {
+                error!("ProxyMode WebSocket pump join error: {join_error}");
+            }
+        }
         Err(_) => error!(
             "ProxyMode session exceeded the {}s connection deadline; aborting",
             CONNECTION_DEADLINE.as_secs()
@@ -529,12 +534,20 @@ where
             .unwrap_or_else(|| format!("{server_name_str}:443"));
         #[cfg(not(test))]
         let server_addr = format!("{server_name_str}:443");
-        let server_tcp =
-            tokio::net::TcpStream::connect(server_addr)
-                .await
-                .map_err(|e| Error::NotaryServer {
-                    detail: format!("TCP connect to {server_name_str}: {e}"),
-                })?;
+        let server_tcp = match tokio::net::TcpStream::connect(server_addr).await {
+            Ok(server_tcp) => server_tcp,
+            Err(error) => {
+                let detail = format!("TCP connect to {server_name_str}: {error}");
+                proxy_verifier
+                    .reject(Some("UPSTREAM_CONNECT_FAILED"))
+                    .await
+                    .map_err(|error| Error::NotaryServer {
+                        detail: format!("send connection rejection: {error}"),
+                    })?;
+                handle.close();
+                return Ok(Err(Error::NotaryServer { detail }));
+            }
+        };
 
         let verifier = proxy_verifier
             .accept()
@@ -578,7 +591,7 @@ where
         })?;
         handle.close();
 
-        Ok((server_name, transcript, transcript_commitments))
+        Ok::<_, Error>(Ok((server_name, transcript, transcript_commitments)))
     };
     tokio::pin!(setup);
 
@@ -586,11 +599,18 @@ where
     // connection died under the session (e.g. a client that connected and
     // immediately closed) — a protocol request already submitted to it may
     // then never resolve, so fail instead of pending forever.
-    let (server_name, transcript, transcript_commitments) = tokio::select! {
+    let setup_outcome = tokio::select! {
         biased;
         res = &mut setup => res?,
         driver_res = driver_task.handle_mut() => {
             return Err(driver_finished_early(driver_res));
+        }
+    };
+    let (server_name, transcript, transcript_commitments) = match setup_outcome {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = driver_task.into_inner().await;
+            return Err(error);
         }
     };
 
@@ -975,7 +995,7 @@ mod tests {
         });
 
         let protocol = async {
-            let mut prover = SdkProver::new(prover_config).unwrap();
+            let mut prover = SdkProver::new(prover_config.clone()).unwrap();
             prover.setup(browser_io.compat()).await.unwrap();
             let response = prover
                 .send_request_proxy(
@@ -1033,6 +1053,77 @@ mod tests {
             .expect("local ProxyMode smoke timed out");
         pump_task.await.unwrap();
         target_task.await.unwrap();
+
+        // The target listener is now gone. A second session exercises the
+        // same TcpStream::connect error path as a DNS failure and must close
+        // the browser transport promptly instead of waiting five minutes.
+        let (websocket, _) = connect_async(format!("ws://{notary_addr}/notarize-proxy"))
+            .await
+            .unwrap();
+        let (mut ws_tx, mut ws_rx) = websocket.split();
+        let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
+        let failed_pump = tokio::spawn(async move {
+            let (mut pipe_reader, mut pipe_writer) = tokio::io::split(pump_io);
+            let ws_to_pipe = async {
+                while let Some(message) = ws_rx.next().await {
+                    match message.unwrap() {
+                        WsMessage::Binary(data) => {
+                            pipe_writer.write_all(&data).await.unwrap();
+                        }
+                        WsMessage::Close(_) => {
+                            pipe_writer.shutdown().await.unwrap();
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            let pipe_to_ws = async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match pipe_reader.read(&mut buf).await.unwrap() {
+                        0 => break,
+                        n => {
+                            if ws_tx
+                                .send(WsMessage::Binary(buf[..n].to_vec().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            };
+            tokio::select! {
+                _ = ws_to_pipe => {}
+                _ = pipe_to_ws => {}
+            }
+        });
+        let mut prover = SdkProver::new(prover_config).unwrap();
+        let failed_session = async {
+            prover
+                .setup(browser_io.compat())
+                .await
+                .map_err(|error| error.to_string())?;
+            prover
+                .send_request_proxy(
+                    HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
+                        .header("Host", SERVER_DOMAIN)
+                        .header("Connection", "close"),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+        let result = tokio::time::timeout(Duration::from_secs(3), failed_session)
+            .await
+            .expect("server connect failure was not propagated to the prover");
+        assert!(
+            result.unwrap_err().contains("UPSTREAM_CONNECT_FAILED"),
+            "server connect failure lost its public diagnostic"
+        );
+        failed_pump.await.unwrap();
         notary_task.abort();
     }
 
