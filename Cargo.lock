@@ -4153,7 +4153,6 @@ dependencies = [
  "libid-signer",
  "libid-tlsn",
  "libid-transcript",
- "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",
