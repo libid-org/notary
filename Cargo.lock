@@ -5835,7 +5835,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 [[package]]
 name = "tlsn"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 dependencies = [
  "aes 0.8.4",
  "ctr 0.9.2",
@@ -5883,7 +5883,7 @@ dependencies = [
 [[package]]
 name = "tlsn-attestation"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 dependencies = [
  "bcs",
  "blake3",
@@ -5901,7 +5901,7 @@ dependencies = [
 [[package]]
 name = "tlsn-cipher"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 dependencies = [
  "aes 0.8.4",
  "async-trait",
@@ -5914,7 +5914,7 @@ dependencies = [
 [[package]]
 name = "tlsn-core"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 dependencies = [
  "bimap",
  "blake3",
@@ -5943,7 +5943,7 @@ dependencies = [
 [[package]]
 name = "tlsn-deap"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 dependencies = [
  "async-trait",
  "futures",
@@ -5960,7 +5960,7 @@ dependencies = [
 [[package]]
 name = "tlsn-hmac-sha256"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 dependencies = [
  "mpz-circuits",
  "mpz-core",
@@ -5974,7 +5974,7 @@ dependencies = [
 [[package]]
 name = "tlsn-key-exchange"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 dependencies = [
  "async-trait",
  "derive_builder 0.12.0",
@@ -5997,7 +5997,7 @@ dependencies = [
 [[package]]
 name = "tlsn-mpc-tls"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -6047,7 +6047,7 @@ dependencies = [
 [[package]]
 name = "tlsn-sdk-core"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 dependencies = [
  "bytes",
  "futures",
@@ -6073,7 +6073,7 @@ dependencies = [
 [[package]]
 name = "tlsn-server-fixture"
 version = "0.0.0"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 dependencies = [
  "anyhow",
  "axum",
@@ -6094,12 +6094,12 @@ dependencies = [
 [[package]]
 name = "tlsn-server-fixture-certs"
 version = "0.0.0"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 
 [[package]]
 name = "tlsn-tls-core"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/grndd-systems/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
+source = "git+https://github.com/libid-org/tlsn?rev=ab632378c35a30794dcbf1caecc3176450f4d0a1#ab632378c35a30794dcbf1caecc3176450f4d0a1"
 dependencies = [
  "futures",
  "hmac 0.12.1",
