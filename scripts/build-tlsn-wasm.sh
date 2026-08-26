@@ -7,8 +7,9 @@
 # with a specific instruction when it cannot.
 #
 # Why build rather than take `tlsn-js` from npm: the published package is an
-# older build whose Prover has no `set_progress_callback`, which browser
-# prover workers call. Shipping the npm build instead makes platform linking
+# older build whose Prover lacks the progress callback and reclaimed-channel
+# `finish()` method the browser calls. Shipping the npm build instead makes
+# platform linking
 # die at "Notarizing sessions" with
 #   w.set_progress_callback is not a function
 # The assert near the end of this script is what stops that happening.
@@ -46,7 +47,8 @@ IN_CI="${CI:-}"
 # staged AND carries the symbol we need is accepted as-is.
 if [ -z "${TLSN_WASM_FORCE:-}" ] \
    && [ -f "$OUT_DIR/tlsn_wasm_bg.wasm" ] \
-   && grep -q "set_progress_callback" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null; then
+   && grep -q "set_progress_callback" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null \
+   && grep -q "finish()" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null; then
     echo "[tlsn-wasm] already staged — skipping (TLSN_WASM_FORCE=1 to rebuild)"
     exit 0
 fi
@@ -60,18 +62,18 @@ fi
 # written either way -- `?rev=<sha>#<sha>` or `?tag=<name>#<sha>` -- and the
 # fragment is the commit in both. Matching the request instead made this fail
 # silently the day the pin moved from a rev to a tag.
-TLSN_REV="$(sed -nE 's|^source = "git\+https://github\.com/tlsnotary/tlsn\?[^#]*#([0-9a-f]{40})".*|\1|p' "$REPO_ROOT/Cargo.lock" | sort -u)"
-if [ -z "$TLSN_REV" ]; then
-    echo "ERROR: could not read the tlsn commit from Cargo.lock."
-    echo '       Expected: source = "git+https://github.com/tlsnotary/tlsn?...#<40-hex>"'
+TLSN_SOURCE="$(sed -nE 's|^source = "git\+(https://github\.com/[^?]+/tlsn)\?[^#]*#([0-9a-f]{40})".*|\1 \2|p' "$REPO_ROOT/Cargo.lock" | sort -u)"
+if [ -z "$TLSN_SOURCE" ]; then
+    echo "ERROR: could not read the tlsn source from Cargo.lock."
     exit 1
 fi
-if [ "$(wc -l <<<"$TLSN_REV")" -ne 1 ]; then
-    echo "ERROR: Cargo.lock pins more than one tlsn rev:"
-    echo "$TLSN_REV"
+if [ "$(wc -l <<<"$TLSN_SOURCE")" -ne 1 ]; then
+    echo "ERROR: Cargo.lock pins more than one tlsn source:"
+    echo "$TLSN_SOURCE"
     echo "       The direct tlsn dependency and libid-tlsn's pin have diverged."
     exit 1
 fi
+read -r TLSN_REPO TLSN_REV <<<"$TLSN_SOURCE"
 
 # rustup's bin must come FIRST: some CI images ship a non-rustup cargo that
 # cannot add targets, and if that one wins the build fails confusingly.
@@ -153,7 +155,9 @@ SRC="$CACHE_DIR/tlsn"
 if [ ! -d "$SRC/.git" ]; then
     mkdir -p "$SRC"
     git -C "$SRC" init -q
-    git -C "$SRC" remote add origin https://github.com/tlsnotary/tlsn.git
+    git -C "$SRC" remote add origin "$TLSN_REPO"
+elif [ "$(git -C "$SRC" remote get-url origin)" != "$TLSN_REPO" ]; then
+    git -C "$SRC" remote set-url origin "$TLSN_REPO"
 fi
 if [ "$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo none)" != "$TLSN_REV" ]; then
     echo "[tlsn-wasm] fetching tlsn @ $TLSN_REV"
@@ -189,6 +193,10 @@ if ! grep -q "set_progress_callback" "$PKG/tlsn_wasm.js"; then
     echo "ERROR: built tlsn_wasm.js has no set_progress_callback."
     echo "       Browser prover workers call it. Refusing to stage a bundle"
     echo "       that would fail at 'Notarizing sessions'."
+    exit 1
+fi
+if ! grep -q "finish()" "$PKG/tlsn_wasm.js"; then
+    echo "ERROR: built tlsn_wasm.js cannot reclaim the notarization channel."
     exit 1
 fi
 

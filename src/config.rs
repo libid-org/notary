@@ -25,10 +25,8 @@ pub struct NotaryServerConfig {
     #[arg(long, env = "SIGNING_KEY")]
     pub signing_key: String,
 
-    /// Max concurrent live sessions before `POST /session` is rejected (503).
-    /// A capacity / DoS-defense knob — tune per deployment (notary RAM,
-    /// expected concurrent provers). The background sweep bounds each entry's
-    /// lifetime; this bounds the burst rate.
+    /// Max concurrent browser ProxyMode sessions before WebSocket upgrade is
+    /// rejected (503). The connection deadline bounds each permit's lifetime.
     #[arg(long, env = "NOTARY_MAX_SESSIONS", default_value_t = 1024)]
     pub max_sessions: usize,
 

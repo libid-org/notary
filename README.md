@@ -24,20 +24,18 @@ at `/info`.
 TCP wire protocol on `NOTARY_PORT` (default **7047**) — length-prefixed JSON
 after MPC-TLS, for Rust backend provers.
 
-HTTP / WebSocket on `NOTARY_WS_PORT` (default **7048**) — tlsn-js compatible:
+HTTP / WebSocket on `NOTARY_WS_PORT` (default **7048**) — browser TLSNotary:
 
 | Route | What it does |
 |---|---|
 | `GET /info` | `{version, publicKey}` — compressed SEC1 notary public key, hex |
-| `POST /session` | Create a session → `{sessionId}` (503 above `NOTARY_MAX_SESSIONS`) |
-| `WS /notarize-proxy?sessionId=` | ProxyMode (zkTLS) verifier session — the browser path |
-| `GET /attestation/{sessionId}` | Long-poll the finished session's section 9.1 record |
+| `WS /notarize-proxy` | ProxyMode session, then one length-prefixed section 9.1 attestation on the same WebSocket |
 
 A server-side MPC-TLS prover needs no route: it opens the TCP listener itself,
 and the same record is written back down that socket.
 
-Sessions live at most 30 minutes; a background sweep evicts anything older,
-fetched or not.
+Browser sessions carry no session ID and expose no polling route. The live
+WebSocket correlates the TLSNotary session with its final attestation.
 
 ## Configuration
 
@@ -49,8 +47,7 @@ Flags or environment variables:
 | `--port` | `NOTARY_PORT` | `7047` | TCP wire port |
 | `--ws-port` | `NOTARY_WS_PORT` | `7048` | HTTP/WS port (`0` disables) |
 | `--signing-key` | `SIGNING_KEY` | — | Hex secp256k1 key, or `kms:<key-id-or-alias>` for AWS KMS |
-| `--x-zk-verifier-address` | `X_ZK_VERIFIER_ADDRESS` | — | ZK verifier contract recovering token/me attestations |
-| `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent-session cap |
+| `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent browser ProxyMode session cap |
 | `--jwks-enabled` | `NOTARY_JWKS_ENABLED` | `true` | Serve JWKS notarization sessions on the TCP listener |
 
 With a KMS key the private material never enters the process: every signature
@@ -66,7 +63,6 @@ docker run --rm \
   -p 7047:7047 -p 7048:7048 \
   -e NOTARY_HOST=0.0.0.0 \
   -e SIGNING_KEY=<hex-or-kms:…> \
-  -e X_ZK_VERIFIER_ADDRESS=0x… \
   ghcr.io/libid-org/notary:latest
 ```
 
