@@ -10,7 +10,7 @@
 //!   socket the prover opened.
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
 //! - **GET /notarize-proxy** (WS upgrade): ProxyMode session followed by one
-//!   length-prefixed ceremony attestation on the reclaimed WebSocket.
+//!   length-prefixed ceremony attestation in its own WebSocket message.
 //!
 //! # Trust model
 //!
@@ -363,13 +363,24 @@ async fn sign_ceremony_attestation(
     })
 }
 
-async fn send_attestation<W: tokio::io::AsyncWrite + Unpin>(
-    io: &mut W,
-    attestation: &AttestationWire,
-) -> Result<()> {
-    write_msg(io, attestation).await?;
-    io.shutdown().await?;
-    Ok(())
+fn attestation_frame(attestation: &AttestationWire) -> Result<Vec<u8>> {
+    const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
+
+    let json = serde_json::to_vec(attestation)?;
+    if json.len() > MAX_FRAME_BYTES {
+        return Err(Error::NotaryServer {
+            detail: format!("attestation frame is too large: {} bytes", json.len()),
+        });
+    }
+    let len = u32::try_from(json.len())
+        .map_err(|_| Error::NotaryServer {
+            detail: format!("attestation frame is too large: {} bytes", json.len()),
+        })?
+        .to_be_bytes();
+    let mut frame = Vec::with_capacity(len.len() + json.len());
+    frame.extend_from_slice(&len);
+    frame.extend_from_slice(&json);
+    Ok(frame)
 }
 
 // ─── ProxyMode WebSocket handler ─────────────────────────────────────────────
@@ -398,62 +409,69 @@ async fn handle_ws_proxy_notarize(
 ) {
     let (io_a, io_b) = tokio::io::duplex(1 << 17);
     let (mut ws_tx, mut ws_rx) = socket.split();
+    let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
 
-    // Guarded: when this handler returns, the pump is aborted with it —
-    // otherwise a client that keeps the WebSocket open after the session
-    // failed would pin the pump task (and the socket) indefinitely.
-    let pump_task = AbortOnDrop::new(tokio::spawn(async move {
-        let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
-        let ws_to_pipe = async {
-            while let Some(Ok(msg)) = ws_rx.next().await {
-                match msg {
-                    Message::Binary(data)
-                        if pipe_writer.write_all(&data).await.is_err() =>
-                    {
-                        break;
-                    }
-                    Message::Close(_) => break,
-                    _ => {}
+    // Keep inbound and outbound ownership separate. Whichever direction ends
+    // first must not cancel a write already accepted in the other direction.
+    let (attestation_tx, attestation_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    let _inbound_task = AbortOnDrop::new(tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            match msg {
+                Message::Binary(data) if pipe_writer.write_all(&data).await.is_err() => {
+                    break
                 }
+                Message::Close(_) => break,
+                _ => {}
             }
-        };
-        let pipe_to_ws = async {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                match pipe_reader.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if ws_tx
-                            .send(Message::Binary(buf[..n].to_vec().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-            let _ = ws_tx.send(Message::Close(None)).await;
-        };
-        tokio::select! {
-            _ = ws_to_pipe => {}
-            _ = pipe_to_ws => {}
         }
     }));
+    let outbound_task = AbortOnDrop::new(tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match pipe_reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if ws_tx
+                        .send(Message::Binary(buf[..n].to_vec().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
 
-    let session = run_proxy_verifier_session(io_b, &state);
-    match tokio::time::timeout(CONNECTION_DEADLINE, session).await {
-        Ok(Ok(())) => {
-            if let Err(e) = pump_task.into_inner().await {
-                error!("ProxyMode WebSocket pump join error: {e}");
-            }
+        // This message boundary is the handoff: TLSNotary may read ahead
+        // within one WebSocket message, but it cannot consume this later one
+        // before its mux has finished.
+        if let Ok(frame) = attestation_rx.await {
+            let _ = ws_tx.send(Message::Binary(frame.into())).await;
         }
-        Ok(Err(e)) => {
-            error!("ProxyMode verifier error: {}", e);
-            if let Err(join_error) = pump_task.into_inner().await {
-                error!("ProxyMode WebSocket pump join error: {join_error}");
+        let _ = ws_tx.send(Message::Close(None)).await;
+    }));
+
+    let protocol = async {
+        let result = match run_proxy_verifier_session(io_b, &state).await {
+            Ok(attestation) => attestation_frame(&attestation).and_then(|frame| {
+                attestation_tx.send(frame).map_err(|_| Error::NotaryServer {
+                    detail: "browser disconnected before attestation handoff".into(),
+                })
+            }),
+            Err(error) => {
+                drop(attestation_tx);
+                Err(error)
             }
+        };
+        if let Err(error) = outbound_task.into_inner().await {
+            error!("ProxyMode WebSocket outbound pump join error: {error}");
         }
+        result
+    };
+
+    match tokio::time::timeout(CONNECTION_DEADLINE, protocol).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("ProxyMode verifier error: {}", e),
         Err(_) => error!(
             "ProxyMode session exceeded the {}s connection deadline; aborting",
             CONNECTION_DEADLINE.as_secs()
@@ -461,7 +479,10 @@ async fn handle_ws_proxy_notarize(
     }
 }
 
-async fn run_proxy_verifier_session<T>(socket: T, state: &NotaryState) -> Result<()>
+async fn run_proxy_verifier_session<T>(
+    socket: T,
+    state: &NotaryState,
+) -> Result<AttestationWire>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
@@ -597,7 +618,7 @@ where
     })?;
     handle.close();
 
-    let mut io = driver_task
+    let io = driver_task
         .into_inner()
         .await
         .map_err(|e| Error::NotaryServer {
@@ -607,6 +628,7 @@ where
             detail: format!("driver: {e}"),
         })?
         .into_inner();
+    drop(io);
 
     // What the prover chose to reveal is not read here and not judged here.
     // Which ranges a profile expects belongs to the Platform Verifier
@@ -668,9 +690,8 @@ where
             .as_secs(),
     )
     .await?;
-    send_attestation(&mut io, &attestation).await?;
-    info!("ProxyMode: ceremony attestation sent for {domain}");
-    Ok(())
+    info!("ProxyMode: ceremony attestation ready for {domain}");
+    Ok(attestation)
 }
 
 // ─── Core notary logic (transport-agnostic) ─────────────────────────────────
@@ -783,28 +804,21 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         use super::{
-            send_attestation,
+            attestation_frame,
             AttestationWire,
         };
 
-        let (mut notary, mut browser) = tokio::io::duplex(1024);
-        let send = tokio::spawn(async move {
-            send_attestation(
-                &mut notary,
-                &AttestationWire {
-                    attested_data: vec![1, 2, 3],
-                    notary_signature: vec![4; 65],
-                },
-            )
-            .await
-            .unwrap();
-        });
+        let frame = attestation_frame(&AttestationWire {
+            attested_data: vec![1, 2, 3],
+            notary_signature: vec![4; 65],
+        })
+        .unwrap();
+        let mut browser = frame.as_slice();
 
         let frame: serde_json::Value = read_msg(&mut browser).await.unwrap();
         assert_eq!(frame["attested_data"], serde_json::json!([1, 2, 3]));
         assert_eq!(frame["notary_signature"].as_array().unwrap().len(), 65);
         assert_eq!(browser.read(&mut [0]).await.unwrap(), 0);
-        send.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1009,7 +1023,10 @@ mod tests {
                 AsyncWriteExt,
             },
             net::TcpListener,
-            sync::Semaphore,
+            sync::{
+                mpsc,
+                Semaphore,
+            },
         };
         use tokio_tungstenite::{
             connect_async,
@@ -1076,12 +1093,14 @@ mod tests {
             .unwrap();
         let (mut ws_tx, mut ws_rx) = websocket.split();
         let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
         let pump_task = tokio::spawn(async move {
             let (mut pipe_reader, mut pipe_writer) = tokio::io::split(pump_io);
             let ws_to_pipe = async {
                 while let Some(message) = ws_rx.next().await {
                     match message.unwrap() {
                         WsMessage::Binary(data) => {
+                            frame_tx.send(data.to_vec()).unwrap();
                             pipe_writer.write_all(&data).await.unwrap();
                         }
                         WsMessage::Close(_) => {
@@ -1168,6 +1187,16 @@ mod tests {
             .await
             .expect("local ProxyMode smoke timed out");
         pump_task.await.unwrap();
+        let mut frames = Vec::new();
+        while let Ok(frame) = frame_rx.try_recv() {
+            frames.push(frame);
+        }
+        let attestation_frame = frames.last().expect("missing attestation message");
+        let declared_len =
+            u32::from_be_bytes(attestation_frame[..4].try_into().unwrap()) as usize;
+        assert_eq!(declared_len, attestation_frame.len() - 4);
+        serde_json::from_slice::<super::AttestationWire>(&attestation_frame[4..])
+            .expect("the final WebSocket message is not an attestation");
         target_task.await.unwrap();
 
         // The target listener is now gone. A second session exercises the
