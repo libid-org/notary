@@ -163,11 +163,6 @@ impl<T> AbortOnDrop<T> {
         Self(Some(handle))
     }
 
-    /// The wrapped handle, for polling the task without disarming the guard.
-    fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
-        self.0.as_mut().expect("handle present until into_inner")
-    }
-
     /// Disarm the guard and hand the handle back for joining.
     fn into_inner(mut self) -> tokio::task::JoinHandle<T> {
         self.0.take().expect("handle present until into_inner")
@@ -180,22 +175,6 @@ impl<T> Drop for AbortOnDrop<T> {
             handle.abort();
         }
     }
-}
-
-/// Error for a session driver that finished while session setup was still in
-/// flight. The driver only completes once the underlying socket is closed or
-/// dead, so a protocol request submitted to it may never resolve — without
-/// this check a connect-then-close client (the kubelet `tcpSocket` probe
-/// pattern) could wedge the handler forever.
-fn driver_finished_early<T, E: std::fmt::Display>(
-    result: std::result::Result<std::result::Result<T, E>, tokio::task::JoinError>,
-) -> Error {
-    let detail = match result {
-        Ok(Ok(_)) => "driver task finished before the session completed".into(),
-        Ok(Err(e)) => format!("driver task: {e}"),
-        Err(e) => format!("driver task join: {e}"),
-    };
-    Error::NotaryServer { detail }
 }
 
 #[derive(Clone)]
@@ -490,7 +469,7 @@ where
     let (driver, mut handle) = session.split();
     // Guarded spawn: every exit path below — each `?`, panics, the caller
     // dropping this future — aborts the driver instead of detaching it.
-    let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
+    let driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
     let setup_result = {
         let setup = async {
@@ -598,19 +577,7 @@ where
                 verifier,
             )))
         };
-        tokio::pin!(setup);
-
-        // Race setup against the driver. The driver only finishes early when the
-        // connection died under the session (e.g. a client that connected and
-        // immediately closed) — a protocol request already submitted to it may
-        // then never resolve, so fail instead of pending forever.
-        tokio::select! {
-            biased;
-            res = &mut setup => res,
-            driver_res = driver_task.handle_mut() => {
-                return Err(driver_finished_early(driver_res));
-            }
-        }
+        setup.await
     };
     let setup_outcome = setup_result?;
     let (server_name, transcript, transcript_commitments, verifier) = match setup_outcome
