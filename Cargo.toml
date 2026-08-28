@@ -89,14 +89,13 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",
 ] }
-tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "ab632378c35a30794dcbf1caecc3176450f4d0a1" }
-tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "ab632378c35a30794dcbf1caecc3176450f4d0a1" }
-tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "ab632378c35a30794dcbf1caecc3176450f4d0a1" }
+tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "816cebcf89480ebf55f58983ec6bab176ea08345" }
+tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "816cebcf89480ebf55f58983ec6bab176ea08345" }
+tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "816cebcf89480ebf55f58983ec6bab176ea08345" }
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.29"
 
 [patch."https://github.com/tlsnotary/tlsn"]
-# WIP: TLSNotary #1178 adds finish() so the browser can reclaim this same
-# channel before reading the ceremony attestation. Return to the release tag
-# when that PR ships.
-tlsn = { git = "https://github.com/libid-org/tlsn", rev = "ab632378c35a30794dcbf1caecc3176450f4d0a1" }
+# WIP: TLSNotary #1178 reclaims the channel and #1179 preserves hash-opening
+# order for multi-range commitments. Return to a release tag when both ship.
+tlsn = { git = "https://github.com/libid-org/tlsn", rev = "816cebcf89480ebf55f58983ec6bab176ea08345" }
