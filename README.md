@@ -28,7 +28,7 @@ HTTP / WebSocket on `NOTARY_WS_PORT` (default **7048**) — browser TLSNotary:
 | Route | What it does |
 |---|---|
 | `GET /info` | `{version, publicKey}` — compressed SEC1 notary public key, hex |
-| `WS /notarize-proxy` | ProxyMode session, then one length-prefixed section 9.1 attestation on the same WebSocket |
+| `WS /notarize-proxy` | ProxyMode session, then one WebSocket binary message containing the length-prefixed section 9.1 attestation |
 
 A server-side MPC-TLS prover needs no route: it opens the TCP listener itself,
 and the same record is written back down that socket.
