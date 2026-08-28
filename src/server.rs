@@ -492,131 +492,143 @@ where
     // dropping this future — aborts the driver instead of detaching it.
     let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
-    let setup = async {
-        #[cfg(test)]
-        let root_store = state
-            .proxy_test
-            .as_ref()
-            .map(|config| config.root_store.clone())
-            .unwrap_or_else(libid_tlsn::root_store);
-        #[cfg(not(test))]
-        let root_store = libid_tlsn::root_store();
-        let verifier = handle
-            .new_verifier(
-                VerifierConfig::builder()
-                    .root_store(root_store)
-                    .build()
-                    .map_err(|e| Error::NotaryServer {
-                        detail: format!("verifier config: {e}"),
-                    })?,
-            )
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("new verifier: {e}"),
+    let setup_result = {
+        let setup = async {
+            #[cfg(test)]
+            let root_store = state
+                .proxy_test
+                .as_ref()
+                .map(|config| config.root_store.clone())
+                .unwrap_or_else(libid_tlsn::root_store);
+            #[cfg(not(test))]
+            let root_store = libid_tlsn::root_store();
+            let verifier = handle
+                .new_verifier(
+                    VerifierConfig::builder()
+                        .root_store(root_store)
+                        .build()
+                        .map_err(|e| Error::NotaryServer {
+                            detail: format!("verifier config: {e}"),
+                        })?,
+                )
+                .map_err(|e| Error::NotaryServer {
+                    detail: format!("new verifier: {e}"),
+                })?;
+
+            let verifier = verifier.commit().await.map_err(|e| Error::NotaryServer {
+                detail: format!("verifier commit: {e}"),
             })?;
 
-        let verifier = verifier.commit().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier commit: {e}"),
-        })?;
+            let proxy_verifier = match verifier {
+                VerifierCommitStart::Proxy(v) => v,
+                _ => {
+                    return Err(Error::NotaryServer {
+                        detail: "expected ProxyTls protocol, got other".into(),
+                    });
+                }
+            };
 
-        let proxy_verifier = match verifier {
-            VerifierCommitStart::Proxy(v) => v,
-            _ => {
+            let server_name_str =
+                proxy_verifier.config().server_name().as_str().to_string();
+            info!("ProxyMode: connecting to {server_name_str}:443");
+
+            #[cfg(test)]
+            let server_addr = state
+                .proxy_test
+                .as_ref()
+                .map(|config| config.server_addr.to_string())
+                .unwrap_or_else(|| format!("{server_name_str}:443"));
+            #[cfg(not(test))]
+            let server_addr = format!("{server_name_str}:443");
+            let server_tcp = match tokio::net::TcpStream::connect(server_addr).await {
+                Ok(server_tcp) => server_tcp,
+                Err(error) => {
+                    let detail = format!("TCP connect to {server_name_str}: {error}");
+                    proxy_verifier
+                        .reject(Some("UPSTREAM_CONNECT_FAILED"))
+                        .await
+                        .map_err(|error| Error::NotaryServer {
+                            detail: format!("send connection rejection: {error}"),
+                        })?;
+                    return Ok(Err(Error::NotaryServer { detail }));
+                }
+            };
+
+            let verifier = proxy_verifier
+                .accept()
+                .await
+                .map_err(|e| Error::NotaryServer {
+                    detail: format!("verifier accept: {e}"),
+                })?
+                .run(server_tcp.compat())
+                .await
+                .map_err(|e| Error::NotaryServer {
+                    detail: format!("run_proxy: {e}"),
+                })?;
+
+            let verifier = verifier.verify().await.map_err(|e| Error::NotaryServer {
+                detail: format!("verifier verify: {e}"),
+            })?;
+
+            if !verifier.request().server_identity() {
+                verifier
+                    .reject(Some("server identity is required"))
+                    .await
+                    .ok();
                 return Err(Error::NotaryServer {
-                    detail: "expected ProxyTls protocol, got other".into(),
+                    detail: "prover did not request server identity reveal".into(),
                 });
             }
-        };
 
-        let server_name_str = proxy_verifier.config().server_name().as_str().to_string();
-        info!("ProxyMode: connecting to {server_name_str}:443");
-
-        #[cfg(test)]
-        let server_addr = state
-            .proxy_test
-            .as_ref()
-            .map(|config| config.server_addr.to_string())
-            .unwrap_or_else(|| format!("{server_name_str}:443"));
-        #[cfg(not(test))]
-        let server_addr = format!("{server_name_str}:443");
-        let server_tcp = match tokio::net::TcpStream::connect(server_addr).await {
-            Ok(server_tcp) => server_tcp,
-            Err(error) => {
-                let detail = format!("TCP connect to {server_name_str}: {error}");
-                proxy_verifier
-                    .reject(Some("UPSTREAM_CONNECT_FAILED"))
-                    .await
-                    .map_err(|error| Error::NotaryServer {
-                        detail: format!("send connection rejection: {error}"),
-                    })?;
-                handle.close();
-                return Ok(Err(Error::NotaryServer { detail }));
-            }
-        };
-
-        let verifier = proxy_verifier
-            .accept()
-            .await
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("verifier accept: {e}"),
-            })?
-            .run(server_tcp.compat())
-            .await
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("run_proxy: {e}"),
+            let (
+                VerifierOutput {
+                    server_name,
+                    transcript,
+                    transcript_commitments,
+                },
+                verifier,
+            ) = verifier.accept().await.map_err(|e| Error::NotaryServer {
+                detail: format!("verifier output accept: {e}"),
             })?;
 
-        let verifier = verifier.verify().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier verify: {e}"),
-        })?;
-
-        if !verifier.request().server_identity() {
-            verifier
-                .reject(Some("server identity is required"))
-                .await
-                .ok();
-            return Err(Error::NotaryServer {
-                detail: "prover did not request server identity reveal".into(),
-            });
-        }
-
-        let (
-            VerifierOutput {
+            Ok::<_, Error>(Ok((
                 server_name,
                 transcript,
                 transcript_commitments,
-            },
-            verifier,
-        ) = verifier.accept().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier output accept: {e}"),
-        })?;
+                verifier,
+            )))
+        };
+        tokio::pin!(setup);
 
-        verifier.close().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier close: {e}"),
-        })?;
-        handle.close();
-
-        Ok::<_, Error>(Ok((server_name, transcript, transcript_commitments)))
-    };
-    tokio::pin!(setup);
-
-    // Race setup against the driver. The driver only finishes early when the
-    // connection died under the session (e.g. a client that connected and
-    // immediately closed) — a protocol request already submitted to it may
-    // then never resolve, so fail instead of pending forever.
-    let setup_outcome = tokio::select! {
-        biased;
-        res = &mut setup => res?,
-        driver_res = driver_task.handle_mut() => {
-            return Err(driver_finished_early(driver_res));
+        // Race setup against the driver. The driver only finishes early when the
+        // connection died under the session (e.g. a client that connected and
+        // immediately closed) — a protocol request already submitted to it may
+        // then never resolve, so fail instead of pending forever.
+        tokio::select! {
+            biased;
+            res = &mut setup => res,
+            driver_res = driver_task.handle_mut() => {
+                return Err(driver_finished_early(driver_res));
+            }
         }
     };
-    let (server_name, transcript, transcript_commitments) = match setup_outcome {
+    let setup_outcome = setup_result?;
+    let (server_name, transcript, transcript_commitments, verifier) = match setup_outcome
+    {
         Ok(output) => output,
         Err(error) => {
+            handle.close();
             let _ = driver_task.into_inner().await;
             return Err(error);
         }
     };
+
+    // Driver completion is expected during close, so it must not participate
+    // in the early-disconnect race above.
+    verifier.close().await.map_err(|e| Error::NotaryServer {
+        detail: format!("verifier close: {e}"),
+    })?;
+    handle.close();
 
     let mut io = driver_task
         .into_inner()
