@@ -3559,7 +3559,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libid-attestations"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
+source = "git+https://github.com/libid-org/libid-rs?rev=cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471#cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -3569,7 +3569,7 @@ dependencies = [
 [[package]]
 name = "libid-ceremony"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
+source = "git+https://github.com/libid-org/libid-rs?rev=cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471#cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471"
 dependencies = [
  "bincode 2.0.1",
  "libid-crypto",
@@ -3579,7 +3579,7 @@ dependencies = [
 [[package]]
 name = "libid-crypto"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
+source = "git+https://github.com/libid-org/libid-rs?rev=cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471#cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471"
 dependencies = [
  "hex",
  "k256",
@@ -3591,7 +3591,7 @@ dependencies = [
 [[package]]
 name = "libid-signer"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
+source = "git+https://github.com/libid-org/libid-rs?rev=cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471#cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471"
 dependencies = [
  "alloy",
  "aws-config",
@@ -3603,7 +3603,7 @@ dependencies = [
 [[package]]
 name = "libid-tlsn"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
+source = "git+https://github.com/libid-org/libid-rs?rev=cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471#cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471"
 dependencies = [
  "http-body-util",
  "hyper 1.11.0",
@@ -3621,7 +3621,7 @@ dependencies = [
 [[package]]
 name = "libid-transcript"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
+source = "git+https://github.com/libid-org/libid-rs?rev=cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471#cafd9a0b3b3c1c4a2e735a279e5904e4d0e19471"
 dependencies = [
  "httparse",
  "serde",

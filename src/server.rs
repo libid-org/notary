@@ -67,7 +67,10 @@ use libid_signer::{
     ManagedSigner,
     SignerSource,
 };
-use libid_transcript::write_msg;
+use libid_transcript::{
+    write_msg,
+    AttestationWire,
+};
 use rand::RngCore;
 use serde::{
     Deserialize,
@@ -506,25 +509,18 @@ fn admit_session(map: &mut HashMap<String, SessionEntry>, max: usize) -> bool {
 
 // ─── Ceremony attestation endpoint, either transport ─────────────────────────
 
-/// Attestation wire JSON.
-///
-/// The attested data and the signature over it, and nothing else. The notary
-/// places no handle, account identifier, client identifier or chain address in
-/// the signed bytes (REQ-COMMON-61): every one is derivable from the revealed
-/// ranges, and a second signed representation can disagree with the bytes it
-/// was taken from. That is why this endpoint no longer takes `handle`,
-/// `user_id` or `session_addr` -- the Platform Verifier reads them itself, and
-/// the notary deciding them would be the profile-specific judgement
-/// REQ-COMMON-33 forbids it.
-#[derive(Debug, Serialize)]
-struct AttestationWire {
-    /// The exact bytes of ceremony-common section 9.1.
-    attested_data: Vec<u8>,
-    /// EIP-191 over `keccak256(attested_data)`. The verifying side derives the
-    /// key from this pair alone and accepts no caller-supplied digest
-    /// (REQ-COMMON-49).
-    notary_signature: Vec<u8>,
-}
+// The wire record itself is `libid_transcript::AttestationWire`. It is defined
+// there, beside the `write_msg`/`read_msg` that frame it, because a prover has
+// to read exactly what this writes -- and a copy here would be a second
+// definition of one message, agreeing only for as long as nobody renames a
+// field. What the notary puts in it is still decided here, and it is nothing
+// it derived by applying a profile rule: no handle, no account identifier, no
+// client identifier, no chain address (REQ-COMMON-61). Every one is derivable
+// from the revealed ranges, and a second signed representation can disagree
+// with the bytes it was taken from. That is why this endpoint no longer takes
+// `handle`, `user_id` or `session_addr` -- the Platform Verifier reads them
+// itself, and the notary deciding them would be the profile-specific
+// judgement REQ-COMMON-33 forbids it.
 
 /// Fetch a notary-signed attestation for a completed TLSNotary session, of
 /// either transport.
