@@ -106,6 +106,26 @@ above, and `notary::jwks` exposes the prover-side helpers the keeper needs:
   de-chunker runs) and sign it with a caller-provided notary key, for
   contract testing.
 
+### Capturing a real reading
+
+`examples/notarize_jwks.rs` runs the real prover against a running notary and
+writes the signed record to a file — a fixture for testing `GoogleJwtRoots`
+with a session Google actually served, rather than one a mock synthesized.
+Run a notary with a known key (anvil #0, so a test can trust the address it
+recovers) and no browser port, then point the example at it:
+
+```sh
+notary --port 7047 --ws-port 0 \
+  --signing-key ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+cargo run --example notarize_jwks -- --notary 127.0.0.1:7047 --out google-jwks-session.json
+```
+
+The file holds `notary` (the address the signature recovers to),
+`created_at` (the notary's clock, read out of the record's header),
+`attested_data` and `notary_signature` as `0x`-hex, `captured_at` and
+`endpoint`. It is a real MPC-TLS session — about ten seconds against a
+local notary, longer over a slow link; `RUST_LOG=info` shows the phases.
+
 Shared primitives (digests, wire protocol, transcript math, signers) come
 from [libid-rs](https://github.com/libid-org/libid-rs).
 

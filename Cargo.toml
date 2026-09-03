@@ -101,6 +101,9 @@ tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "816ceb
 tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "816cebcf89480ebf55f58983ec6bab176ea08345" }
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.29"
+# `examples/notarize_jwks` stamps the file it writes with the wall clock in
+# RFC 3339. Already in the graph through tlsn; only the clock is needed.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [patch."https://github.com/tlsnotary/tlsn"]
 # WIP: TLSNotary #1178 reclaims the channel and #1179 preserves hash-opening
