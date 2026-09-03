@@ -1,7 +1,7 @@
 //! Mock prover: pretends to be the result of a successful MPC-TLS session by
 //! fetching the JWKS over plain TLS, synthesizing the transcript the real
 //! session would have produced, and signing the record with a configurable
-//! key. Lets a deployment drive `IdentityJwksRoots` end-to-end without standing
+//! key. Lets a deployment drive `GoogleJwtRoots` end-to-end without standing
 //! up the MPC plumbing.
 //!
 //! What's "fake" vs "real":

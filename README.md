@@ -11,14 +11,14 @@ the authenticated transcript. Every session gets the same record —
   …), read on chain by that platform's Platform Verifier; or
 * **a JWKS reading** — the keeper's request for Google's OIDC signing keys
   (`https://www.googleapis.com/oauth2/v3/certs`), read on chain by
-  `IdentityJwksRoots`, so Google's keys rotate without trusting the submitter.
+  `GoogleJwtRoots`, so Google's keys rotate without trusting the submitter.
 
 The notary does not tell them apart and does not need to: the record carries
 the TLS-certificate-verified server name (`authorityId`), and the contract that
 reads the record compares it against the authority it pins. What differs is
 what the prover reveals. The keeper reveals the whole JWKS session, request
 and response, because a public key set has nothing to hide — and a fully
-revealed transcript with nothing committed is what lets `IdentityJwksRoots`
+revealed transcript with nothing committed is what lets `GoogleJwtRoots`
 read the key set straight out of the record. Both contracts authenticate the
 signature through the on-chain `NotaryService`; the notary's signature alone
 registers nothing, and its public key is served at `/info`.
@@ -99,7 +99,7 @@ above, and `notary::jwks` exposes the prover-side helpers the keeper needs:
 * `jwks::prover::notarize_jwks(socket)` — run the MPC-TLS JWKS prover against
   a notary's TCP port, revealing everything (`jwks::layout`), and get back the
   signed `NotarizedSession`: the `attestedData` and `proof` arguments of
-  `IdentityJwksRoots.rotate`.
+  `GoogleJwtRoots.rotate`.
 * `jwks::mock::MockProver` — build the same record without MPC: fetch the key
   set over plain TLS, synthesize the transcript byte for byte as the real
   session would look (chunked response framing by default, so the on-chain

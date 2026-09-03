@@ -5,7 +5,7 @@
 //! in what the prover chose to reveal, and in nothing the notary writes: the
 //! record is built from what the session disclosed, the server the notary
 //! authenticated, the commitments over the rest, and the notary's own clock.
-//! Which contract reads it -- a Platform Verifier, or `IdentityJwksRoots` --
+//! Which contract reads it -- a Platform Verifier, or `GoogleJwtRoots` --
 //! is decided by whoever submits it, and both authenticate the signature
 //! through the on-chain Notary Service.
 //!
@@ -23,7 +23,7 @@
 /// `attested_data` is the exact bytes of ceremony-common section 9.1;
 /// `notary_signature` is EIP-191 over `keccak256(attested_data)`. Those are
 /// the `attestedData` and `proof` arguments of `NotaryService.verify`, and of
-/// everything built on it (`IdentityJwksRoots.rotate` included).
+/// everything built on it (`GoogleJwtRoots.rotate` included).
 ///
 /// Serialized as `{ "attested_data": [u8...], "notary_signature": [u8...] }`:
 /// one length-prefixed JSON message on the recovered socket for an MPC prover,

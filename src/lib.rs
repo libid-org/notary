@@ -9,7 +9,7 @@
 //! know, and does not ask, which one it is serving. The sessions differ only in
 //! what the prover reveals -- a JWKS reading reveals everything, because a
 //! public key set has nothing to hide -- and in which contract reads the
-//! record: a Platform Verifier, or `IdentityJwksRoots`, both through the
+//! record: a Platform Verifier, or `GoogleJwtRoots`, both through the
 //! on-chain Notary Service.
 //!
 //! The TCP wire listener serves Rust backend provers; the browser-facing

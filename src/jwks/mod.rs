@@ -4,7 +4,7 @@
 //! The keeper points the same MPC-TLS machinery at
 //! `https://www.googleapis.com/oauth2/v3/certs` and gets back the record every
 //! session gets -- a [`NotarizedSession`] -- which it submits to
-//! `IdentityJwksRoots.rotate`. That contract authenticates the signature
+//! `GoogleJwtRoots.rotate`. That contract authenticates the signature
 //! through the Notary Service and reads the key set straight out of the
 //! revealed transcript. The notary special-cases nothing here: it signs what it
 //! observed, and which host it observed is in the record (`authorityId`), for
@@ -39,7 +39,7 @@ use libid_tlsn::{
 use libid_transcript::ceremony::Layout;
 
 /// The TLS server name the JWKS reading authenticates. The record carries
-/// `keccak256` of it as `authorityId`, and `IdentityJwksRoots` refuses any
+/// `keccak256` of it as `authorityId`, and `GoogleJwtRoots` refuses any
 /// other -- and, because googleapis.com serves many virtual hosts under one
 /// certificate, also requires the `Host` header the request carries to name
 /// this same host.

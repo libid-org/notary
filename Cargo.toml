@@ -38,7 +38,7 @@ path = "src/main.rs"
 # instead: the head of `fix/origin-form-request-target`, stacked on the PR's
 # branch. That commit is what makes `prover_generic` write the request-target
 # in origin-form (`GET /oauth2/v3/certs HTTP/1.1`) -- the line
-# `IdentityJwksRoots` and every Platform Verifier pin -- where the PR head
+# `GoogleJwtRoots` and every Platform Verifier pin -- where the PR head
 # alone writes the absolute URI and every Rust-prover session is refused on
 # chain. This returns to `tag = "v0.3.0"` the moment the tag is cut -- and it
 # must, before this is released: a rev is reachable only while the branch that
