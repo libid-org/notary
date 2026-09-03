@@ -11,7 +11,7 @@ pub struct NotaryServerConfig {
     pub host: String,
 
     /// TCP wire-protocol port (backend provers: platform MPC-TLS sessions and
-    /// JWKS notarization sessions). `0` binds an ephemeral port.
+    /// the keeper's JWKS readings alike). `0` binds an ephemeral port.
     #[arg(long, env = "NOTARY_PORT", default_value = "7047")]
     pub port: u16,
 
@@ -29,16 +29,4 @@ pub struct NotaryServerConfig {
     /// rejected (503). The connection deadline bounds each permit's lifetime.
     #[arg(long, env = "NOTARY_MAX_SESSIONS", default_value_t = 1024)]
     pub max_sessions: usize,
-
-    /// Serve JWKS notarization sessions on the TCP wire listener (an MPC-TLS
-    /// session whose TLS-verified SNI is `www.googleapis.com` is answered
-    /// with a signed `JwksRotationProof` instead of the platform's ceremony
-    /// attestation). Same notary identity, same listener.
-    #[arg(
-        long,
-        env = "NOTARY_JWKS_ENABLED",
-        default_value_t = true,
-        action = clap::ArgAction::Set
-    )]
-    pub jwks_enabled: bool,
 }

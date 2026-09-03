@@ -8,7 +8,7 @@ edition = "2021"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/libid-org/notary"
-description = "The libID notary service: MPC-TLS / zkTLS notarization for platform sessions and notarized JWKS (OIDC) readings, under one notary identity."
+description = "The libID notary service: MPC-TLS / zkTLS notarization of platform sessions and JWKS (OIDC) readings into one signed ceremony attestation, under one notary identity."
 # A binary + companion library, never a registry crate: it names `tlsn`
 # (git-only upstream) in its manifest, which cargo refuses to publish.
 publish = false
@@ -27,21 +27,27 @@ path = "src/main.rs"
 # `path` deps unify. libid-tlsn is git-only (upstream tlsn is not on crates.io)
 # and exposes sibling-crate types, so mixing the crates.io copies with the git
 # copy would put two incompatible versions of the same types in the graph.
-# libid-ceremony arrives transitively through libid-tlsn, from the same pin.
-# The upstream `tlsn` git rev is pinned by libid-tlsn and arrives the same way;
-# the direct `tlsn` entry below MUST name the same rev.
+# libid-ceremony is the record the mock prover encodes, and also what
+# libid-tlsn's attestation builder hands the server: one copy, or the two
+# disagree on a type. The upstream `tlsn` git rev is pinned by libid-tlsn and
+# arrives the same way; the direct `tlsn` entry below MUST name the same rev.
 #
 # A REV, NOT A TAG, AND ON PURPOSE. The ceremony wire constructions this server
 # encodes live in libid-rs PR #2, and v0.3.0 does not exist yet. A tag that has
-# not been cut resolves to nothing, so the pin below is the head of that PR
-# instead. This returns to `tag = "v0.3.0"` the moment the tag is cut -- and it
+# not been cut resolves to nothing, so the pin below is a commit on that work
+# instead: the head of `fix/origin-form-request-target`, stacked on the PR's
+# branch. That commit is what makes `prover_generic` write the request-target
+# in origin-form (`GET /oauth2/v3/certs HTTP/1.1`) -- the line
+# `IdentityJwksRoots` and every Platform Verifier pin -- where the PR head
+# alone writes the absolute URI and every Rust-prover session is refused on
+# chain. This returns to `tag = "v0.3.0"` the moment the tag is cut -- and it
 # must, before this is released: a rev is reachable only while the branch that
 # carries it is, and squash-merging the PR would strand it.
-libid-attestations = { git = "https://github.com/libid-org/libid-rs", rev = "239a4bb426ac72591fe30006f22660e164a98d96" }
-libid-crypto = { git = "https://github.com/libid-org/libid-rs", rev = "239a4bb426ac72591fe30006f22660e164a98d96" }
-libid-signer = { git = "https://github.com/libid-org/libid-rs", rev = "239a4bb426ac72591fe30006f22660e164a98d96" }
-libid-tlsn = { git = "https://github.com/libid-org/libid-rs", rev = "239a4bb426ac72591fe30006f22660e164a98d96" }
-libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "239a4bb426ac72591fe30006f22660e164a98d96" }
+libid-ceremony = { git = "https://github.com/libid-org/libid-rs", rev = "391078f2f05d1d3b6bce7c347db3c5f6a0cbe851" }
+libid-crypto = { git = "https://github.com/libid-org/libid-rs", rev = "391078f2f05d1d3b6bce7c347db3c5f6a0cbe851" }
+libid-signer = { git = "https://github.com/libid-org/libid-rs", rev = "391078f2f05d1d3b6bce7c347db3c5f6a0cbe851" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", rev = "391078f2f05d1d3b6bce7c347db3c5f6a0cbe851" }
+libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "391078f2f05d1d3b6bce7c347db3c5f6a0cbe851" }
 
 # Upstream TLSNotary. The pin MUST equal libid-tlsn's (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible
@@ -49,10 +55,6 @@ libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "239a4
 # script reads this pin back out of Cargo.lock so the browser prover can
 # never drift onto a different tlsn version than the server.
 tlsn = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15" }
-
-# ── Solidity ABI mirrors (JwksOracle wire types) ────────────────────────────
-alloy-primitives = { version = "1", features = ["serde"] }
-alloy-sol-types = "1"
 
 # ── server ──────────────────────────────────────────────────────────────────
 anyhow = "1.0"
@@ -77,14 +79,19 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# ── JWKS role ───────────────────────────────────────────────────────────────
-base64 = "0.22"
+# ── JWKS mock prover ────────────────────────────────────────────────────────
+# The caller-provided notary key the mock signs with. Same major as
+# libid-crypto's, so the key type passes straight through.
 k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 # Plain-TLS JWKS fetch for the mock prover only.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-serde_with = { version = "3", features = ["hex"] }
 
 [dev-dependencies]
+# The mock prover synthesizes the request bytes hyper puts on the wire, and
+# one test drives hyper's own HTTP/1 encoder over an in-memory pipe to prove
+# it. Both crates are already in the graph through libid-tlsn.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",

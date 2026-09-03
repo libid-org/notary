@@ -1,29 +1,31 @@
 //! The libID notary service.
 //!
-//! One binary, one signing identity, two notary duties:
+//! One binary, one signing identity, one record. The notary takes part as the
+//! MPC-TLS or ProxyMode (zkTLS) verifier in a prover's HTTPS session and signs
+//! the canonical ceremony section 9.1 attestation for the authenticated
+//! transcript -- a [`NotarizedSession`]. That is true of a platform API
+//! session (X, GitHub, …) and of a reading of Google's OIDC JWKS
+//! (`https://www.googleapis.com/oauth2/v3/certs`) alike: the notary does not
+//! know, and does not ask, which one it is serving. The sessions differ only in
+//! what the prover reveals -- a JWKS reading reveals everything, because a
+//! public key set has nothing to hide -- and in which contract reads the
+//! record: a Platform Verifier, or `IdentityJwksRoots`, both through the
+//! on-chain Notary Service.
 //!
-//! * **Platform sessions** — MPC-TLS / zkTLS (ProxyMode) notarization of
-//!   platform API sessions (X, GitHub, …), producing the signed canonical
-//!   ceremony section 9.1 attestation for the authenticated transcript.
-//! * **JWKS readings** — notarized readings of Google's OIDC JWKS
-//!   (`https://www.googleapis.com/oauth2/v3/certs`), producing signed
-//!   `JwksRotationProof`s for the on-chain `JwksOracle`.
+//! The TCP wire listener serves Rust backend provers; the browser-facing
+//! HTTP/WS API (tlsn-js / tlsn_wasm compatible) lives on a second port.
 //!
-//! Both duties are served by the same TCP wire listener: the notary runs the
-//! MPC-TLS verifier first, then dispatches on the TLS-cert-verified server
-//! name — `www.googleapis.com` gets the JWKS response shape, everything else
-//! gets the ceremony attestation. The browser-facing HTTP/WS API (tlsn-js /
-//! tlsn_wasm compatible) lives on a second port.
-//!
-//! The crate is a library too: [`jwks`] exposes the prover-side helpers a
-//! backend rotation listener needs to obtain a `JwksRotationProof` from a
-//! running notary.
+//! The crate is a library too: [`jwks`] exposes the prover-side helpers the
+//! keeper uses to obtain a notarized JWKS reading from a running notary, and a
+//! mock that synthesizes one without MPC for contract testing.
 
+pub mod attestation;
 pub mod config;
 pub mod error;
 pub mod jwks;
 pub mod server;
 
+pub use attestation::NotarizedSession;
 pub use config::NotaryServerConfig;
 pub use error::{
     Error,

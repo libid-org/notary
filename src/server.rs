@@ -3,11 +3,10 @@
 //! # Endpoints
 //!
 //! - **TCP** (port `NOTARY_PORT`): MPC-TLS verifier for Rust backend provers.
-//!   Dispatches on the TLS-cert-verified server name after verification:
-//!   `www.googleapis.com` sessions are answered with a signed
-//!   [`crate::jwks::JwksNotaryResponse`] (JWKS rotation duty); every other
-//!   session with the section 9.1 ceremony attestation, written back down the
-//!   socket the prover opened.
+//!   The section 9.1 ceremony attestation is written back down the socket the
+//!   prover opened. The keeper's JWKS reading is one of these sessions like
+//!   any other: nothing here dispatches on the server name -- the record
+//!   carries it, and the contract that reads the record pins it.
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
 //! - **GET /notarize-proxy** (WS upgrade): ProxyMode session followed by one
 //!   length-prefixed ceremony attestation in its own WebSocket message.
@@ -57,10 +56,7 @@ use libid_signer::{
     SignerSource,
 };
 use libid_transcript::write_msg;
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::Serialize;
 use tlsn::{
     config::verifier::VerifierConfig,
     connection::ServerName,
@@ -98,7 +94,7 @@ use crate::{
         Error,
         Result,
     },
-    jwks,
+    NotarizedSession,
 };
 
 /// Handle for controlling the running notary server.
@@ -170,7 +166,6 @@ struct NotaryState {
     signer: Arc<ManagedSigner>,
     proxy_sessions: Arc<Semaphore>,
     public_key_hex: String,
-    jwks_enabled: bool,
     #[cfg(test)]
     proxy_test: Option<ProxyTestConfig>,
 }
@@ -207,7 +202,6 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         signer: Arc::new(signer),
         proxy_sessions: Arc::new(Semaphore::new(config.max_sessions)),
         public_key_hex,
-        jwks_enabled: config.jwks_enabled,
         #[cfg(test)]
         proxy_test: None,
     };
@@ -302,34 +296,19 @@ async fn info_handler(State(state): State<NotaryState>) -> Json<InfoResponse> {
 
 // ─── Ceremony attestation ───────────────────────────────────────────────────
 
-/// Attestation wire JSON.
-///
-/// The attested data and the signature over it, and nothing else. The notary
-/// places no handle, account identifier, client identifier or chain address in
-/// the signed bytes (REQ-COMMON-61): every one is derivable from the revealed
-/// ranges, and a second signed representation can disagree with the bytes it
-/// was taken from.
-#[derive(Debug, Serialize, Deserialize)]
-struct AttestationWire {
-    /// The exact bytes of ceremony-common section 9.1.
-    attested_data: Vec<u8>,
-    /// EIP-191 over `keccak256(attested_data)`. The verifying side derives the
-    /// key from this pair alone and accepts no caller-supplied digest
-    /// (REQ-COMMON-49).
-    notary_signature: Vec<u8>,
-}
-
 /// Build the section 9.1 attested data for one completed session and sign it.
 ///
 /// Both transports end here and receive the same record on their reclaimed
 /// channel, because transport says nothing about the TLS session it describes.
+/// The record is the attested data and the signature over it, and nothing
+/// else (see [`NotarizedSession`]).
 async fn sign_ceremony_attestation(
     signer: &ManagedSigner,
     partial: &PartialTranscript,
     authority: &str,
     commitments: &[TranscriptCommitment],
     created_at: u64,
-) -> Result<AttestationWire> {
+) -> Result<NotarizedSession> {
     let attested = libid_tlsn::attest::attested_data(
         partial,
         authority,
@@ -348,13 +327,13 @@ async fn sign_ceremony_attestation(
     let notary_signature = signer
         .sign_claim(&libid_crypto::keccak256(&encoded))
         .await?;
-    Ok(AttestationWire {
+    Ok(NotarizedSession {
         attested_data: encoded,
         notary_signature,
     })
 }
 
-fn attestation_frame(attestation: &AttestationWire) -> Result<Vec<u8>> {
+fn attestation_frame(attestation: &NotarizedSession) -> Result<Vec<u8>> {
     const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
 
     let json = serde_json::to_vec(attestation)?;
@@ -473,7 +452,7 @@ async fn handle_ws_proxy_notarize(
 async fn run_proxy_verifier_session<T>(
     socket: T,
     state: &NotaryState,
-) -> Result<AttestationWire>
+) -> Result<NotarizedSession>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
@@ -720,27 +699,16 @@ where
     let domain = dns_name.as_str().to_string();
     info!("Domain from SNI: {}", domain);
 
-    // ── JWKS duty dispatch ──
-    //
-    // Same listener, same MPC-TLS verification, same signing identity: a
-    // session whose TLS-cert-verified server name is the JWKS host is a
-    // notarized JWKS reading. Its wire response is a signed
-    // `JwksRotationProof` (no attestation-request round trip — the JWKS
-    // prover protocol ends with the verifier's response).
-    if state.jwks_enabled && domain.eq_ignore_ascii_case(jwks::JWKS_DOMAIN) {
-        let handshake = libid_tlsn::extract_handshake_data(&result.tls_transcript)?;
-        let response =
-            jwks::build_rotation_response(sent, recv, &handshake, &state.signer).await?;
-        let mut io = result.recovered_io;
-        write_msg(&mut io, &response).await?;
-        info!("JWKS rotation proof sent to prover");
-        return Ok(());
-    }
-
-    // The ceremony record is transport-agnostic. It is built from what the
-    // session revealed, the server the notary authenticated, the commitments
-    // over the rest, and the notary's own clock -- and an MPC-TLS session
-    // produces all four exactly as a ProxyMode one does.
+    // The ceremony record is transport-agnostic and session-agnostic. It is
+    // built from what the session revealed, the server the notary
+    // authenticated, the commitments over the rest, and the notary's own clock
+    // -- an MPC-TLS session produces all four exactly as a ProxyMode one does,
+    // and a JWKS reading exactly as a platform session does. This used to
+    // dispatch on the server name and answer `www.googleapis.com` with a
+    // Merkle proof of its own shape; that was the notary deciding what a
+    // session was for, which is the profile-specific decision REQ-COMMON-33
+    // forbids it from making. The record names the host; the contract that
+    // reads the record decides whether it wanted that host.
     let ceremony_attestation = sign_ceremony_attestation(
         &state.signer,
         &result.partial_transcript,
@@ -767,12 +735,10 @@ mod tests {
         use libid_transcript::read_msg;
         use tokio::io::AsyncReadExt;
 
-        use super::{
-            attestation_frame,
-            AttestationWire,
-        };
+        use super::attestation_frame;
+        use crate::NotarizedSession;
 
-        let frame = attestation_frame(&AttestationWire {
+        let frame = attestation_frame(&NotarizedSession {
             attested_data: vec![1, 2, 3],
             notary_signature: vec![4; 65],
         })
@@ -824,9 +790,9 @@ mod tests {
 
         use super::{
             handle_verified_session,
-            AttestationWire,
             NotaryState,
         };
+        use crate::NotarizedSession;
 
         const TEST_KEY: &str =
             "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -841,7 +807,6 @@ mod tests {
             signer: Arc::new(signer),
             proxy_sessions: Arc::new(tokio::sync::Semaphore::new(1)),
             public_key_hex: String::new(),
-            jwks_enabled: false,
             proxy_test: None,
         };
 
@@ -932,7 +897,7 @@ mod tests {
                 .unwrap();
 
             let mut io = prover.finish().await.unwrap().compat();
-            let attestation: AttestationWire = read_msg(&mut io).await.unwrap();
+            let attestation: NotarizedSession = read_msg(&mut io).await.unwrap();
             assert_eq!(
                 &attestation.attested_data[..32],
                 &libid_crypto::keccak256(SERVER_DOMAIN.as_bytes())
@@ -1033,7 +998,6 @@ mod tests {
             signer: Arc::new(signer),
             proxy_sessions: Arc::new(Semaphore::new(1)),
             public_key_hex: String::new(),
-            jwks_enabled: false,
             proxy_test: Some(ProxyTestConfig {
                 server_addr: target_addr,
                 root_store: prover_config.root_store.clone(),
@@ -1159,7 +1123,7 @@ mod tests {
         let declared_len =
             u32::from_be_bytes(attestation_frame[..4].try_into().unwrap()) as usize;
         assert_eq!(declared_len, attestation_frame.len() - 4);
-        serde_json::from_slice::<super::AttestationWire>(&attestation_frame[4..])
+        serde_json::from_slice::<crate::NotarizedSession>(&attestation_frame[4..])
             .expect("the final WebSocket message is not an attestation");
         target_task.await.unwrap();
 
@@ -1265,7 +1229,6 @@ mod tests {
             public_key_hex: hex::encode(signer.compressed_public_key()),
             signer: Arc::new(signer),
             proxy_sessions: Arc::new(Semaphore::new(8)),
-            jwks_enabled: false,
             proxy_test: None,
         };
 
