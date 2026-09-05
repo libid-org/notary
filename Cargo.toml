@@ -89,13 +89,40 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",
 ] }
-tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "816cebcf89480ebf55f58983ec6bab176ea08345" }
-tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "816cebcf89480ebf55f58983ec6bab176ea08345" }
-tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "816cebcf89480ebf55f58983ec6bab176ea08345" }
+tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "0f82f54968b36738eacebf7c8ac7728003918b72" }
+tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "0f82f54968b36738eacebf7c8ac7728003918b72" }
+tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "0f82f54968b36738eacebf7c8ac7728003918b72" }
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.29"
 
 [patch."https://github.com/tlsnotary/tlsn"]
 # WIP: TLSNotary #1178 reclaims the channel and #1179 preserves hash-opening
 # order for multi-range commitments. Return to a release tag when both ship.
-tlsn = { git = "https://github.com/libid-org/tlsn", rev = "816cebcf89480ebf55f58983ec6bab176ea08345" }
+tlsn = { git = "https://github.com/libid-org/tlsn", rev = "0f82f54968b36738eacebf7c8ac7728003918b72" }
+
+# TLSNotary #1173 needs the matching mpz KOS instance-domain separation.
+[patch."https://github.com/privacy-ethereum/mpz"]
+clmul = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+matrix-transpose = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-circuits = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-circuits-core = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-circuits-data = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-cointoss = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-cointoss-core = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-common = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-core = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-fields = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-garble = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-garble-core = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-hash = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-ideal-vm = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-memory-core = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-ole = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-ole-core = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-ot = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-ot-core = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-share-conversion = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-share-conversion-core = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-vm-core = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-zk = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
+mpz-zk-core = { git = "https://github.com/AdamDawidKrol/mpz", rev = "c0379ef" }
