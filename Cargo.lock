@@ -3168,7 +3168,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -3568,19 +3568,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
-name = "libid-attestations"
-version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
-dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
- "libid-crypto",
-]
-
-[[package]]
 name = "libid-ceremony"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
+source = "git+https://github.com/libid-org/libid-rs?rev=391078f2f05d1d3b6bce7c347db3c5f6a0cbe851#391078f2f05d1d3b6bce7c347db3c5f6a0cbe851"
 dependencies = [
  "bincode 2.0.1",
  "libid-crypto",
@@ -3590,7 +3580,7 @@ dependencies = [
 [[package]]
 name = "libid-crypto"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
+source = "git+https://github.com/libid-org/libid-rs?rev=391078f2f05d1d3b6bce7c347db3c5f6a0cbe851#391078f2f05d1d3b6bce7c347db3c5f6a0cbe851"
 dependencies = [
  "hex",
  "k256",
@@ -3602,7 +3592,7 @@ dependencies = [
 [[package]]
 name = "libid-signer"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
+source = "git+https://github.com/libid-org/libid-rs?rev=391078f2f05d1d3b6bce7c347db3c5f6a0cbe851#391078f2f05d1d3b6bce7c347db3c5f6a0cbe851"
 dependencies = [
  "alloy",
  "aws-config",
@@ -3614,7 +3604,7 @@ dependencies = [
 [[package]]
 name = "libid-tlsn"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
+source = "git+https://github.com/libid-org/libid-rs?rev=391078f2f05d1d3b6bce7c347db3c5f6a0cbe851#391078f2f05d1d3b6bce7c347db3c5f6a0cbe851"
 dependencies = [
  "http-body-util",
  "hyper 1.11.0",
@@ -3632,7 +3622,7 @@ dependencies = [
 [[package]]
 name = "libid-transcript"
 version = "0.3.0"
-source = "git+https://github.com/libid-org/libid-rs?rev=239a4bb426ac72591fe30006f22660e164a98d96#239a4bb426ac72591fe30006f22660e164a98d96"
+source = "git+https://github.com/libid-org/libid-rs?rev=391078f2f05d1d3b6bce7c347db3c5f6a0cbe851#391078f2f05d1d3b6bce7c347db3c5f6a0cbe851"
 dependencies = [
  "httparse",
  "serde",
@@ -4139,16 +4129,16 @@ checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 name = "notary"
 version = "0.3.0"
 dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "chrono",
  "clap",
  "futures-util",
  "hex",
+ "hyper 1.11.0",
+ "hyper-util",
  "k256",
- "libid-attestations",
+ "libid-ceremony",
  "libid-crypto",
  "libid-signer",
  "libid-tlsn",
@@ -4156,7 +4146,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "serde_with",
  "thiserror 2.0.20",
  "tlsn",
  "tlsn-sdk-core",
@@ -4601,7 +4590,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.43",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -4639,7 +4628,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]

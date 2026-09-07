@@ -15,7 +15,8 @@ pub enum Error {
         /// Human-readable failure detail.
         detail: String,
     },
-    /// JWKS parsing / proof construction failure.
+    /// A JWKS session could not be built (request construction, or the mock
+    /// prover's synthesized record).
     #[error("jwks: {detail}")]
     Jwks {
         /// Human-readable failure detail.
@@ -42,9 +43,6 @@ pub enum Error {
     /// HTTP fetch failed (mock JWKS prover only).
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
-    /// Base64url decoding failed.
-    #[error("base64: {0}")]
-    Base64(#[from] base64::DecodeError),
 }
 
 /// Result alias for this crate.

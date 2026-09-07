@@ -1,177 +1,169 @@
-//! The JWKS notarization duty and its prover-side helpers.
+//! The JWKS reading: Google's OIDC signing keys, notarized like any other
+//! session.
 //!
-//! Points the same MPC-TLS machinery at Google's OIDC JWKS endpoint
-//! (`https://www.googleapis.com/oauth2/v3/certs`) instead of platform
-//! user-info endpoints. The notary side is served by the main TCP wire
-//! listener (see [`crate::server`]): after MPC-TLS verification the session
-//! dispatches on the TLS-cert-verified SNI, and a `www.googleapis.com`
-//! session is answered with a signed [`JwksRotationProof`].
+//! The keeper points the same MPC-TLS machinery at
+//! `https://www.googleapis.com/oauth2/v3/certs` and gets back the record every
+//! session gets -- a [`NotarizedSession`] -- which it submits to
+//! `GoogleJwtRoots.rotate`. That contract authenticates the signature
+//! through the Notary Service and reads the key set straight out of the
+//! revealed transcript. The notary special-cases nothing here: it signs what it
+//! observed, and which host it observed is in the record (`authorityId`), for
+//! the contract to compare against the authority it pins.
 //!
-//! Prover entry points (library consumers, e.g. a backend rotation listener):
+//! What makes the reading readable on chain is its [`layout`]: everything
+//! revealed, nothing committed. The contract concatenates the revealed ranges
+//! and parses request line, `Host` header, status line, framing and JSON out
+//! of the result; a commitment anywhere in either direction is refused,
+//! because a hidden range is where a second `Host` header or a decoy `"keys"`
+//! member would live.
 //!
-//! * [`prover::notarize_jwks`] — the real one: runs the MPC-TLS prover
-//!   against a live notary over any async socket and returns the signed
-//!   proof.
-//! * [`mock::MockProver`] — fetches the JWKS over plain TLS (no MPC), then
-//!   constructs every field of the proof and signs the digest with a
-//!   provided notary signing key. For end-to-end contract testing.
+//! Prover entry points (library consumers, i.e. the keeper):
 //!
-//! The wire format matches `JwksOracle.sol::NotarizedJwksProof` and
-//! `JwkClaim` exactly, so the proofs produced here are submittable
-//! straight to chain.
+//! * [`prover::notarize_jwks`] -- the real one: runs the MPC-TLS prover
+//!   against a live notary over any async socket and reads the record back.
+//! * [`mock::MockProver`] -- fetches the JWKS over plain TLS (no MPC),
+//!   synthesizes the transcript the real session would have produced, and
+//!   signs the record with a caller-provided notary key. For end-to-end
+//!   contract testing.
+//!
+//! [`NotarizedSession`]: crate::NotarizedSession
 
 pub mod mock;
-pub mod notary;
 pub mod prover;
-pub mod sol_types;
-pub mod transcript;
 
-pub use notary::{
-    build_rotation_response,
-    JwksNotaryResponse,
-    JWKS_DOMAIN,
-    JWKS_ENDPOINT,
+use libid_tlsn::{
+    Bytes,
+    HttpBody,
+    HttpRequest,
 };
+use libid_transcript::ceremony::Layout;
 
-use serde::{
-    Deserialize,
-    Serialize,
-};
+/// The TLS server name the JWKS reading authenticates. The record carries
+/// `keccak256` of it as `authorityId`, and `GoogleJwtRoots` refuses any
+/// other -- and, because googleapis.com serves many virtual hosts under one
+/// certificate, also requires the `Host` header the request carries to name
+/// this same host.
+pub const JWKS_DOMAIN: &str = "www.googleapis.com";
 
-/// One JWK as parsed from `oauth2/v3/certs`. Uses the raw bytes the notary
-/// committed to (not a re-serialized JSON), so substring checks line up
-/// byte-for-byte with the on-chain transcript.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParsedJwk {
-    /// Key id.
-    pub kid: String,
-    /// RSA modulus, base64url without padding, as Google sent it.
-    pub n_b64url: String,
-    /// The raw `{...}` object slice from the response body.
-    pub raw_object_bytes: Vec<u8>,
-}
+/// The endpoint the JWKS reading requests. The contract pins the request line
+/// `GET /oauth2/v3/certs HTTP/1.1` byte for byte.
+pub const JWKS_ENDPOINT: &str = "/oauth2/v3/certs";
 
-/// Everything the on-chain `rotateKeys` call needs. Byte fields serialize as
-/// `0x`-prefixed hex strings to make Foundry / TypeScript consumption easy.
-#[serde_with::serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JwksRotationProof {
-    /// EIP-191 notary signature over the JWKS notary digest.
-    #[serde(with = "hex_prefixed")]
-    pub notary_signature: Vec<u8>,
-    /// `keccak256("www.googleapis.com")`.
-    #[serde(with = "hex_prefixed_32")]
-    pub domain_hash: [u8; 32],
-    /// TLS client random.
-    #[serde(with = "hex_prefixed_32")]
-    pub client_random: [u8; 32],
-    /// TLS server random.
-    #[serde(with = "hex_prefixed_32")]
-    pub server_random: [u8; 32],
-    /// Server ephemeral public key (uncompressed SEC1 point).
-    #[serde(with = "hex_prefixed")]
-    pub server_ephemeral_key: Vec<u8>,
-    /// Merkle root over `[domain, endpoint, jwk_0, jwk_1, …]` leaves.
-    #[serde(with = "hex_prefixed_32")]
-    pub transcript_root: [u8; 32],
-    /// Unix seconds at proof construction.
-    pub timestamp: u64,
-    /// Inclusion path for the domain leaf (index 0).
-    #[serde(with = "hex_prefixed_32_vec")]
-    pub domain_path: Vec<[u8; 32]>,
-    /// Inclusion path for the endpoint leaf (index 1).
-    #[serde(with = "hex_prefixed_32_vec")]
-    pub endpoint_path: Vec<[u8; 32]>,
-    /// One claim per JWK in the response.
-    pub claims: Vec<JwkRotationClaim>,
-}
-
-/// One JWK claim inside a [`JwksRotationProof`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JwkRotationClaim {
-    /// Key id.
-    pub kid: String,
-    /// RSA modulus, base64url without padding.
-    pub n_b64url: String,
-    /// Raw JWK object bytes (the Merkle leaf preimage after the `recv:` tag).
-    #[serde(with = "hex_prefixed")]
-    pub jwk_bytes: Vec<u8>,
-    /// Inclusion path for this JWK's leaf.
-    #[serde(with = "hex_prefixed_32_vec")]
-    pub jwk_path: Vec<[u8; 32]>,
-}
-
-mod hex_prefixed {
-    use serde::{
-        Deserialize,
-        Deserializer,
-        Serializer,
+/// What the JWKS reading discloses: everything, in both directions.
+///
+/// One revealed range per direction covering the whole transcript, and no
+/// commitment. A public key set has nothing to hide, and zero commitments is
+/// what lets the contract read the transcript by concatenation safely: with
+/// exact coverage and nothing committed, no cut can hide bytes between the
+/// request line and the last key.
+///
+/// The JWKS session is not part of a ceremony, so it states its own layout
+/// rather than calling `libid_transcript::ceremony`. The shape is the same --
+/// the reveals are named and the commitments are their complement, here empty
+/// -- so each direction tiles by construction, which is what the contract's
+/// `requireExactCoverage` demands.
+pub fn layout(sent: &[u8], recv: &[u8]) -> (Layout, Layout) {
+    let whole = |bytes: &[u8]| Layout {
+        reveal: std::iter::once(0..bytes.len()).collect(),
+        commit: Vec::new(),
     };
-    pub fn serialize<S: Serializer>(b: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("0x{}", hex::encode(b)))
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let s = String::deserialize(d)?;
-        let s = s.strip_prefix("0x").unwrap_or(&s);
-        hex::decode(s).map_err(serde::de::Error::custom)
-    }
+    (whole(sent), whole(recv))
 }
 
-mod hex_prefixed_32 {
-    use serde::{
-        Deserialize,
-        Deserializer,
-        Serializer,
-    };
-    pub fn serialize<S: Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("0x{}", hex::encode(b)))
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
-        let s = String::deserialize(d)?;
-        let s = s.strip_prefix("0x").unwrap_or(&s);
-        let v = hex::decode(s).map_err(serde::de::Error::custom)?;
-        if v.len() != 32 {
-            return Err(serde::de::Error::custom(format!(
-                "expected 32 bytes, got {}",
-                v.len()
-            )));
+/// The request the reading sends.
+///
+/// The URI is absolute because `prover_generic` derives the server to reach
+/// from it; on the wire the request-target is origin-form (`prover_generic`
+/// rewrites it before sending), so the transcript's first line is the one the
+/// contract pins. hyper writes header names in lowercase, in the order they
+/// were set, and adds none of its own to a bodiless `GET`, so the sent
+/// transcript is exactly:
+///
+/// ```text
+/// GET /oauth2/v3/certs HTTP/1.1\r\n
+/// host: www.googleapis.com\r\n
+/// connection: close\r\n
+/// accept: application/json\r\n
+/// user-agent: <user_agent>\r\n
+/// \r\n
+/// ```
+///
+/// `connection: close` makes the server delimit the response, so the prover
+/// reads to EOF and the transcript ends where the body does. The mock prover
+/// synthesizes these same bytes from this same request, and a test drives
+/// hyper's encoder to keep the two honest.
+pub(crate) fn request(user_agent: &str) -> crate::Result<HttpRequest<HttpBody<Bytes>>> {
+    HttpRequest::builder()
+        .method("GET")
+        .uri(format!("https://{JWKS_DOMAIN}{JWKS_ENDPOINT}"))
+        .header("Host", JWKS_DOMAIN)
+        .header("Connection", "close")
+        .header("Accept", "application/json")
+        .header("User-Agent", user_agent)
+        .body(HttpBody::new(Bytes::new()))
+        .map_err(|e| crate::Error::Jwks {
+            detail: format!("request build: {e}"),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The contract's coverage rule: reveals and commitments account for every
+    /// byte of the direction exactly, no gap and no overlap.
+    fn assert_tiles(layout: &Layout, length: usize) {
+        let mut spans: Vec<_> = layout
+            .reveal
+            .iter()
+            .chain(layout.commit.iter())
+            .cloned()
+            .collect();
+        spans.sort_by_key(|range| range.start);
+        let mut at = 0;
+        for range in spans {
+            assert_eq!(range.start, at, "gap or overlap before {}", range.start);
+            at = range.end;
         }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&v);
-        Ok(out)
+        assert_eq!(at, length, "the spans do not reach the transcript end");
     }
-}
 
-mod hex_prefixed_32_vec {
-    use serde::{
-        Deserialize,
-        Deserializer,
-        Serialize,
-        Serializer,
-    };
-    pub fn serialize<S: Serializer>(v: &[[u8; 32]], s: S) -> Result<S::Ok, S::Error> {
-        let strs: Vec<String> =
-            v.iter().map(|b| format!("0x{}", hex::encode(b))).collect();
-        strs.serialize(s)
+    #[test]
+    fn reveals_both_directions_whole_and_commits_nothing() {
+        let sent = b"GET /oauth2/v3/certs HTTP/1.1\r\nhost: www.googleapis.com\r\n\r\n";
+        let recv = b"HTTP/1.1 200 OK\r\n\r\n{\"keys\":[]}";
+        let (s, r) = layout(sent, recv);
+
+        assert_eq!(s.reveal.len(), 1, "one range, not several to cut between");
+        assert_eq!(s.reveal[0], 0..sent.len());
+        assert_eq!(r.reveal.len(), 1, "one range, not several to cut between");
+        assert_eq!(r.reveal[0], 0..recv.len());
+        assert!(s.commit.is_empty(), "a commitment would hide request bytes");
+        assert!(
+            r.commit.is_empty(),
+            "a commitment would hide response bytes"
+        );
+        assert_tiles(&s, sent.len());
+        assert_tiles(&r, recv.len());
     }
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Vec<[u8; 32]>, D::Error> {
-        let strs = Vec::<String>::deserialize(d)?;
-        strs.into_iter()
-            .map(|s| {
-                let s = s.strip_prefix("0x").unwrap_or(&s);
-                let v = hex::decode(s).map_err(serde::de::Error::custom)?;
-                if v.len() != 32 {
-                    return Err(serde::de::Error::custom(format!(
-                        "expected 32 bytes, got {}",
-                        v.len()
-                    )));
-                }
-                let mut out = [0u8; 32];
-                out.copy_from_slice(&v);
-                Ok(out)
-            })
-            .collect()
+
+    #[test]
+    fn the_request_names_the_host_the_path_and_the_four_headers() {
+        let request = request("libid-keeper/test").unwrap();
+        assert_eq!(request.method(), "GET");
+        assert_eq!(request.uri().host(), Some(JWKS_DOMAIN));
+        assert_eq!(request.uri().path(), JWKS_ENDPOINT);
+        let headers: Vec<(&str, &[u8])> = request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        let expected: Vec<(&str, &[u8])> = vec![
+            ("host", JWKS_DOMAIN.as_bytes()),
+            ("connection", b"close"),
+            ("accept", b"application/json"),
+            ("user-agent", b"libid-keeper/test"),
+        ];
+        assert_eq!(headers, expected);
     }
 }
