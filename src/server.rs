@@ -60,11 +60,7 @@ use libid_transcript::{
     write_msg,
     AttestationWire,
 };
-use rand::RngCore;
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::Serialize;
 use tlsn::{
     config::verifier::VerifierConfig,
     connection::ServerName,
@@ -173,17 +169,11 @@ struct NotaryState {
     /// Notary signing identity (local hex key or AWS KMS).
     signer: Arc<ManagedSigner>,
     proxy_sessions: Arc<Semaphore>,
+    proxy_root_store: Arc<tlsn::webpki::RootCertStore>,
+    /// `None` connects to the TLS-authenticated server name on port 443.
+    proxy_server_addr: Option<SocketAddr>,
     public_key_hex: String,
     jwks_enabled: bool,
-    #[cfg(test)]
-    proxy_test: Option<ProxyTestConfig>,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-struct ProxyTestConfig {
-    server_addr: SocketAddr,
-    root_store: tlsn::webpki::RootCertStore,
 }
 
 #[derive(Serialize)]
@@ -210,10 +200,10 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     let state = NotaryState {
         signer: Arc::new(signer),
         proxy_sessions: Arc::new(Semaphore::new(config.max_sessions)),
+        proxy_root_store: Arc::new(libid_tlsn::root_store()),
+        proxy_server_addr: None,
         public_key_hex,
         jwks_enabled: config.jwks_enabled,
-        #[cfg(test)]
-        proxy_test: None,
     };
 
     // Broadcast shutdown to the TCP and WebSocket servers.
@@ -396,6 +386,7 @@ async fn notarize_proxy_ws_handler(
 async fn handle_ws_proxy_notarize(
     socket: WebSocket,
     state: NotaryState,
+    // Held for the connection lifetime; dropping it returns the session slot.
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let (io_a, io_b) = tokio::io::duplex(1 << 17);
@@ -483,19 +474,13 @@ where
     // dropping this future — aborts the driver instead of detaching it.
     let driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
+    // An inner error means a rejection was sent and the driver must be joined
+    // before returning; an outer error can abort the guarded driver.
     let setup = async {
-        #[cfg(test)]
-        let root_store = state
-            .proxy_test
-            .as_ref()
-            .map(|config| config.root_store.clone())
-            .unwrap_or_else(libid_tlsn::root_store);
-        #[cfg(not(test))]
-        let root_store = libid_tlsn::root_store();
         let verifier = handle
             .new_verifier(
                 VerifierConfig::builder()
-                    .root_store(root_store)
+                    .root_store(state.proxy_root_store.as_ref().clone())
                     .build()
                     .map_err(|e| Error::NotaryServer {
                         detail: format!("verifier config: {e}"),
@@ -521,14 +506,10 @@ where
         let server_name_str = proxy_verifier.config().server_name().as_str().to_string();
         info!("ProxyMode: connecting to {server_name_str}:443");
 
-        #[cfg(test)]
         let server_addr = state
-            .proxy_test
-            .as_ref()
-            .map(|config| config.server_addr.to_string())
+            .proxy_server_addr
+            .map(|addr| addr.to_string())
             .unwrap_or_else(|| format!("{server_name_str}:443"));
-        #[cfg(not(test))]
-        let server_addr = format!("{server_name_str}:443");
         let server_tcp = match tokio::net::TcpStream::connect(server_addr).await {
             Ok(server_tcp) => server_tcp,
             Err(error) => {
@@ -840,9 +821,10 @@ mod tests {
         let state = NotaryState {
             signer: Arc::new(signer),
             proxy_sessions: Arc::new(tokio::sync::Semaphore::new(1)),
+            proxy_root_store: Arc::new(libid_tlsn::root_store()),
+            proxy_server_addr: None,
             public_key_hex: String::new(),
             jwks_enabled: false,
-            proxy_test: None,
         };
 
         let (prover_io, notary_io) = tokio::io::duplex(2 << 23);
@@ -1004,7 +986,6 @@ mod tests {
         use super::{
             notarize_proxy_ws_handler,
             NotaryState,
-            ProxyTestConfig,
         };
 
         const TEST_KEY: &str =
@@ -1032,12 +1013,10 @@ mod tests {
         let state = NotaryState {
             signer: Arc::new(signer),
             proxy_sessions: Arc::new(Semaphore::new(1)),
+            proxy_root_store: Arc::new(prover_config.root_store.clone()),
+            proxy_server_addr: Some(target_addr),
             public_key_hex: String::new(),
             jwks_enabled: false,
-            proxy_test: Some(ProxyTestConfig {
-                server_addr: target_addr,
-                root_store: prover_config.root_store.clone(),
-            }),
         };
         let notary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let notary_addr = notary_listener.local_addr().unwrap();
@@ -1265,8 +1244,9 @@ mod tests {
             public_key_hex: hex::encode(signer.compressed_public_key()),
             signer: Arc::new(signer),
             proxy_sessions: Arc::new(Semaphore::new(8)),
+            proxy_root_store: Arc::new(libid_tlsn::root_store()),
+            proxy_server_addr: None,
             jwks_enabled: false,
-            proxy_test: None,
         };
 
         // The client half stays open and never writes a byte.
