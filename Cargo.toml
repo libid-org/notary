@@ -35,19 +35,19 @@ path = "src/main.rs"
 # A REV, NOT A TAG, AND ON PURPOSE. The ceremony wire constructions this server
 # encodes live in libid-rs PR #2, and v0.3.0 does not exist yet. A tag that has
 # not been cut resolves to nothing, so the pin below is a commit on that work
-# instead: the head of `fix/origin-form-request-target`, stacked on the PR's
-# branch. That commit is what makes `prover_generic` write the request-target
-# in origin-form (`GET /oauth2/v3/certs HTTP/1.1`) -- the line
-# `GoogleJwtRoots` and every Platform Verifier pin -- where the PR head
-# alone writes the absolute URI and every Rust-prover session is refused on
-# chain. This returns to `tag = "v0.3.0"` the moment the tag is cut -- and it
+# instead: the head of `feat/ceremony-constructions`, the PR's own branch. It
+# carries the origin-form request line (#5) that `GoogleJwtRoots` and every
+# Platform Verifier pin (`GET /oauth2/v3/certs HTTP/1.1`; the absolute URI
+# before it was refused on chain), the reveal layouts that match what the
+# verifier matches (#8) and refuse a member that chunk framing runs through
+# (#9), and no `libid-attestations` (#6). This returns to `tag = "v0.3.0"` the moment the tag is cut -- and it
 # must, before this is released: a rev is reachable only while the branch that
 # carries it is, and squash-merging the PR would strand it.
-libid-ceremony = { git = "https://github.com/libid-org/libid-rs", rev = "391078f2f05d1d3b6bce7c347db3c5f6a0cbe851" }
-libid-crypto = { git = "https://github.com/libid-org/libid-rs", rev = "391078f2f05d1d3b6bce7c347db3c5f6a0cbe851" }
-libid-signer = { git = "https://github.com/libid-org/libid-rs", rev = "391078f2f05d1d3b6bce7c347db3c5f6a0cbe851" }
-libid-tlsn = { git = "https://github.com/libid-org/libid-rs", rev = "391078f2f05d1d3b6bce7c347db3c5f6a0cbe851" }
-libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "391078f2f05d1d3b6bce7c347db3c5f6a0cbe851" }
+libid-ceremony = { git = "https://github.com/libid-org/libid-rs", rev = "cc40b0c449cedcd8da2868da020c09ba7951bb9e" }
+libid-crypto = { git = "https://github.com/libid-org/libid-rs", rev = "cc40b0c449cedcd8da2868da020c09ba7951bb9e" }
+libid-signer = { git = "https://github.com/libid-org/libid-rs", rev = "cc40b0c449cedcd8da2868da020c09ba7951bb9e" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", rev = "cc40b0c449cedcd8da2868da020c09ba7951bb9e" }
+libid-transcript = { git = "https://github.com/libid-org/libid-rs", rev = "cc40b0c449cedcd8da2868da020c09ba7951bb9e" }
 
 # Upstream TLSNotary. The pin MUST equal libid-tlsn's (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible
