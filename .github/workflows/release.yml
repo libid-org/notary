@@ -1,9 +1,10 @@
 name: Release
 
-# Publishing a GitHub Release tagged `v<version>` produces the two release
-# artifacts:
+# Publishing a GitHub Release tagged `v<version>` or `v<version>-rc.N` produces
+# the two release artifacts:
 #
-#   * a Docker image pushed to ghcr.io/libid-org/notary:<version> and :latest;
+#   * a Docker image pushed to ghcr.io/libid-org/notary:<version> (`:latest`
+#     only for a final release);
 #   * a tlsn_wasm browser bundle (built from the exact tlsn rev Cargo.lock
 #     pins) uploaded to the release as tlsn-wasm-<version>.tar.gz.
 #
@@ -23,8 +24,9 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/notary
 
 jobs:
-  # The tag names the version the manifest already carries — the tag is a
-  # pointer, never a source. Everything that publishes needs this first.
+  # The tag names the version the manifest already carries, optionally with an
+  # RC suffix — the tag is a pointer, never a source. Everything that publishes
+  # needs this first.
   verify-tag:
     name: Release tag matches version
     runs-on: ubuntu-latest
@@ -32,14 +34,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Tag equals Cargo.toml version
+      - name: Tag matches Cargo.toml version
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
-          if [ "$TAG" != "v$version" ]; then
-            echo "::error::release tag '$TAG' does not match Cargo.toml version 'v$version'"
+          version_regex="${version//./\\.}"
+          if [[ "$TAG" != "v$version" && ! "$TAG" =~ ^v${version_regex}-rc\.[1-9][0-9]*$ ]]; then
+            echo "::error::release tag '$TAG' does not match 'v$version' or 'v$version-rc.N'"
             exit 1
           fi
           echo "Tag $TAG matches Cargo.toml."
@@ -91,12 +94,16 @@ jobs:
       - name: Build and push
         env:
           TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
-          docker build -t "$IMAGE:$version" -t "$IMAGE:latest" .
+          docker build -t "$IMAGE:$version" .
           docker push "$IMAGE:$version"
-          docker push "$IMAGE:latest"
+          if [ "$PRERELEASE" = "false" ]; then
+            docker tag "$IMAGE:$version" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
 
   tlsn-wasm:
     name: tlsn_wasm bundle → release asset
@@ -119,7 +126,7 @@ jobs:
           set -euo pipefail
           version="${TAG#v}"
           tar -czf "tlsn-wasm-$version.tar.gz" -C tlsn-wasm \
-            tlsn_wasm.js tlsn_wasm_bg.wasm spawn.js
+            tlsn_wasm.js tlsn_wasm_bg.wasm snippets
           sha256sum "tlsn-wasm-$version.tar.gz"
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
