@@ -63,9 +63,14 @@ use futures_util::{
     SinkExt,
     StreamExt,
 };
+use libid_ceremony::AttestedData;
 use libid_signer::{
     ManagedSigner,
     SignerSource,
+};
+use libid_tlsn::attest::{
+    FromObserved,
+    ObservedSession,
 };
 use libid_transcript::{
     write_msg,
@@ -78,7 +83,11 @@ use serde::{
 };
 use tlsn::{
     config::verifier::VerifierConfig,
-    connection::ServerName,
+    connection::{
+        CertBinding,
+        CertBindingV1_2,
+        ServerName,
+    },
     transcript::{
         PartialTranscript,
         TranscriptCommitment,
@@ -544,12 +553,12 @@ async fn sign_ceremony_attestation(
     commitments: &[TranscriptCommitment],
     created_at: u64,
 ) -> Result<AttestationWire> {
-    let attested = libid_tlsn::attest::attested_data(
-        partial,
+    let attested = AttestedData::from_observed(ObservedSession {
+        transcript: partial,
         authority,
         commitments,
-        libid_tlsn::attest::AttestationInput { created_at },
-    )
+        created_at,
+    })
     .map_err(|e| Error::NotaryServer {
         detail: format!("attested data: {e}"),
     })?;
@@ -961,7 +970,22 @@ where
     // `JwksRotationProof` (no attestation-request round trip — the JWKS
     // prover protocol ends with the verifier's response).
     if state.jwks_enabled && domain.eq_ignore_ascii_case(jwks::JWKS_DOMAIN) {
-        let handshake = libid_tlsn::extract_handshake_data(&result.tls_transcript)?;
+        let handshake = match result.tls_transcript.certificate_binding() {
+            CertBinding::V1_2(CertBindingV1_2 {
+                client_random,
+                server_random,
+                server_ephemeral_key,
+            }) => jwks::JwksHandshake {
+                client_random: *client_random,
+                server_random: *server_random,
+                server_ephemeral_key: server_ephemeral_key.key.clone(),
+            },
+            _ => {
+                return Err(Error::Jwks {
+                    detail: "JWKS proofs require TLS 1.2".into(),
+                });
+            }
+        };
         let response =
             jwks::build_rotation_response(sent, recv, &handshake, &state.signer).await?;
         let mut io = result.recovered_io;

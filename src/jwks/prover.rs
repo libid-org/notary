@@ -58,14 +58,12 @@ where
         request,
         // The JWKS session is not part of a ceremony: it reads a public
         // document, no credential passes through it, and no Platform Verifier
-        // ever sees the result. So it states its own layout rather than calling
-        // `libid_transcript::ceremony` -- the whole response is revealed,
-        // because there is nothing in a public key set to hide.
+        // ever sees the result. Reveal both directions completely.
         |sent, recv| {
             Ok((
                 Layout {
-                    reveal: libid_transcript::find_notary_reveal_ranges(sent),
-                    commit: libid_transcript::find_presentation_commit_ranges(sent),
+                    reveal: core::iter::once(0..sent.len()).collect(),
+                    commit: Vec::new(),
                 },
                 Layout {
                     reveal: core::iter::once(0..recv.len()).collect(),

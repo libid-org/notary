@@ -23,10 +23,7 @@ use base64::{
 };
 use k256::ecdsa::SigningKey;
 use libid_crypto::{
-    build_merkle_tree,
-    double_hash_leaf,
     keccak256,
-    merkle_proof,
     pubkey_to_eth_address,
     sign_eth_claim,
 };
@@ -37,6 +34,11 @@ use crate::{
         Result,
     },
     jwks::{
+        crypto::{
+            build_merkle_tree,
+            double_hash_leaf,
+            merkle_proof,
+        },
         transcript,
         JwkRotationClaim,
         JwksRotationProof,
@@ -181,25 +183,7 @@ async fn fetch_jwks(url: &str) -> Result<Vec<u8>> {
 }
 
 /// Compute the same notary digest the contract verifies in `_notaryDigest`.
-/// Thin re-export of [`libid_attestations::compute_jwks_notary_digest`], kept
-/// under the name the original codebase used.
-pub fn notary_digest(
-    domain_hash: [u8; 32],
-    client_random: [u8; 32],
-    server_random: [u8; 32],
-    server_ephemeral_key: &[u8],
-    transcript_root: [u8; 32],
-    timestamp: u64,
-) -> [u8; 32] {
-    libid_attestations::compute_jwks_notary_digest(
-        domain_hash,
-        client_random,
-        server_random,
-        server_ephemeral_key,
-        transcript_root,
-        timestamp,
-    )
-}
+pub use super::crypto::notary_digest;
 
 /// Convenience wrapper to be used in tests / CLI: parse the `n` field as a
 /// 256-byte big-endian integer.
