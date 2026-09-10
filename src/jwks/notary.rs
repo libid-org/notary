@@ -41,7 +41,7 @@ pub const JWKS_DOMAIN: &str = "www.googleapis.com";
 pub const JWKS_ENDPOINT: &str = "/oauth2/v3/certs";
 
 /// Wire message sent from notary back to prover after MPC-TLS closes
-/// (JWKS sessions only — platform sessions get `NotaryResponse`).
+/// (JWKS sessions only — platform sessions get the ceremony attestation).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JwksNotaryResponse {
     /// Full attestation as JSON (forwarded to anyone who later wants to
