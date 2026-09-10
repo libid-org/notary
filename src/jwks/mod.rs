@@ -20,6 +20,7 @@
 //! `JwkClaim` exactly, so the proofs produced here are submittable
 //! straight to chain.
 
+mod crypto;
 pub mod mock;
 pub mod notary;
 pub mod prover;
@@ -28,6 +29,7 @@ pub mod transcript;
 
 pub use notary::{
     build_rotation_response,
+    JwksHandshake,
     JwksNotaryResponse,
     JWKS_DOMAIN,
     JWKS_ENDPOINT,

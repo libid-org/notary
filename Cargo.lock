@@ -935,6 +935,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "async-task"
+version = "4.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1518,6 +1524,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bincode"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
+dependencies = [
+ "bincode_derive",
+ "serde",
+ "unty",
+]
+
+[[package]]
+name = "bincode_derive"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
+dependencies = [
+ "virtue",
+]
+
+[[package]]
 name = "bitcoin-consensus-encoding"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1847,8 +1873,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clmul"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -3531,19 +3557,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
-name = "libid-attestations"
-version = "0.2.0"
-source = "git+https://github.com/libid-org/libid-rs?tag=v0.2.0#ec71e1536cb76df80cf8c0ca923273d40671db60"
+name = "libid-ceremony"
+version = "0.3.0"
+source = "git+https://github.com/libid-org/libid-rs?tag=v0.3.0#501f094bf10f776c2227ef345908f507a0c80fd0"
 dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
+ "bincode 2.0.1",
  "libid-crypto",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "libid-crypto"
-version = "0.2.0"
-source = "git+https://github.com/libid-org/libid-rs?tag=v0.2.0#ec71e1536cb76df80cf8c0ca923273d40671db60"
+version = "0.3.0"
+source = "git+https://github.com/libid-org/libid-rs?tag=v0.3.0#501f094bf10f776c2227ef345908f507a0c80fd0"
 dependencies = [
  "hex",
  "k256",
@@ -3553,9 +3579,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libid-profiles"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dab7ecd48e0d3c233192f235e4cc6f90dc6b62fe6ffb9903d99120e6f70c895"
+
+[[package]]
 name = "libid-signer"
-version = "0.2.0"
-source = "git+https://github.com/libid-org/libid-rs?tag=v0.2.0#ec71e1536cb76df80cf8c0ca923273d40671db60"
+version = "0.3.0"
+source = "git+https://github.com/libid-org/libid-rs?tag=v0.3.0#501f094bf10f776c2227ef345908f507a0c80fd0"
 dependencies = [
  "alloy",
  "aws-config",
@@ -3566,12 +3598,13 @@ dependencies = [
 
 [[package]]
 name = "libid-tlsn"
-version = "0.2.0"
-source = "git+https://github.com/libid-org/libid-rs?tag=v0.2.0#ec71e1536cb76df80cf8c0ca923273d40671db60"
+version = "0.3.0"
+source = "git+https://github.com/libid-org/libid-rs?tag=v0.3.0#501f094bf10f776c2227ef345908f507a0c80fd0"
 dependencies = [
  "http-body-util",
  "hyper 1.11.0",
  "hyper-util",
+ "libid-ceremony",
  "libid-transcript",
  "thiserror 2.0.20",
  "tlsn",
@@ -3583,9 +3616,11 @@ dependencies = [
 
 [[package]]
 name = "libid-transcript"
-version = "0.2.0"
-source = "git+https://github.com/libid-org/libid-rs?tag=v0.2.0#ec71e1536cb76df80cf8c0ca923273d40671db60"
+version = "0.3.0"
+source = "git+https://github.com/libid-org/libid-rs?tag=v0.3.0#501f094bf10f776c2227ef345908f507a0c80fd0"
 dependencies = [
+ "httparse",
+ "libid-profiles",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -3653,8 +3688,8 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "matrix-transpose"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "thiserror 1.0.69",
 ]
@@ -3684,8 +3719,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-circuits"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "mpz-circuits-core",
  "mpz-circuits-data",
@@ -3693,10 +3728,10 @@ dependencies = [
 
 [[package]]
 name = "mpz-circuits-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "itybity 0.3.3",
  "once_cell",
  "rand 0.9.5",
@@ -3708,18 +3743,18 @@ dependencies = [
 
 [[package]]
 name = "mpz-circuits-data"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "mpz-circuits-core",
  "once_cell",
 ]
 
 [[package]]
 name = "mpz-cointoss"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "futures",
  "mpz-cointoss-core",
@@ -3731,8 +3766,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-cointoss-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "mpz-core",
  "opaque-debug",
@@ -3742,13 +3777,16 @@ dependencies = [
 
 [[package]]
 name = "mpz-common"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
+ "async-task",
  "async-trait",
  "bytes",
  "cfg-if",
  "crossbeam-channel",
+ "crossbeam-deque",
+ "crossbeam-utils",
  "futures",
  "pin-project-lite",
  "pollster",
@@ -3761,8 +3799,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "aes 0.9.2",
  "bcs",
@@ -3787,8 +3825,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-fields"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "ark-ff 0.4.2",
  "ark-secp256r1",
@@ -3808,8 +3846,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-garble"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "async-trait",
  "derive_builder 0.11.2",
@@ -3834,8 +3872,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-garble-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "aes 0.9.2",
  "bitvec",
@@ -3865,8 +3903,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-hash"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "blake3",
  "itybity 0.3.3",
@@ -3878,8 +3916,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ideal-vm"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "async-trait",
  "futures",
@@ -3895,8 +3933,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-memory-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "blake3",
  "futures",
@@ -3910,8 +3948,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ole"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "async-trait",
  "futures",
@@ -3928,8 +3966,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ole-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "hybrid-array",
  "itybity 0.3.3",
@@ -3944,8 +3982,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ot"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -3967,8 +4005,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ot-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "aes 0.9.2",
  "blake3",
@@ -3998,8 +4036,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-share-conversion"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "async-trait",
  "mpz-common",
@@ -4014,8 +4052,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-share-conversion-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "mpz-common",
  "mpz-core",
@@ -4028,8 +4066,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-vm-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "async-trait",
  "futures",
@@ -4041,8 +4079,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-zk"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4059,8 +4097,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-zk-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/privacy-ethereum/mpz?rev=v0.1.0-alpha.6#6ebfe619490c3155a589fc6a3be83b0976de19dc"
 dependencies = [
  "blake3",
  "cfg-if",
@@ -4096,7 +4134,7 @@ dependencies = [
  "futures-util",
  "hex",
  "k256",
- "libid-attestations",
+ "libid-ceremony",
  "libid-crypto",
  "libid-signer",
  "libid-tlsn",
@@ -5311,7 +5349,7 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96005f01d74e0866a7c27bc47e6051e286339df96c5ab10dd0ee833043a0fbd5"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "bytes",
  "futures-channel",
  "futures-core",
@@ -5712,8 +5750,8 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tlsn"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-alpha.15#47aee45b53e06648c1b2ad3689b367b8c923fdec"
 dependencies = [
  "aes 0.8.4",
  "ctr 0.9.2",
@@ -5761,8 +5799,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-attestation"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-alpha.15#47aee45b53e06648c1b2ad3689b367b8c923fdec"
 dependencies = [
  "bcs",
  "blake3",
@@ -5779,8 +5817,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-cipher"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-alpha.15#47aee45b53e06648c1b2ad3689b367b8c923fdec"
 dependencies = [
  "aes 0.8.4",
  "async-trait",
@@ -5792,8 +5830,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-core"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-alpha.15#47aee45b53e06648c1b2ad3689b367b8c923fdec"
 dependencies = [
  "bimap",
  "blake3",
@@ -5821,8 +5859,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-deap"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-alpha.15#47aee45b53e06648c1b2ad3689b367b8c923fdec"
 dependencies = [
  "async-trait",
  "futures",
@@ -5838,8 +5876,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-hmac-sha256"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-alpha.15#47aee45b53e06648c1b2ad3689b367b8c923fdec"
 dependencies = [
  "mpz-circuits",
  "mpz-core",
@@ -5852,8 +5890,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-key-exchange"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-alpha.15#47aee45b53e06648c1b2ad3689b367b8c923fdec"
 dependencies = [
  "async-trait",
  "derive_builder 0.12.0",
@@ -5875,8 +5913,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-mpc-tls"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-alpha.15#47aee45b53e06648c1b2ad3689b367b8c923fdec"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -5930,8 +5968,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-tls-client"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-alpha.15#47aee45b53e06648c1b2ad3689b367b8c923fdec"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -5956,8 +5994,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-tls-core"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.15"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-alpha.15#47aee45b53e06648c1b2ad3689b367b8c923fdec"
 dependencies = [
  "futures",
  "hmac 0.12.1",
@@ -6283,6 +6321,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "unty"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6333,6 +6377,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtue"
+version = "0.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "vsimd"

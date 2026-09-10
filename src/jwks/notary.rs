@@ -8,15 +8,8 @@
 
 use std::time::SystemTime;
 
-use libid_attestations::compute_jwks_notary_digest;
-use libid_crypto::{
-    build_merkle_tree,
-    double_hash_leaf,
-    keccak256,
-    merkle_proof,
-};
+use libid_crypto::keccak256;
 use libid_signer::ManagedSigner;
-use libid_transcript::TlsHandshakeData;
 use serde::{
     Deserialize,
     Serialize,
@@ -28,6 +21,12 @@ use crate::{
         Result,
     },
     jwks::{
+        crypto::{
+            build_merkle_tree,
+            double_hash_leaf,
+            merkle_proof,
+            notary_digest,
+        },
         transcript::parse_jwks_body,
         JwkRotationClaim,
         JwksRotationProof,
@@ -53,6 +52,17 @@ pub struct JwksNotaryResponse {
     pub proof: JwksRotationProof,
 }
 
+/// TLS 1.2 certificate-binding fields carried by a JWKS proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JwksHandshake {
+    /// TLS client random.
+    pub client_random: [u8; 32],
+    /// TLS server random.
+    pub server_random: [u8; 32],
+    /// Server ephemeral public key.
+    pub server_ephemeral_key: Vec<u8>,
+}
+
 /// Build and sign a [`JwksNotaryResponse`] from a verified MPC-TLS
 /// transcript whose SNI was [`JWKS_DOMAIN`].
 ///
@@ -63,7 +73,7 @@ pub struct JwksNotaryResponse {
 pub async fn build_rotation_response(
     sent: &[u8],
     recv: &[u8],
-    handshake: &TlsHandshakeData,
+    handshake: &JwksHandshake,
     signer: &ManagedSigner,
 ) -> Result<JwksNotaryResponse> {
     // ---- Endpoint check ----
@@ -131,7 +141,7 @@ pub async fn build_rotation_response(
         .map(|d| d.as_secs())
         .unwrap_or_default();
 
-    let digest = compute_jwks_notary_digest(
+    let digest = notary_digest(
         domain_hash,
         handshake.client_random,
         handshake.server_random,
@@ -201,13 +211,13 @@ fn decode_chunked_if_needed(recv: &[u8], body_start: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use libid_crypto::{
-        merkle_verify,
         pubkey_to_eth_address,
         recover_eth_claim,
     };
     use libid_signer::SignerSource;
 
     use super::*;
+    use crate::jwks::crypto::merkle_verify;
 
     const JWKS_BODY: &[u8] = br#"{"keys":[{"alg":"RS256","e":"AQAB","n":"AAA","kty":"RSA","kid":"k1","use":"sig"},{"use":"sig","kty":"RSA","kid":"k2","alg":"RS256","n":"BBB","e":"AQAB"}]}"#;
 
@@ -220,8 +230,8 @@ mod tests {
         (sent, recv)
     }
 
-    fn sample_handshake() -> TlsHandshakeData {
-        TlsHandshakeData {
+    fn sample_handshake() -> JwksHandshake {
+        JwksHandshake {
             client_random: [1u8; 32],
             server_random: [2u8; 32],
             server_ephemeral_key: vec![4u8; 65],
@@ -251,7 +261,7 @@ mod tests {
         assert_eq!(proof.domain_hash, keccak256(JWKS_DOMAIN.as_bytes()));
 
         // Signature recovers to the notary's address.
-        let digest = compute_jwks_notary_digest(
+        let digest = notary_digest(
             proof.domain_hash,
             proof.client_random,
             proof.server_random,

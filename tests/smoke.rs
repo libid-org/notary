@@ -35,10 +35,6 @@ fn test_config(ws_port: u16) -> NotaryServerConfig {
         &ws_port.to_string(),
         "--signing-key",
         TEST_KEY,
-        "--x-zk-verifier-address",
-        "0x1111111111111111111111111111111111111111",
-        "--verifying-contract",
-        "0x2222222222222222222222222222222222222222",
     ])
 }
 
@@ -84,13 +80,19 @@ async fn info_session_and_longpoll_endpoints_work() {
         .expect("GET /evm-proof");
     assert_eq!(resp.status(), 404);
 
-    // The attestation endpoint refuses to guess the digest shape.
+    // The attestation endpoint takes no parameters at all -- there is nothing
+    // in the record a caller could choose -- so the only thing it can refuse is
+    // a session it never observed.
     let resp = client
-        .get(format!("{base}/zk/proxy/attestation/{session_id}"))
+        .get(format!("{base}/attestation/never-observed"))
         .send()
         .await
-        .expect("GET /zk/proxy/attestation");
-    assert_eq!(resp.status(), 400, "session_type is required");
+        .expect("GET /attestation");
+    assert_eq!(
+        resp.status(),
+        404,
+        "an unknown session has nothing to attest"
+    );
 
     handle.shutdown();
 }

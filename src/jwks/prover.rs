@@ -2,10 +2,15 @@
 //! running notary — the pieces a backend JWKS rotation listener consumes.
 
 use libid_tlsn::{
-    HttpRequestSpec,
+    Bytes,
+    HttpBody,
+    HttpRequest,
     ProverResult,
 };
-use libid_transcript::read_msg;
+use libid_transcript::{
+    ceremony::Layout,
+    read_msg,
+};
 use tokio::io::{
     AsyncRead,
     AsyncWrite,
@@ -33,20 +38,41 @@ pub async fn run_jwks_prover<T>(socket: T) -> Result<ProverResult<T>>
 where
     T: AsyncWrite + AsyncRead + Send + Unpin + 'static,
 {
+    let request = HttpRequest::builder()
+        .method("GET")
+        .uri(format!("https://{JWKS_DOMAIN}{JWKS_ENDPOINT}"))
+        .header("Host", JWKS_DOMAIN)
+        .header("Connection", "close")
+        .header("Accept", "application/json")
+        .header(
+            "User-Agent",
+            concat!("libid-notary/", env!("CARGO_PKG_VERSION")),
+        )
+        .body(HttpBody::new(Bytes::new()))
+        .map_err(|e| crate::Error::NotaryServer {
+            detail: format!("request build: {e}"),
+        })?;
+
     let result = libid_tlsn::prover_generic(
         socket,
-        &HttpRequestSpec {
-            api_host: JWKS_DOMAIN,
-            path: JWKS_ENDPOINT,
-            method: "GET",
-            body: None,
-            bearer_token: None,
-            user_agent: concat!("libid-notary/", env!("CARGO_PKG_VERSION")),
+        request,
+        // The JWKS session is not part of a ceremony: it reads a public
+        // document, no credential passes through it, and no Platform Verifier
+        // ever sees the result. Reveal both directions completely.
+        |sent, recv| {
+            Ok((
+                Layout {
+                    reveal: core::iter::once(0..sent.len()).collect(),
+                    commit: Vec::new(),
+                },
+                Layout {
+                    reveal: core::iter::once(0..recv.len()).collect(),
+                    commit: Vec::new(),
+                },
+            ))
         },
-        // One range covering the whole recv transcript — NOT a range of
-        // numbers, which is what the clippy lint guards against.
-        #[allow(clippy::single_range_in_vec_init)]
-        |recv| Ok(vec![0..recv.len()]),
+        // Nobody waits on a JWKS rotation the way a user waits on a claim: the
+        // keeper runs it on a timer and reads the result.
         |_| {},
     )
     .await?;
