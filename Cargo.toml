@@ -84,43 +84,44 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",
 ] }
-tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "8a5de746f73bbe3476a3b10ce411fde3c87e479d" }
-tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "8a5de746f73bbe3476a3b10ce411fde3c87e479d" }
-tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "8a5de746f73bbe3476a3b10ce411fde3c87e479d" }
+tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "94aaaf33f3361d1218f9abb4c82b5c58a9199460" }
+tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "94aaaf33f3361d1218f9abb4c82b5c58a9199460" }
+tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "94aaaf33f3361d1218f9abb4c82b5c58a9199460" }
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.29"
 
 [patch."https://github.com/tlsnotary/tlsn"]
 # WIP: TLSNotary #1178 reclaims the channel, #1179 preserves hash-opening
-# order, and #1173 fixes RCOT preprocessing deadlocks. Return to a release
-# containing all three fixes when available.
-tlsn = { git = "https://github.com/libid-org/tlsn", rev = "8a5de746f73bbe3476a3b10ce411fde3c87e479d" }
+# order, #1173 fixes RCOT preprocessing deadlocks, and libid-org/tlsn#2 bounds
+# verifier transcript allocation. Return to a release containing the fixes.
+tlsn = { git = "https://github.com/libid-org/tlsn", rev = "94aaaf33f3361d1218f9abb4c82b5c58a9199460" }
 
 # TLSNotary #1173 also needs privacy-ethereum/mpz#446 KOS instance-domain
-# separation. Cargo ignores dependency-workspace patches, so repeat TLSN's
-# matching alpha.6-compatible pin here for the server and test clients.
+# separation, while libid-org/mpz#2 preserves active context tasks after an
+# executor handle is dropped. Cargo ignores dependency-workspace patches, so
+# repeat TLSN's matching alpha.6-compatible pin for server and test clients.
 [patch."https://github.com/privacy-ethereum/mpz"]
-clmul = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-matrix-transpose = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-circuits = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-circuits-core = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-circuits-data = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-cointoss = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-cointoss-core = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-common = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-core = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-fields = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-garble = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-garble-core = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-hash = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-ideal-vm = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-memory-core = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-ole = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-ole-core = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-ot = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-ot-core = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-share-conversion = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-share-conversion-core = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-vm-core = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-zk = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
-mpz-zk-core = { git = "https://github.com/libid-org/mpz", rev = "c0379ef" }
+clmul = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+matrix-transpose = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-circuits = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-circuits-core = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-circuits-data = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-cointoss = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-cointoss-core = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-common = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-core = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-fields = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-garble = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-garble-core = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-hash = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-ideal-vm = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-memory-core = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-ole = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-ole-core = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-ot = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-ot-core = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-share-conversion = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-share-conversion-core = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-vm-core = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-zk = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
+mpz-zk-core = { git = "https://github.com/libid-org/mpz", rev = "1dd2349d52aeea038d77fb0816f781c6b714fe77" }
