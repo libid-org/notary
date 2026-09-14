@@ -4136,15 +4136,11 @@ checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 name = "notary"
 version = "0.3.0"
 dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
  "anyhow",
  "axum",
- "base64 0.22.1",
  "clap",
  "futures-util",
  "hex",
- "k256",
  "libid-ceremony",
  "libid-crypto",
  "libid-signer",
@@ -4153,7 +4149,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "serde_with",
  "thiserror 2.0.20",
  "tlsn",
  "tlsn-sdk-core",
