@@ -30,9 +30,6 @@ pub enum Error {
     /// Signing (local or KMS) failed.
     #[error(transparent)]
     Signer(#[from] libid_signer::SignerError),
-    /// Crypto primitive failure.
-    #[error(transparent)]
-    Crypto(#[from] libid_crypto::Error),
 }
 
 /// Result alias for this crate.
