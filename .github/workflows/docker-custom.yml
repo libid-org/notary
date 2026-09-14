@@ -5,6 +5,12 @@ name: Custom Docker image
 #   ghcr.io/libid-org/notary:custom-<tag-suffix>
 # so a testing deployment can point at exactly the code under review while
 # `:latest` and the version tags keep meaning "released".
+#
+# The tag is a manifest list covering linux/amd64 and linux/arm64. Each
+# platform compiles on a runner of its own architecture and pushes an untagged
+# image addressed only by digest; a final job joins the two digests under the
+# one tag. QEMU is deliberately not used: emulating a tlsn/mpz build costs
+# hours, while `ubuntu-24.04-arm` is native and free for this public repo.
 
 on:
   workflow_dispatch:
@@ -21,14 +27,37 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/notary
 
 jobs:
-  docker:
-    name: Build ${{ inputs.ref }} → custom-${{ inputs['tag-suffix'] }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+  build:
+    name: Build ${{ inputs.ref }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      # One architecture failing should not hide whether the other one builds.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
     steps:
+      # First, before the expensive build: the suffix becomes a docker tag, so
+      # a typo fails in seconds instead of after two compilations.
+      - name: Tag suffix is a valid docker tag fragment
+        env:
+          SUFFIX: ${{ inputs['tag-suffix'] }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$SUFFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$ ]]; then
+            echo "::error::tag-suffix '$SUFFIX' is not a valid docker tag fragment"
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
@@ -39,18 +68,65 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push by digest
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          # The default `docker` driver cannot push by digest; a container
+          # builder can, and still compiles natively on this runner.
+          docker buildx create --name notary --driver docker-container --use
+          # No provenance/SBOM attestations: they would ride along as extra
+          # manifests with platform unknown/unknown, and this tag's contract is
+          # exactly two platform entries.
+          docker buildx build \
+            --platform "$PLATFORM" \
+            --provenance=false \
+            --sbom=false \
+            --metadata-file metadata.json \
+            --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+            .
+          mkdir -p digests
+          jq -er '."containerimage.digest"' metadata.json > "digests/$ARCH"
+          echo "$PLATFORM $(cat "digests/$ARCH") ($(git rev-parse HEAD))"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: Manifest list → custom-${{ inputs['tag-suffix'] }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Join the per-platform digests under one tag
         env:
           SUFFIX: ${{ inputs['tag-suffix'] }}
         run: |
           set -euo pipefail
-          # The suffix becomes a docker tag: restrict it to docker-tag-safe
-          # characters up front so a typo fails here, not deep inside docker.
-          if ! [[ "$SUFFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$ ]]; then
-            echo "::error::tag-suffix '$SUFFIX' is not a valid docker tag fragment"
-            exit 1
-          fi
           tag="$IMAGE:custom-$SUFFIX"
-          docker build -t "$tag" .
-          docker push "$tag"
-          echo "Pushed $tag ($(git rev-parse HEAD))"
+          sources=()
+          for f in digests/*; do sources+=("$IMAGE@$(cat "$f")"); done
+          docker buildx imagetools create -t "$tag" "${sources[@]}"
+          docker buildx imagetools inspect "$tag"
+          echo "Pushed $tag" >> "$GITHUB_STEP_SUMMARY"
