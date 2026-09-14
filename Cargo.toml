@@ -32,11 +32,11 @@ path = "src/main.rs"
 # The upstream `tlsn` git rev is pinned by libid-tlsn and arrives the same way;
 # the direct `tlsn` entry below MUST name the same rev.
 #
-libid-ceremony = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
-libid-crypto = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
-libid-signer = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
-libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
-libid-transcript = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.0" }
+libid-ceremony = { git = "https://github.com/libid-org/libid-rs", tag = "v0.4.0" }
+libid-crypto = { git = "https://github.com/libid-org/libid-rs", tag = "v0.4.0" }
+libid-signer = { git = "https://github.com/libid-org/libid-rs", tag = "v0.4.0" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.4.0" }
+libid-transcript = { git = "https://github.com/libid-org/libid-rs", tag = "v0.4.0" }
 
 # Upstream TLSNotary. The pin MUST equal libid-tlsn's (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible
