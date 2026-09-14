@@ -86,9 +86,11 @@ with no `docker/login-action` step, no `packages: read` permission and no PAT â€
 `GITHUB_TOKEN` is not involved. Nothing is needed on the consumer side beyond
 the pull itself.
 
-Images are `linux/amd64` only. On an arm64 host (Apple Silicon) add
-`--platform linux/amd64`; GitHub's `ubuntu-latest` runners are amd64 and need
-no flag.
+Every tag these workflows publish is a manifest list covering `linux/amd64`
+and `linux/arm64`, so one reference runs on GitHub's `ubuntu-latest` and
+`ubuntu-24.04-arm` runners, on x86 and Graviton nodes, and on Apple Silicon â€”
+no `--platform` flag, no emulation. Tags published up to `0.3.0-rc.3` are
+amd64 only.
 
 ## Browser wasm bundle
 
