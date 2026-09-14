@@ -79,7 +79,9 @@ jobs:
   # untagged image addressed only by digest; `docker-manifest` then joins the
   # digests under the release tags. QEMU is deliberately not used: emulating a
   # tlsn/mpz build costs hours, while `ubuntu-24.04-arm` is native and free for
-  # this public repo.
+  # this public repo. Those per-platform images stay in the ghcr package as
+  # UNTAGGED versions; the manifest list is the only thing pointing at them, so
+  # a "delete untagged versions" retention policy would break every tag.
   docker:
     name: Docker image ${{ matrix.platform }} → ghcr.io
     runs-on: ${{ matrix.runner }}
