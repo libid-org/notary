@@ -35,7 +35,10 @@ FROM debian:bookworm-slim
 
 # ca-certificates: outbound TLS to AWS KMS when SIGNING_KEY is `kms:<id>`.
 # netcat: the HEALTHCHECK probes the TCP wire port.
-# No libssl3: `ldd` on the built binary shows libc, libm and libgcc_s only.
+# libssl3 is deliberately not named: nothing links it -- `ldd` on the binary
+# lists libc, libm and libgcc_s only. ca-certificates still pulls it in through
+# openssl, so dropping the explicit install does not shrink the image; it stops
+# the Dockerfile claiming a dependency this service does not have.
 RUN apt-get update && apt-get install -y ca-certificates netcat-openbsd && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/notary /usr/local/bin/notary
