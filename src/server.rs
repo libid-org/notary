@@ -307,10 +307,11 @@ async fn info_handler(State(state): State<NotaryState>) -> Json<InfoResponse> {
 // `handle`, `user_id` or `session_addr` -- the Platform Verifier reads them
 // itself, and the notary deciding them would be the profile-specific
 // judgement REQ-COMMON-33 forbids it.
-/// The record is the attested data and the signature over it, and nothing
-/// else (see [`NotarizedSession`]).
 
 /// Build the section 9.1 attested data for one completed session and sign it.
+///
+/// The record is the attested data and the signature over it, and nothing
+/// else (see [`NotarizedSession`]).
 ///
 /// Both transports end here and receive the same record on their reclaimed
 /// channel, because transport says nothing about the TLS session it describes.
