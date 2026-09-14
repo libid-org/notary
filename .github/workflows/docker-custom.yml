@@ -11,6 +11,10 @@ name: Custom Docker image
 # image addressed only by digest; a final job joins the two digests under the
 # one tag. QEMU is deliberately not used: emulating a tlsn/mpz build costs
 # hours, while `ubuntu-24.04-arm` is native and free for this public repo.
+#
+# Those per-platform images stay in the ghcr package as UNTAGGED versions; the
+# manifest list is the only thing pointing at them, so a "delete untagged
+# versions" retention policy on this package would break every tag.
 
 on:
   workflow_dispatch:
