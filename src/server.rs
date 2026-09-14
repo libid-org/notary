@@ -3,11 +3,9 @@
 //! # Endpoints
 //!
 //! - **TCP** (port `NOTARY_PORT`): MPC-TLS verifier for Rust backend provers.
-//!   Dispatches on the TLS-cert-verified server name after verification:
-//!   `www.googleapis.com` sessions are answered with a signed
-//!   [`crate::jwks::JwksNotaryResponse`] (JWKS rotation duty); every other
-//!   session with the section 9.1 ceremony attestation, written back down the
-//!   socket the prover opened.
+//!   The section 9.1 ceremony attestation is written back down the socket the
+//!   prover opened. Nothing here dispatches on the server name: the record
+//!   carries it, and the contract that reads the record pins it.
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
 //! - **GET /notarize-proxy** (WS upgrade): ProxyMode session followed by one
 //!   length-prefixed ceremony attestation in its own WebSocket message.
@@ -68,11 +66,7 @@ use libid_transcript::{
 use serde::Serialize;
 use tlsn::{
     config::verifier::VerifierConfig,
-    connection::{
-        CertBinding,
-        CertBindingV1_2,
-        ServerName,
-    },
+    connection::ServerName,
     transcript::{
         PartialTranscript,
         TranscriptCommitment,
@@ -107,7 +101,6 @@ use crate::{
         Error,
         Result,
     },
-    jwks,
 };
 
 /// Handle for controlling the running notary server.
@@ -182,7 +175,6 @@ struct NotaryState {
     /// `None` connects to the TLS-authenticated server name on port 443.
     proxy_server_addr: Option<SocketAddr>,
     public_key_hex: String,
-    jwks_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -212,7 +204,6 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         proxy_root_store: Arc::new(libid_tlsn::root_store()),
         proxy_server_addr: None,
         public_key_hex,
-        jwks_enabled: config.jwks_enabled,
     };
 
     // Broadcast shutdown to the TCP and WebSocket servers.
@@ -710,42 +701,16 @@ where
     let domain = dns_name.as_str().to_string();
     info!("Domain from SNI: {}", domain);
 
-    // ── JWKS duty dispatch ──
-    //
-    // Same listener, same MPC-TLS verification, same signing identity: a
-    // session whose TLS-cert-verified server name is the JWKS host is a
-    // notarized JWKS reading. Its wire response is a signed
-    // `JwksRotationProof` (no attestation-request round trip — the JWKS
-    // prover protocol ends with the verifier's response).
-    if state.jwks_enabled && domain.eq_ignore_ascii_case(jwks::JWKS_DOMAIN) {
-        let handshake = match result.tls_transcript.certificate_binding() {
-            CertBinding::V1_2(CertBindingV1_2 {
-                client_random,
-                server_random,
-                server_ephemeral_key,
-            }) => jwks::JwksHandshake {
-                client_random: *client_random,
-                server_random: *server_random,
-                server_ephemeral_key: server_ephemeral_key.key.clone(),
-            },
-            _ => {
-                return Err(Error::Jwks {
-                    detail: "JWKS proofs require TLS 1.2".into(),
-                });
-            }
-        };
-        let response =
-            jwks::build_rotation_response(sent, recv, &handshake, &state.signer).await?;
-        let mut io = result.recovered_io;
-        write_msg(&mut io, &response).await?;
-        info!("JWKS rotation proof sent to prover");
-        return Ok(());
-    }
-
-    // The ceremony record is transport-agnostic. It is built from what the
-    // session revealed, the server the notary authenticated, the commitments
-    // over the rest, and the notary's own clock -- and an MPC-TLS session
-    // produces all four exactly as a ProxyMode one does.
+    // The ceremony record is transport-agnostic and session-agnostic. It is
+    // built from what the session revealed, the server the notary
+    // authenticated, the commitments over the rest, and the notary's own clock
+    // -- an MPC-TLS session produces all four exactly as a ProxyMode one does,
+    // and the keeper's JWKS reading exactly as a platform session does. This
+    // used to dispatch on the server name and answer `www.googleapis.com` with
+    // a Merkle proof of its own shape; that was the notary deciding what a
+    // session was for, which is the profile-specific decision REQ-COMMON-33
+    // forbids it from making. The record names the host; the contract that
+    // reads the record decides whether it wanted that host.
     let ceremony_attestation = sign_ceremony_attestation(
         &state.signer,
         &result.partial_transcript,
@@ -848,7 +813,6 @@ mod tests {
             proxy_root_store: Arc::new(libid_tlsn::root_store()),
             proxy_server_addr: None,
             public_key_hex: String::new(),
-            jwks_enabled: false,
         };
 
         let (prover_io, notary_io) = tokio::io::duplex(2 << 23);
@@ -1040,7 +1004,6 @@ mod tests {
             proxy_root_store: Arc::new(prover_config.root_store.clone()),
             proxy_server_addr: Some(target_addr),
             public_key_hex: String::new(),
-            jwks_enabled: false,
         };
         let notary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let notary_addr = notary_listener.local_addr().unwrap();
@@ -1270,7 +1233,6 @@ mod tests {
             proxy_sessions: Arc::new(Semaphore::new(8)),
             proxy_root_store: Arc::new(libid_tlsn::root_store()),
             proxy_server_addr: None,
-            jwks_enabled: false,
         };
 
         // The client half stays open and never writes a byte.

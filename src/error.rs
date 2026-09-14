@@ -15,12 +15,6 @@ pub enum Error {
         /// Human-readable failure detail.
         detail: String,
     },
-    /// JWKS parsing / proof construction failure.
-    #[error("jwks: {detail}")]
-    Jwks {
-        /// Human-readable failure detail.
-        detail: String,
-    },
     /// Socket I/O failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -39,12 +33,6 @@ pub enum Error {
     /// Crypto primitive failure.
     #[error(transparent)]
     Crypto(#[from] libid_crypto::Error),
-    /// HTTP fetch failed (mock JWKS prover only).
-    #[error("http: {0}")]
-    Http(#[from] reqwest::Error),
-    /// Base64url decoding failed.
-    #[error("base64: {0}")]
-    Base64(#[from] base64::DecodeError),
 }
 
 /// Result alias for this crate.
