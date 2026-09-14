@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y ca-certificates libssl3 netcat-openbsd 
 
 COPY --from=builder /app/target/release/notary /usr/local/bin/notary
 
-# 7047: TCP wire protocol (backend provers, incl. JWKS sessions).
+# 7047: TCP wire protocol (Rust backend provers).
 # 7048: HTTP/WebSocket (browser tlsn-js / tlsn_wasm clients).
 EXPOSE 7047 7048
 
