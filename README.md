@@ -81,9 +81,10 @@ exactly what is missing if something is).
 
 ## Library use
 
-The crate also builds as a library: `notary::run` starts the server on
-caller-supplied listeners, which is how the smoke tests embed it. It carries no
-prover-side code. The keeper's JWKS prover and its mock live in the keeper, on
+The crate also builds as a library: `notary::run` starts the server from a
+`NotaryServerConfig` (port `0` binds an ephemeral port, reported back through
+`NotaryServerHandle::local_addr`), which is how the smoke tests embed it. It
+carries no prover-side code. The keeper's JWKS prover and its mock live in the keeper, on
 libid-rs's primitives (`libid_tlsn::prover_generic` for the session,
 `libid_transcript` for the layout and the wire frame).
 
