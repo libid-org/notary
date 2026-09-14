@@ -59,9 +59,36 @@ docker run --rm \
   ghcr.io/libid-org/notary:latest
 ```
 
-Tags: `<version>` and `latest` on every release; `custom-<suffix>` images can
-be built from any ref via the *Custom Docker image* workflow (inputs: `ref`,
-`tag-suffix`).
+The image runs as uid 10001, not root, and its `HEALTHCHECK` connects to
+`NOTARY_PORT` on loopback.
+
+### Tags
+
+| Tag | Moves? | Use it for |
+| --- | --- | --- |
+| `<version>` | never | deployments, and other repos' CI — **pin this** |
+| `latest` | every final release | a quick local try; never pin it |
+| `custom-<suffix>` | never | one ref under review, built via the *Custom Docker image* workflow (inputs: `ref`, `tag-suffix`) |
+
+A `custom-` tag is a build artefact, not a release channel: it is fine to pin
+while a PR is open, and it should be replaced by a `<version>` tag once that PR
+merges and a release is published.
+
+### Pulling from another repository's CI
+
+The `notary` package is **public**. A GitHub Actions job in any repository can
+
+```yaml
+- run: docker pull ghcr.io/libid-org/notary:<version>
+```
+
+with no `docker/login-action` step, no `packages: read` permission and no PAT —
+`GITHUB_TOKEN` is not involved. Nothing is needed on the consumer side beyond
+the pull itself.
+
+Images are `linux/amd64` only. On an arm64 host (Apple Silicon) add
+`--platform linux/amd64`; GitHub's `ubuntu-latest` runners are amd64 and need
+no flag.
 
 ## Browser wasm bundle
 
