@@ -64,20 +64,21 @@ tokio = { version = "1", features = [
     "time",
 ] }
 tokio-util = { version = "0.7", features = ["compat"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
-    "json",
-] }
+# Test-only HTTP client: it GETs the notary's own /info over plain HTTP on
+# loopback, so it needs no TLS backend. Leaving rustls on would pull
+# rustls-platform-verifier and its Android JNI tree into the lockfile for
+# nothing.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
 tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
 tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
 tokio = { version = "1", features = ["test-util"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 
 # libid-org/tlsn#3 (merged) moved that branch onto libid-org/mpz 4db9454 and the
 # typed KOS `InstanceId` from libid-org/mpz#1; this pin is the merge commit on
