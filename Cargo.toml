@@ -8,7 +8,7 @@ edition = "2021"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/libid-org/notary"
-description = "The libID notary service: MPC-TLS / zkTLS notarization for platform sessions and notarized JWKS (OIDC) readings, under one notary identity."
+description = "The libID notary service: MPC-TLS / zkTLS notarization of a prover's HTTPS session into one signed ceremony attestation, under one notary identity."
 # A binary + companion library, never a registry crate: it names `tlsn`
 # (git-only upstream) in its manifest, which cargo refuses to publish.
 publish = false
@@ -45,9 +45,6 @@ libid-transcript = { git = "https://github.com/libid-org/libid-rs", tag = "v0.3.
 # never drift onto a different tlsn version than the server.
 tlsn = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15" }
 
-# ── Solidity ABI mirrors (JwksOracle wire types) ────────────────────────────
-alloy-primitives = { version = "1", features = ["serde"] }
-alloy-sol-types = "1"
 
 # ── server ──────────────────────────────────────────────────────────────────
 anyhow = "1.0"
@@ -72,12 +69,6 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# ── JWKS role ───────────────────────────────────────────────────────────────
-base64 = "0.22"
-k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
-# Plain-TLS JWKS fetch for the mock prover only.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-serde_with = { version = "3", features = ["hex"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = [
