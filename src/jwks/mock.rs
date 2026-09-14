@@ -17,7 +17,6 @@
 
 use k256::ecdsa::SigningKey;
 use libid_ceremony::{
-    attestation::tag,
     AttestedData,
     DirectionBlock,
     RevealedRange,
@@ -115,7 +114,7 @@ impl MockProver {
         let (sent_layout, recv_layout) = jwks::layout(&sent, &received);
 
         let data = AttestedData {
-            authority_id: tag(JWKS_DOMAIN),
+            authority_id: AttestedData::authority_id_of(JWKS_DOMAIN),
             created_at: self.cfg.timestamp,
             sent_transcript_length: offset(sent.len())?,
             recv_transcript_length: offset(received.len())?,

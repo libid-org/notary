@@ -17,10 +17,10 @@
 # Usage:
 #   ./scripts/build-tlsn-wasm.sh [--out <dir>]     (TLSN_WASM_FORCE=1 to rebuild)
 #
-# Outputs tlsn_wasm.js and tlsn_wasm_bg.wasm into the --out dir. The generated
-# wrapper embeds web-spawn so worker creation needs no separately served script.
-# (default: tlsn-wasm/ in the repo root; gitignored). Set TLSN_WASM_CACHE to
-# relocate the tlsn checkout + cargo target dir (default: system temp).
+# Outputs tlsn_wasm.js, tlsn_wasm_bg.wasm and the generated
+# snippets/web-spawn-*/js/spawn.js module into the --out dir (default:
+# tlsn-wasm/ in the repo root; gitignored). Set TLSN_WASM_CACHE to relocate the
+# tlsn checkout + cargo target dir (default: system temp).
 
 set -euo pipefail
 
@@ -45,12 +45,15 @@ CACHE_DIR="${TLSN_WASM_CACHE:-${TMPDIR:-/tmp}/libid-tlsn-wasm}"
 IN_CI="${CI:-}"
 
 # This crate is far too slow to rebuild casually, so a bundle that is already
-# staged AND carries the symbol we need is accepted as-is.
+# staged AND carries the API and worker tree we need is accepted as-is.
+shopt -s nullglob
+STAGED_SPAWNS=("$OUT_DIR"/snippets/web-spawn-*/js/spawn.js)
 if [ -z "${TLSN_WASM_FORCE:-}" ] \
    && [ -f "$OUT_DIR/tlsn_wasm_bg.wasm" ] \
    && grep -q "set_progress_callback" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null \
    && grep -q "finish()" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null \
-   && grep -q "const workerSource =" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null \
+   && [ "${#STAGED_SPAWNS[@]}" -eq 1 ] \
+   && [ -f "${STAGED_SPAWNS[0]}" ] \
    && [ ! -e "$OUT_DIR/spawn.js" ]; then
     echo "[tlsn-wasm] already staged — skipping (TLSN_WASM_FORCE=1 to rebuild)"
     exit 0
@@ -169,9 +172,8 @@ if [ "$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo none)" != "$TLSN_REV" ]
 fi
 
 echo "[tlsn-wasm] building (large MPC crate; the first build is slow)…"
-# Use the crate's own build.sh, then embed its web-spawn helper into the wrapper.
-# Keeping the helper in the release build means every consumer gets the same
-# recursive blob-worker fix and needs no spawn.js route or rewrite.
+# Use the crate's own build.sh: it produces a wrapper and web-spawn snippet with
+# matching relative imports. The release preserves that module tree unchanged.
 #
 # RUSTFLAGS is cleared deliberately: an ambient value (CI sets -D warnings)
 # OVERRIDES the crate's .cargo/config.toml rustflags, which carry the
@@ -180,17 +182,23 @@ echo "[tlsn-wasm] building (large MPC crate; the first build is slow)…"
     CARGO_TARGET_DIR="$CACHE_DIR/target" sh build.sh)
 
 PKG="$SRC/crates/wasm/pkg"
-for f in tlsn_wasm.js tlsn_wasm_bg.wasm spawn.js; do
+for f in tlsn_wasm.js tlsn_wasm_bg.wasm; do
     if [ ! -f "$PKG/$f" ]; then
         echo "ERROR: expected $f in $PKG after the build; the crate layout changed."
         ls -la "$PKG" || true
         exit 1
     fi
 done
-
-python3 "$REPO_ROOT/scripts/embed-tlsn-spawn.py" "$PKG"
-if [ -e "$PKG/spawn.js" ] || ! grep -q "const workerSource =" "$PKG/tlsn_wasm.js"; then
-    echo "ERROR: failed to embed web-spawn into tlsn_wasm.js."
+SPAWNS=("$PKG"/snippets/web-spawn-*/js/spawn.js)
+if [ "${#SPAWNS[@]}" -ne 1 ] || [ ! -f "${SPAWNS[0]:-}" ]; then
+    echo "ERROR: expected exactly one snippets/web-spawn-*/js/spawn.js in $PKG."
+    find "$PKG/snippets" -mindepth 1 -maxdepth 4 -print 2>/dev/null || true
+    exit 1
+fi
+SPAWN="${SPAWNS[0]}"
+SPAWN_REL="${SPAWN#"$PKG/"}"
+if ! grep -Fq "./$SPAWN_REL" "$PKG/tlsn_wasm.js"; then
+    echo "ERROR: tlsn_wasm.js does not import the staged worker module $SPAWN_REL."
     exit 1
 fi
 
@@ -210,9 +218,13 @@ fi
 
 mkdir -p "$OUT_DIR"
 rm -f "$OUT_DIR/spawn.js"
+rm -rf "$OUT_DIR/snippets"
+mkdir -p "$OUT_DIR/$(dirname "$SPAWN_REL")"
 cp "$PKG/tlsn_wasm.js" "$PKG/tlsn_wasm_bg.wasm" "$OUT_DIR/"
+cp "$SPAWN" "$OUT_DIR/$SPAWN_REL"
 
 echo ""
 echo "[tlsn-wasm] staged from tlsn @ ${TLSN_REV:0:8} into $OUT_DIR:"
 echo "  tlsn_wasm.js"
 echo "  tlsn_wasm_bg.wasm"
+echo "  $SPAWN_REL"
