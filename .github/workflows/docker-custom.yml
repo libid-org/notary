@@ -77,6 +77,9 @@ jobs:
           # The default `docker` driver cannot push by digest; a container
           # builder can, and still compiles natively on this runner.
           docker buildx create --name notary --driver docker-container --use
+          # oci-mediatypes=false keeps the classic Docker manifest list this
+          # repo has always published: `docker manifest inspect` before Docker
+          # 23 cannot read an OCI index, and nothing here needs one.
           # No provenance/SBOM attestations: they would ride along as extra
           # manifests with platform unknown/unknown, and this tag's contract is
           # exactly two platform entries.
@@ -85,7 +88,7 @@ jobs:
             --provenance=false \
             --sbom=false \
             --metadata-file metadata.json \
-            --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+            --output "type=image,name=$IMAGE,oci-mediatypes=false,push-by-digest=true,name-canonical=true,push=true" \
             .
           mkdir -p digests
           jq -er '."containerimage.digest"' metadata.json > "digests/$ARCH"
