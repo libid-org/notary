@@ -307,6 +307,8 @@ async fn info_handler(State(state): State<NotaryState>) -> Json<InfoResponse> {
 // `handle`, `user_id` or `session_addr` -- the Platform Verifier reads them
 // itself, and the notary deciding them would be the profile-specific
 // judgement REQ-COMMON-33 forbids it.
+/// The record is the attested data and the signature over it, and nothing
+/// else (see [`NotarizedSession`]).
 
 /// Build the section 9.1 attested data for one completed session and sign it.
 ///
@@ -704,7 +706,12 @@ where
     // built from what the session revealed, the server the notary
     // authenticated, the commitments over the rest, and the notary's own clock
     // -- an MPC-TLS session produces all four exactly as a ProxyMode one does,
-    // and a JWKS reading is just a session that revealed everything.
+    // and a JWKS reading exactly as a platform session does. This used to
+    // dispatch on the server name and answer `www.googleapis.com` with a
+    // Merkle proof of its own shape; that was the notary deciding what a
+    // session was for, which is the profile-specific decision REQ-COMMON-33
+    // forbids it from making. The record names the host; the contract that
+    // reads the record decides whether it wanted that host.
     let ceremony_attestation = sign_ceremony_attestation(
         &state.signer,
         &result.partial_transcript,
