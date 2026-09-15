@@ -75,6 +75,7 @@ use tlsn::{
         VerifierCommitStart,
         VerifierOutput,
     },
+    webpki::CertificateDer,
     Session,
 };
 use tokio::{
@@ -186,8 +187,33 @@ struct InfoResponse {
 
 // ─── Server startup ──────────────────────────────────────────────────────────
 
+/// Where ProxyMode connects, for a Rust embedder that runs its own TLS server.
+///
+/// A test stands up a server of its own and has to tell the notary where it
+/// listens and which root signed its certificate. Both loosen what the notary
+/// authenticates, so neither has a flag or an environment variable: a
+/// deployment gets [`run`] and the defaults, and only code that links this
+/// crate can say otherwise. The MPC-TLS path is untouched; it authenticates
+/// inside `libid_tlsn::verifier`, against the WebPKI roots alone.
+#[derive(Default)]
+pub struct ProxyUpstream {
+    /// Connect here instead of `<server name>:443`. The certificate the peer
+    /// presents is still verified against the name the prover asked for.
+    pub addr: Option<SocketAddr>,
+    /// DER certificates trusted as roots in addition to the WebPKI set.
+    pub extra_roots: Vec<Vec<u8>>,
+}
+
 /// Start the notary server (TCP + optional browser TLSNotary WebSocket).
 pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
+    run_with(config, ProxyUpstream::default()).await
+}
+
+/// [`run`], with ProxyMode's upstream overridden for a Rust embedder.
+pub async fn run_with(
+    config: NotaryServerConfig,
+    upstream: ProxyUpstream,
+) -> Result<NotaryServerHandle> {
     // SIGNING_KEY accepts `kms:<key-id-or-alias>` or a hex key.
     let signer = SignerSource::from_spec(&config.signing_key)?
         .build_managed(None)
@@ -198,11 +224,15 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         "notary signer ready"
     );
     let public_key_hex = hex::encode(signer.compressed_public_key());
+    let mut proxy_root_store = libid_tlsn::root_store();
+    proxy_root_store
+        .roots
+        .extend(upstream.extra_roots.into_iter().map(CertificateDer));
     let state = NotaryState {
         signer: Arc::new(signer),
         proxy_sessions: Arc::new(Semaphore::new(config.max_sessions)),
-        proxy_root_store: Arc::new(libid_tlsn::root_store()),
-        proxy_server_addr: None,
+        proxy_root_store: Arc::new(proxy_root_store),
+        proxy_server_addr: upstream.addr,
         public_key_hex,
     };
 

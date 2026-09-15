@@ -26,5 +26,7 @@ pub use error::{
 };
 pub use server::{
     run,
+    run_with,
     NotaryServerHandle,
+    ProxyUpstream,
 };
