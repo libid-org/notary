@@ -25,7 +25,13 @@
 
 use std::{
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+        Arc,
+    },
     time::SystemTime,
 };
 
@@ -152,6 +158,11 @@ impl<T> AbortOnDrop<T> {
         Self(Some(handle))
     }
 
+    /// The wrapped handle, for polling the task without disarming the guard.
+    fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
+        self.0.as_mut().expect("handle present until into_inner")
+    }
+
     /// Disarm the guard and hand the handle back for joining.
     fn into_inner(mut self) -> tokio::task::JoinHandle<T> {
         self.0.take().expect("handle present until into_inner")
@@ -164,6 +175,23 @@ impl<T> Drop for AbortOnDrop<T> {
             handle.abort();
         }
     }
+}
+
+/// Error for a session driver that finished while session setup was still in
+/// flight. The driver only completes once the underlying transport is closed
+/// or dead, so a protocol request submitted to it may never resolve: without
+/// this, a browser that connected and went away would leave its session
+/// pending -- and its slot taken -- until the connection deadline. (Same
+/// race, and the same fix, as `libid_tlsn::verifier` on the TCP path.)
+fn driver_finished_early<T, E: std::fmt::Display>(
+    result: std::result::Result<std::result::Result<T, E>, tokio::task::JoinError>,
+) -> Error {
+    let detail = match result {
+        Ok(Ok(_)) => "driver task finished before the session completed".into(),
+        Ok(Err(e)) => format!("driver task: {e}"),
+        Err(e) => format!("driver task join: {e}"),
+    };
+    Error::NotaryServer { detail }
 }
 
 #[derive(Clone)]
@@ -406,6 +434,12 @@ async fn handle_ws_proxy_notarize(
                 _ => {}
             }
         }
+        // The browser is gone, by close frame or by dropped socket. Tell the
+        // session so: it reads EOF, fails, and the connection's session slot
+        // comes back now. Dropping the write half alone would not do that --
+        // the read half in the outbound pump keeps the pipe open -- and the
+        // session would sit on its slot until the connection deadline.
+        let _ = pipe_writer.shutdown().await;
     }));
     let outbound_task = AbortOnDrop::new(tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
@@ -472,7 +506,13 @@ where
     let (driver, mut handle) = session.split();
     // Guarded spawn: every exit path below — each `?`, panics, the caller
     // dropping this future — aborts the driver instead of detaching it.
-    let driver_task = AbortOnDrop::new(tokio::spawn(driver));
+    let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
+
+    // Set once the relay has run. Before that, the driver finishing means the
+    // browser went away under the session; after, it means the peer closed
+    // the mux, which is how a session ends.
+    let established = AtomicBool::new(false);
+    let established = &established;
 
     // An inner error means a rejection was sent and the driver must be joined
     // before returning; an outer error can abort the guarded driver.
@@ -536,6 +576,7 @@ where
             .map_err(|e| Error::NotaryServer {
                 detail: format!("run_proxy: {e}"),
             })?;
+        established.store(true, Ordering::Release);
 
         let verifier = verifier.verify().await.map_err(|e| Error::NotaryServer {
             detail: format!("verifier verify: {e}"),
@@ -569,17 +610,42 @@ where
 
         Ok::<_, Error>(Ok((server_name, transcript, transcript_commitments)))
     };
-    let setup_outcome = setup.await?;
+    tokio::pin!(setup);
+
+    // Race setup against the driver. The driver only finishes early when the
+    // transport died under the session -- a browser that connected and went
+    // away -- and a protocol request already submitted to it may then never
+    // resolve, so fail instead of pending forever on a taken slot.
+    let mut finished_driver = None;
+    let setup_outcome = tokio::select! {
+        biased;
+        res = &mut setup => res?,
+        driver_res = driver_task.handle_mut() => {
+            if !established.load(Ordering::Acquire) {
+                return Err(driver_finished_early(driver_res));
+            }
+            // The peer closed the mux as its last act while this side was
+            // still finishing. Let setup complete and keep the driver's
+            // result: a finished handle cannot be polled a second time.
+            finished_driver = Some(driver_res);
+            (&mut setup).await?
+        }
+    };
+    let join_driver = |driver_task: AbortOnDrop<_>| async move {
+        match finished_driver {
+            Some(res) => res,
+            None => driver_task.into_inner().await,
+        }
+    };
     let (server_name, transcript, transcript_commitments) = match setup_outcome {
         Ok(output) => output,
         Err(error) => {
-            let _ = driver_task.into_inner().await;
+            let _ = join_driver(driver_task).await;
             return Err(error);
         }
     };
 
-    let io = driver_task
-        .into_inner()
+    let io = join_driver(driver_task)
         .await
         .map_err(|e| Error::NotaryServer {
             detail: format!("driver join: {e}"),
