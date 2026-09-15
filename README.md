@@ -114,7 +114,7 @@ helpers a backend rotation listener needs:
   (zeroed handshake fields, real signature) for contract testing.
 
 Shared primitives (digests, wire protocol, transcript math, signers) come
-from [libid-rs](https://github.com/libid-org/libid-rs).
+from [libID-rs](https://github.com/libid-org/libID-rs).
 
 ## License
 
