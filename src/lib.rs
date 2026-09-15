@@ -17,6 +17,7 @@
 
 pub mod config;
 pub mod error;
+pub mod limits;
 pub mod server;
 
 pub use config::NotaryServerConfig;
