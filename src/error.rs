@@ -9,6 +9,20 @@ pub enum Error {
         /// Human-readable failure detail.
         detail: String,
     },
+    /// A ProxyMode session relayed more than its byte cap. The relay was
+    /// aborted on the operation that crossed it; nothing was attested.
+    #[error(
+        "ProxyMode session to {authority} relayed {used} bytes, over the {limit}-byte \
+         cap; aborted, nothing attested"
+    )]
+    ProxyDataCapExceeded {
+        /// The server name the session was relaying to.
+        authority: String,
+        /// Bytes relayed when the cap was crossed, both directions combined.
+        used: usize,
+        /// The configured cap.
+        limit: usize,
+    },
     /// The revealed HTTP request line could not be parsed.
     #[error("malformed request line: {detail}")]
     MalformedRequestLine {
