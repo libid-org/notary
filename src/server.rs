@@ -972,6 +972,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// Each session test drives a real MPC-TLS or ProxyMode setup, which is
+    /// CPU-heavy in a debug build. Run at once on a 4-vCPU CI runner they
+    /// starve each other past their timeouts; one at a time they fit easily.
+    static ONE_SESSION_AT_A_TIME: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn attestation_is_one_length_prefixed_frame_then_eof() {
         use libid_transcript::read_msg;
@@ -1038,6 +1044,7 @@ mod tests {
         const TEST_KEY: &str =
             "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
+        let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
         let signer = SignerSource::from_spec(TEST_KEY)
             .unwrap()
             .build_managed(None)
@@ -1211,6 +1218,7 @@ mod tests {
         const TEST_KEY: &str =
             "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
+        let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
         let prover_config = ProverConfig::builder(SERVER_DOMAIN)
             .mode(ProverMode::Proxy)
             .root_certs(vec![CA_CERT_DER.to_vec()])
@@ -1546,14 +1554,17 @@ mod tests {
             TokioAsyncReadCompatExt,
         };
 
-        use super::super::{
-            handle_tcp_prover,
-            handle_verified_session,
-            notarize_proxy_ws_handler,
-            with_mpc_slot,
-            AttestationWire,
-            NotaryState,
-            Result,
+        use super::{
+            super::{
+                handle_tcp_prover,
+                handle_verified_session,
+                notarize_proxy_ws_handler,
+                with_mpc_slot,
+                AttestationWire,
+                NotaryState,
+                Result,
+            },
+            ONE_SESSION_AT_A_TIME,
         };
 
         /// anvil #0 — public test key.
@@ -1645,6 +1656,7 @@ mod tests {
         /// naming the cap, and no attestation frame is ever sent.
         #[tokio::test(flavor = "multi_thread")]
         async fn proxy_session_over_the_data_cap_is_aborted_without_attestation() {
+            let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
             let prover_config = ProverConfig::builder(SERVER_DOMAIN)
                 .mode(ProverMode::Proxy)
                 .root_certs(vec![CA_CERT_DER.to_vec()])
@@ -1791,6 +1803,7 @@ mod tests {
         /// real handler; the second is a real prover behind the same queue.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn mpc_prover_queues_behind_a_full_slot_and_then_succeeds() {
+            let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
             let mut state = NotaryState::for_tests(test_signer().await);
             state.mpc_sessions = Arc::new(Semaphore::new(1));
             let expected_pubkey = state.signer.compressed_public_key().to_vec();
