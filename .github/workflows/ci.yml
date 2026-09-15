@@ -69,6 +69,13 @@ jobs:
       - name: Tests
         run: cargo test --all
 
+      # The TCP path authenticates the server against compiled-in WebPKI
+      # roots, so no local fixture can complete an MPC-TLS session through it.
+      # That test is `#[ignore]`d from the default run and drives a live
+      # session here, after the offline suite has passed.
+      - name: Live MPC-TLS session (network)
+        run: cargo test --test mpc_mode -- --ignored
+
   # ---------------------------------------------------------------------------
   # DCO: every commit carries a Signed-off-by trailer, as CONTRIBUTING.md
   # promises. Plain git over the event's commit range — no marketplace action,
