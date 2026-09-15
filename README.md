@@ -45,7 +45,8 @@ Flags or environment variables:
 | `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent ProxyMode sessions; past it the upgrade is refused with 503 |
 | `--proxy-max-bytes` | `NOTARY_PROXY_MAX_BYTES` | `10000000` | Bytes one ProxyMode session may relay, both directions combined (10 MB); crossing it aborts the session, close code 1008 `PROXY_DATA_CAP_EXCEEDED`, nothing attested |
 | `--mpc-max-sessions` | `NOTARY_MPC_MAX_SESSIONS` | `4x` | Concurrent MPC-TLS sessions: a count (`16`) or per-core multiplier (`4x`), resolved at startup; provers past it wait, never refused |
-| `--connection-deadline-secs` | `NOTARY_CONNECTION_DEADLINE_SECS` | `300` | Lifetime of one prover connection on either transport, queue time included; past it the connection is dropped |
+| `--connection-deadline-secs` | `NOTARY_CONNECTION_DEADLINE_SECS` | `300` | Lifetime of one session on either transport, queue time included; past it the connection is dropped |
+| `--setup-deadline-secs` | `NOTARY_SETUP_DEADLINE_SECS` | `15` | How long a connection may sit before starting its session; until it does it holds no session slot |
 
 With a KMS key the private material never enters the process: every signature
 is a `kms:Sign` call.
@@ -53,6 +54,12 @@ is a `kms:Sign` call.
 The effective limits, with the MPC-TLS data limits libid-tlsn negotiates at
 session setup (4 KB sent, 32 KB received; not tunable here), are logged once at
 startup as `resource limits in force`.
+
+A session slot is taken when a session starts — the prover's first byte on the
+TCP port, the browser's first binary frame on the WebSocket — and not when the
+connection is accepted. Opening sockets therefore reserves nothing: an idle
+connection costs a socket until `--setup-deadline-secs` drops it, and the
+session limits bound sessions rather than connection attempts.
 
 ## Docker
 

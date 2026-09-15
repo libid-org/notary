@@ -27,11 +27,13 @@ pub struct NotaryServerConfig {
     #[arg(long, env = "SIGNING_KEY")]
     pub signing_key: String,
 
-    /// Max concurrent browser ProxyMode sessions. Past it a WebSocket upgrade
-    /// is rejected with 503 and the browser retries; nothing queues. A session
-    /// is one relay task plus its transcript, bounded by `--proxy-max-bytes`,
-    /// so this can stay large. `--connection-deadline-secs` bounds how long one
-    /// slot stays taken.
+    /// Max concurrent browser ProxyMode sessions. A slot is taken when the
+    /// browser sends its first relayed bytes, not when it upgrades, so an
+    /// upgraded socket that says nothing costs no slot. Past the limit the
+    /// upgrade is refused with 503 and the browser retries; nothing queues. A
+    /// session is one relay task plus its transcript, bounded by
+    /// `--proxy-max-bytes`, so this can stay large.
+    /// `--connection-deadline-secs` bounds how long one slot stays taken.
     #[arg(long, env = "NOTARY_MAX_SESSIONS", default_value_t = 1024)]
     pub max_sessions: usize,
 
@@ -49,17 +51,20 @@ pub struct NotaryServerConfig {
 
     /// Concurrent MPC-TLS sessions on the TCP wire port: a count (`16`) or a
     /// multiple of the cores this process may use (`4x`, the default), which is
-    /// resolved once at startup and logged. A prover past the limit waits its
-    /// turn rather than being refused, because it cannot cheaply retry once it
-    /// has paid for MPC setup; `--connection-deadline-secs` caps the wait.
+    /// resolved once at startup and logged. A slot is taken once the prover has
+    /// sent its first byte, not on accept, so a connection that says nothing
+    /// never holds one. A prover past the limit waits its turn rather than
+    /// being refused, because it cannot cheaply retry once it has paid for MPC
+    /// setup; `--connection-deadline-secs` caps the wait.
     #[arg(long, env = "NOTARY_MPC_MAX_SESSIONS", default_value_t = Concurrency::default())]
     pub mpc_max_sessions: Concurrency,
 
-    /// Seconds one prover connection may live, on either transport, from
-    /// accept to the attestation being written; for MPC-TLS that includes time
-    /// spent waiting for a session slot. Past it the connection is dropped and
-    /// nothing is attested. A real session finishes in well under a minute
-    /// even on a slow link, so the default is headroom, not a budget.
+    /// Seconds one prover connection may live, on either transport, from the
+    /// moment its session starts to the attestation being written; for MPC-TLS
+    /// that includes time spent waiting for a session slot. Past it the
+    /// connection is dropped and nothing is attested. A real session finishes
+    /// in well under a minute even on a slow link, so the default is headroom,
+    /// not a budget.
     #[arg(
         long,
         env = "NOTARY_CONNECTION_DEADLINE_SECS",
@@ -67,11 +72,32 @@ pub struct NotaryServerConfig {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub connection_deadline_secs: u64,
+
+    /// Seconds a connection has to start its session: to send its first byte
+    /// on the TCP port, or its first binary frame on the WebSocket. Until it
+    /// does it holds no session slot, so this bounds only how long an idle
+    /// socket may sit -- which is the point. A slot taken on accept would let
+    /// anyone able to open a socket reserve the notary's scarcest resource
+    /// without speaking the protocol, and hold it for the whole connection
+    /// deadline. A real client sends immediately; the default is for a slow
+    /// network, not for a slow client.
+    #[arg(
+        long,
+        env = "NOTARY_SETUP_DEADLINE_SECS",
+        default_value_t = 15,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub setup_deadline_secs: u64,
 }
 
 impl NotaryServerConfig {
     /// `--connection-deadline-secs` as a duration.
     pub fn connection_deadline(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.connection_deadline_secs)
+    }
+
+    /// `--setup-deadline-secs` as a duration.
+    pub fn setup_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.setup_deadline_secs)
     }
 }

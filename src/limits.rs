@@ -234,6 +234,67 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for CappedIo<T> {
     }
 }
 
+/// A stream whose first bytes have already been read, put back in front of it.
+///
+/// The notary reads a connection's first byte before it will spend a session
+/// slot on it: a client that has sent nothing is not a prover, and must not be
+/// able to reserve the expensive resource by connecting alone. That byte
+/// belongs to the protocol, so it is replayed here and the session reads the
+/// stream it would have read.
+#[derive(Debug)]
+pub struct PeekedIo<T> {
+    prefix: Vec<u8>,
+    taken: usize,
+    inner: T,
+}
+
+impl<T> PeekedIo<T> {
+    /// Wrap `inner` so that `prefix` is read from it first.
+    pub fn new(prefix: Vec<u8>, inner: T) -> Self {
+        Self {
+            prefix,
+            taken: 0,
+            inner,
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for PeekedIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let left = &this.prefix[this.taken..];
+        if !left.is_empty() {
+            let n = left.len().min(buf.remaining());
+            buf.put_slice(&left[..n]);
+            this.taken += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for PeekedIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
@@ -247,6 +308,7 @@ mod tests {
         CappedIo,
         Concurrency,
         DataCap,
+        PeekedIo,
     };
 
     fn nz(n: usize) -> NonZeroUsize {
@@ -314,5 +376,31 @@ mod tests {
         // Once crossed, every later operation fails too.
         assert!(capped.write_all(&[4; 1]).await.is_err());
         assert!(capped.read(&mut buf).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn peeked_io_replays_the_first_byte_then_reads_the_rest() {
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"ello").await.unwrap();
+
+        let mut peeked = PeekedIo::new(b"h".to_vec(), server);
+        let mut seen = [0u8; 5];
+        peeked.read_exact(&mut seen).await.unwrap();
+
+        assert_eq!(&seen, b"hello");
+    }
+
+    #[tokio::test]
+    async fn peeked_io_replays_a_prefix_longer_than_one_read() {
+        let (client, server) = tokio::io::duplex(64);
+        drop(client);
+
+        let mut peeked = PeekedIo::new(b"abcd".to_vec(), server);
+        let mut one = [0u8; 1];
+        for expected in b"abcd" {
+            peeked.read_exact(&mut one).await.unwrap();
+            assert_eq!(one[0], *expected);
+        }
+        assert_eq!(peeked.read(&mut one).await.unwrap(), 0);
     }
 }

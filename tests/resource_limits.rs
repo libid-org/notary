@@ -9,6 +9,7 @@ use std::{
 };
 
 use clap::Parser;
+use futures_util::SinkExt;
 use notary::{
     limits::Concurrency,
     server,
@@ -17,6 +18,7 @@ use notary::{
 use tokio_tungstenite::{
     connect_async,
     tungstenite,
+    tungstenite::Message,
 };
 
 /// anvil #0 — public test key.
@@ -49,6 +51,8 @@ fn every_limit_has_a_default() {
     assert_eq!(config.mpc_max_sessions, Concurrency::PerCore(nz(4)));
     assert_eq!(config.connection_deadline_secs, 300);
     assert_eq!(config.connection_deadline(), Duration::from_secs(300));
+    assert_eq!(config.setup_deadline_secs, 15);
+    assert_eq!(config.setup_deadline(), Duration::from_secs(15));
 }
 
 #[test]
@@ -97,6 +101,11 @@ fn other_limits_are_plain_numbers_and_the_deadline_is_never_zero() {
         .expect_err("a zero deadline would fail every connection")
         .to_string();
     assert!(error.contains("--connection-deadline-secs"), "{error}");
+
+    let error = parse(&["--setup-deadline-secs", "0"])
+        .expect_err("a zero setup deadline would fail every connection")
+        .to_string();
+    assert!(error.contains("--setup-deadline-secs"), "{error}");
 }
 
 /// Reserve an ephemeral port for the HTTP server: ws_port 0 means "disabled",
@@ -119,12 +128,15 @@ async fn proxy_upgrade_past_max_sessions_is_refused_with_503() {
         handle.ws_local_addr().expect("ws server enabled")
     );
 
-    // The first browser takes the only slot and just holds the socket open.
-    let (holder, _) = connect_async(&url).await.expect("first upgrade");
-
-    let refused = connect_async(&url)
+    // The first browser takes the only slot by starting a session -- sending
+    // the bytes it wants relayed. Upgrading alone reserves nothing.
+    let (mut holder, _) = connect_async(&url).await.expect("first upgrade");
+    holder
+        .send(Message::Binary(b"\x16\x03\x01".to_vec().into()))
         .await
-        .expect_err("second upgrade must be refused while the slot is taken");
+        .expect("the browser sends its first TLS bytes");
+
+    let refused = until_refused(&url).await;
     let tungstenite::Error::Http(response) = refused else {
         panic!("expected an HTTP refusal, got: {refused}");
     };
@@ -146,4 +158,66 @@ async fn proxy_upgrade_past_max_sessions_is_refused_with_503() {
         .expect("the slot was not released after the holder went away");
 
     handle.shutdown();
+}
+
+/// The attack the slot-on-connect design allowed: upgrade, then say nothing.
+/// One socket per slot, ~150 bytes each, and every browser is refused for the
+/// whole connection deadline. An upgraded-but-silent socket must cost a
+/// socket and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_upgrade_holds_no_session_slot() {
+    let ws_port = free_port().await;
+    let config =
+        parse(&["--ws-port", &ws_port.to_string(), "--max-sessions", "1"]).unwrap();
+    let handle = server::run(config).await.expect("server starts");
+    let url = format!(
+        "ws://{}/notarize-proxy",
+        handle.ws_local_addr().expect("ws server enabled")
+    );
+
+    // Upgraded and held open, but never a byte of session data.
+    let (_silent, _) = connect_async(&url).await.expect("first upgrade");
+
+    // A ping keeps the socket warm without starting a session; it must not
+    // buy a slot either.
+    let (mut pinger, _) = connect_async(&url).await.expect("second upgrade");
+    pinger
+        .send(Message::Ping(Vec::new().into()))
+        .await
+        .expect("ping");
+
+    // The only slot is still free, so a real browser gets in.
+    let (mut real, _) = connect_async(&url)
+        .await
+        .expect("a real browser must not be refused because of idle sockets");
+    real.send(Message::Binary(b"\x16\x03\x01".to_vec().into()))
+        .await
+        .expect("the real browser starts its session");
+
+    // And now that a session is running, the cap applies as it should.
+    let refused = until_refused(&url).await;
+    let tungstenite::Error::Http(response) = refused else {
+        panic!("expected an HTTP refusal, got: {refused}");
+    };
+    assert_eq!(response.status(), 503);
+
+    handle.shutdown();
+}
+
+/// Connect until the server refuses, or fail the test. The slot is taken
+/// asynchronously, once the server has read the first frame, so the refusal
+/// arrives a moment after the frame is sent.
+async fn until_refused(url: &str) -> tungstenite::Error {
+    let refused = async {
+        loop {
+            match connect_async(url).await {
+                Err(error) => return error,
+                Ok((socket, _)) => drop(socket),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), refused)
+        .await
+        .expect("the session cap never refused an upgrade")
 }

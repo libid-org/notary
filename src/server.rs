@@ -120,6 +120,7 @@ use crate::{
         available_cores,
         CappedIo,
         DataCap,
+        PeekedIo,
     },
 };
 
@@ -214,12 +215,16 @@ struct NotaryState {
     /// MPC-TLS slots: a prover that finds none waits for one. Closed on
     /// shutdown, so the queue drains with an error instead of hanging.
     mpc_sessions: Arc<Semaphore>,
-    /// Overall deadline for one prover connection on either transport: the
-    /// whole session plus the attestation exchange, and for MPC-TLS the wait
-    /// for a slot. Defense in depth: whatever future bug makes a session
-    /// pend, no connection can pin a handler task (and its MPC buffers)
-    /// forever.
+    /// Overall deadline for one session on either transport, from the moment
+    /// it starts: the session itself plus the attestation exchange, and for
+    /// MPC-TLS the wait for a slot. Defense in depth: whatever future bug
+    /// makes a session pend, no connection can pin a handler task (and its
+    /// MPC buffers) forever. Reaching a session is `setup_deadline`'s job.
     connection_deadline: Duration,
+    /// How long a connection may sit before it starts its session. Until it
+    /// does it holds no slot, so an idle socket costs a socket and nothing
+    /// else.
+    setup_deadline: Duration,
     public_key_hex: String,
 }
 
@@ -237,6 +242,7 @@ impl NotaryState {
             proxy_server_addr: None,
             mpc_sessions: Arc::new(Semaphore::new(4)),
             connection_deadline: Duration::from_secs(300),
+            setup_deadline: Duration::from_secs(15),
         }
     }
 }
@@ -278,6 +284,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         mpc_max_sent_data = libid_tlsn::MAX_SENT_DATA,
         mpc_max_recv_data = libid_tlsn::MAX_RECV_DATA,
         connection_deadline_secs = config.connection_deadline_secs,
+        setup_deadline_secs = config.setup_deadline_secs,
         "resource limits in force"
     );
     let state = NotaryState {
@@ -288,6 +295,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         proxy_server_addr: None,
         mpc_sessions: Arc::new(Semaphore::new(mpc_max_sessions)),
         connection_deadline: config.connection_deadline(),
+        setup_deadline: config.setup_deadline(),
         public_key_hex,
     };
 
@@ -471,11 +479,18 @@ async fn notarize_proxy_ws_handler(
 ) -> impl IntoResponse {
     // Refuse rather than queue: a browser retries a refused upgrade cheaply,
     // and nothing has been spent on this session yet.
-    let Ok(permit) = Arc::clone(&state.proxy_sessions).try_acquire_owned() else {
+    //
+    // No slot is reserved here. The check is advisory -- it turns a saturated
+    // notary away at the cheapest point, before the upgrade -- and the slot
+    // itself is taken when the browser sends its first relayed bytes. A socket
+    // that upgrades and then stays silent would otherwise hold a slot for the
+    // whole connection deadline: a denial of service costing one 150-byte
+    // request per slot.
+    if state.proxy_sessions.available_permits() == 0 {
         info!(%peer, "ProxyMode: all session slots busy; upgrade refused with 503");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    ws.on_upgrade(move |socket| handle_ws_proxy_notarize(socket, peer, state, permit))
+    }
+    ws.on_upgrade(move |socket| handle_ws_proxy_notarize(socket, peer, state))
         .into_response()
 }
 
@@ -493,28 +508,95 @@ enum SessionEnd {
 /// this endpoint, and the reason names which one.
 const CLOSE_POLICY_VIOLATION: u16 = 1008;
 
+/// WebSocket close code 1013, "try again later": the notary is at capacity.
+/// It differs from the 503 on the upgrade only in when it happens -- the slots
+/// filled between this browser's upgrade and its first bytes.
+const CLOSE_TRY_AGAIN_LATER: u16 = 1013;
+
+/// The browser's first relayed bytes, or `None` if it went away before sending
+/// any.
+///
+/// Only a binary frame starts a session. Pings and text do not: a socket kept
+/// warm by pings is still an idle socket, and the point of waiting here is
+/// that idle sockets hold no session slot.
+async fn first_relayed_bytes(
+    ws_rx: &mut futures_util::stream::SplitStream<WebSocket>,
+) -> Option<Vec<u8>> {
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        match msg {
+            Message::Binary(data) => return Some(data.to_vec()),
+            Message::Close(_) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
 async fn handle_ws_proxy_notarize(
     socket: WebSocket,
     peer: SocketAddr,
     state: NotaryState,
-    // Held for the connection lifetime; dropping it returns the session slot.
-    _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    let (io_a, io_b) = tokio::io::duplex(1 << 17);
     let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // The session starts here, not at the upgrade: a slot is worth spending
+    // once there is a session to spend it on.
+    let first =
+        match tokio::time::timeout(state.setup_deadline, first_relayed_bytes(&mut ws_rx))
+            .await
+        {
+            Ok(Some(first)) => first,
+            Ok(None) => {
+                info!(%peer, "ProxyMode: browser closed before starting a session");
+                return;
+            }
+            Err(_) => {
+                info!(
+                    %peer,
+                    "ProxyMode: no session data within the {}s setup deadline; closing",
+                    state.setup_deadline.as_secs()
+                );
+                let _ = ws_tx
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CLOSE_POLICY_VIOLATION,
+                        reason: "no session data within the setup deadline".into(),
+                    })))
+                    .await;
+                return;
+            }
+        };
+
+    // Held for the session lifetime; dropping it returns the slot.
+    let Ok(_permit) = Arc::clone(&state.proxy_sessions).try_acquire_owned() else {
+        info!(%peer, "ProxyMode: all session slots busy; session refused with 1013");
+        let _ = ws_tx
+            .send(Message::Close(Some(CloseFrame {
+                code: CLOSE_TRY_AGAIN_LATER,
+                reason: "notary is at capacity; retry".into(),
+            })))
+            .await;
+        return;
+    };
+
+    let (io_a, io_b) = tokio::io::duplex(1 << 17);
     let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
 
     // Keep inbound and outbound ownership separate. Whichever direction ends
     // first must not cancel a write already accepted in the other direction.
     let (end_tx, end_rx) = tokio::sync::oneshot::channel::<SessionEnd>();
     let _inbound_task = AbortOnDrop::new(tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                Message::Binary(data) if pipe_writer.write_all(&data).await.is_err() => {
-                    break
+        // The frame that started the session, put back in front of the rest.
+        if pipe_writer.write_all(&first).await.is_ok() {
+            while let Some(Ok(msg)) = ws_rx.next().await {
+                match msg {
+                    Message::Binary(data)
+                        if pipe_writer.write_all(&data).await.is_err() =>
+                    {
+                        break
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
-                Message::Close(_) => break,
-                _ => {}
             }
         }
         // The browser is gone, by close frame or by dropped socket. Tell the
@@ -869,7 +951,45 @@ async fn handle_tcp_prover<T>(socket: T, state: &NotaryState) -> Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
 {
+    // Wait for the prover to say something before spending a slot on it. A
+    // slot taken on accept is a slot anyone who can open a TCP socket may
+    // reserve -- no TLS, no protocol, not one byte -- and hold for the whole
+    // connection deadline. Sixteen such sockets took every MPC slot on a
+    // four-core pod, and the real provers behind them queued until their own
+    // deadlines expired. The first byte costs the attacker nothing either, but
+    // it puts them on a clock this side controls: the slot is now held by a
+    // session in progress, which the connection deadline already bounds.
+    let socket = await_session_start(socket, state.setup_deadline).await?;
     with_mpc_slot(state, handle_notary_session(socket, state)).await
+}
+
+/// `socket` with its first byte read and put back, once the prover sends one.
+///
+/// Reading is what proves a connection is a client rather than an open socket.
+/// The byte read here belongs to the session that follows, so it is replayed
+/// into it and the session sees the stream it would have seen.
+async fn await_session_start<T>(mut socket: T, deadline: Duration) -> Result<PeekedIo<T>>
+where
+    T: tokio::io::AsyncRead + Unpin,
+{
+    let mut first = [0u8; 1];
+    let read = tokio::time::timeout(deadline, socket.read(&mut first))
+        .await
+        .map_err(|_| Error::NotaryServer {
+            detail: format!(
+                "no prover data within the {}s setup deadline",
+                deadline.as_secs()
+            ),
+        })?
+        .map_err(|e| Error::NotaryServer {
+            detail: format!("reading the first prover byte: {e}"),
+        })?;
+    if read == 0 {
+        return Err(Error::NotaryServer {
+            detail: "prover closed the connection before sending anything".into(),
+        });
+    }
+    Ok(PeekedIo::new(first[..read].to_vec(), socket))
 }
 
 /// Run `session` holding one of the MPC-TLS slots, waiting for one first if
@@ -878,9 +998,9 @@ where
 /// Waiting, not refusing, is the point: MPC-TLS is the heavy path, and a
 /// prover refused after paying for its setup would pay again, so the slots
 /// only bound how many run at once. The queue is FIFO. The connection
-/// deadline covers the WHOLE connection -- the wait and then the session --
-/// so no TCP client, however broken, pins this handler task past it, and a
-/// queued prover never waits forever either.
+/// deadline covers the whole session -- the wait for a slot and then the
+/// session itself -- so no client, however broken, pins this handler task
+/// past it, and a queued prover never waits forever either.
 async fn with_mpc_slot<F, T>(state: &NotaryState, session: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
@@ -1445,8 +1565,18 @@ mod tests {
     /// fail-fast fixes, covering whatever future bug makes a session pend.
     /// Paused time: the runtime auto-advances the clock to the deadline the
     /// moment everything is blocked, so the test finishes in milliseconds.
+    /// A connection that says nothing fails at the setup deadline, and holds
+    /// no session slot while it waits.
+    ///
+    /// Both halves matter. Sixteen sockets that connect and stay silent took
+    /// every MPC slot on a four-core pod when the slot was taken on accept,
+    /// and held each for the 300s connection deadline; real provers queued
+    /// behind them until their own deadlines expired. Opening a socket now
+    /// costs the socket and nothing else.
     #[tokio::test(start_paused = true)]
-    async fn silent_connection_hits_the_deadline() {
+    async fn silent_connection_hits_the_setup_deadline_and_takes_no_slot() {
+        use std::time::Duration;
+
         use libid_signer::SignerSource;
 
         use super::{
@@ -1462,21 +1592,41 @@ mod tests {
             .await
             .unwrap();
         let state = NotaryState::for_tests(signer);
+        let slots = state.mpc_sessions.available_permits();
 
         // The client half stays open and never writes a byte.
         let (_client, server) = tokio::io::duplex(1 << 16);
 
         let started = tokio::time::Instant::now();
-        let err = handle_tcp_prover(server, &state)
+        let connection = {
+            let state = state.clone();
+            tokio::spawn(async move { handle_tcp_prover(server, &state).await })
+        };
+
+        // A moment in: the connection is alive and still holds nothing.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!connection.is_finished(), "the connection failed too early");
+        assert_eq!(
+            state.mpc_sessions.available_permits(),
+            slots,
+            "a connection that has sent nothing took a session slot"
+        );
+
+        let err = connection
             .await
+            .unwrap()
             .expect_err("a silent connection must fail, not pend");
         assert!(
-            err.to_string().contains("deadline"),
-            "expected the deadline error, got: {err}"
+            err.to_string().contains("setup deadline"),
+            "expected the setup-deadline error, got: {err}"
         );
         assert!(
-            started.elapsed() >= state.connection_deadline,
-            "failed before the deadline — some step errored spuriously"
+            started.elapsed() >= state.setup_deadline,
+            "failed before the setup deadline — some step errored spuriously"
+        );
+        assert!(
+            started.elapsed() < state.connection_deadline,
+            "an idle socket must not be held for the whole connection deadline"
         );
     }
 
@@ -1808,11 +1958,13 @@ mod tests {
             state.mpc_sessions = Arc::new(Semaphore::new(1));
             let expected_pubkey = state.signer.compressed_public_key().to_vec();
 
-            // A holds the only slot: it connected and says nothing.
-            let (a_client, a_server) = tokio::io::duplex(1 << 16);
+            // A holds the only slot: it sent the byte that starts a session,
+            // then said nothing more. Connecting alone would take no slot.
+            let (mut a_client, a_server) = tokio::io::duplex(1 << 16);
             let a_state = state.clone();
             let a_task =
                 tokio::spawn(async move { handle_tcp_prover(a_server, &a_state).await });
+            a_client.write_all(b"\x00").await.unwrap();
             let slot_taken = async {
                 while state.mpc_sessions.available_permits() != 0 {
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1820,7 +1972,7 @@ mod tests {
             };
             tokio::time::timeout(Duration::from_secs(5), slot_taken)
                 .await
-                .expect("the silent client never took the slot");
+                .expect("the stalled client never took the slot");
 
             // B: a real prover, whose notary side goes through the queue.
             let (prover_io, notary_io) = tokio::io::duplex(2 << 23);
@@ -1868,9 +2020,9 @@ mod tests {
             drop(a_client);
             let a_outcome = tokio::time::timeout(Duration::from_secs(5), a_task)
                 .await
-                .expect("the silent client did not release the slot")
+                .expect("the stalled client did not release the slot")
                 .unwrap();
-            assert!(a_outcome.is_err(), "a silent client cannot have succeeded");
+            assert!(a_outcome.is_err(), "a stalled client cannot have succeeded");
 
             tokio::time::timeout(Duration::from_secs(60), &mut setup)
                 .await
