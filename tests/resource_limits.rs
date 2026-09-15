@@ -1,11 +1,16 @@
-//! The resource limits through the public surface: the ProxyMode session cap
-//! refusing an upgrade on the real HTTP server, and giving the slot back the
-//! moment the browser that held it goes away.
+//! The resource limits through the public surface: the flags an operator
+//! sets, and the ProxyMode session cap refusing an upgrade on the real HTTP
+//! server. The limits that need a session to trip (the ProxyMode data cap,
+//! the MPC-TLS queue) are unit tests beside the handlers.
 
-use std::time::Duration;
+use std::{
+    num::NonZeroUsize,
+    time::Duration,
+};
 
 use clap::Parser;
 use notary::{
+    limits::Concurrency,
     server,
     NotaryServerConfig,
 };
@@ -30,6 +35,68 @@ fn parse(extra: &[&str]) -> Result<NotaryServerConfig, clap::Error> {
     ];
     args.extend_from_slice(extra);
     NotaryServerConfig::try_parse_from(args)
+}
+
+fn nz(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).unwrap()
+}
+
+#[test]
+fn every_limit_has_a_default() {
+    let config = parse(&[]).unwrap();
+    assert_eq!(config.max_sessions, 1024);
+    assert_eq!(config.proxy_max_bytes, 10_000_000);
+    assert_eq!(config.mpc_max_sessions, Concurrency::PerCore(nz(4)));
+    assert_eq!(config.connection_deadline_secs, 300);
+    assert_eq!(config.connection_deadline(), Duration::from_secs(300));
+}
+
+#[test]
+fn mpc_max_sessions_takes_a_raw_count_or_a_core_multiplier() {
+    let raw = parse(&["--mpc-max-sessions", "16"]).unwrap();
+    assert_eq!(raw.mpc_max_sessions, Concurrency::Raw(nz(16)));
+    assert_eq!(raw.mpc_max_sessions.resolve(Some(nz(10))), 16);
+
+    let per_core = parse(&["--mpc-max-sessions", "4x"]).unwrap();
+    assert_eq!(per_core.mpc_max_sessions, Concurrency::PerCore(nz(4)));
+    assert_eq!(per_core.mpc_max_sessions.resolve(Some(nz(10))), 40);
+}
+
+/// A value that is neither form is a startup error naming both, never a
+/// silent fallback to the default.
+#[test]
+fn bad_mpc_max_sessions_fails_at_startup_naming_the_accepted_forms() {
+    for bad in ["abc", "0", "0x", "x", "4 x"] {
+        let error = parse(&["--mpc-max-sessions", bad])
+            .expect_err(&format!("{bad:?} must not start the notary"))
+            .to_string();
+        assert!(error.contains("--mpc-max-sessions"), "{error}");
+        assert!(
+            error.contains("\"16\"") && error.contains("\"4x\""),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn other_limits_are_plain_numbers_and_the_deadline_is_never_zero() {
+    let config = parse(&[
+        "--max-sessions",
+        "2",
+        "--proxy-max-bytes",
+        "4096",
+        "--connection-deadline-secs",
+        "7",
+    ])
+    .unwrap();
+    assert_eq!(config.max_sessions, 2);
+    assert_eq!(config.proxy_max_bytes, 4096);
+    assert_eq!(config.connection_deadline(), Duration::from_secs(7));
+
+    let error = parse(&["--connection-deadline-secs", "0"])
+        .expect_err("a zero deadline would fail every connection")
+        .to_string();
+    assert!(error.contains("--connection-deadline-secs"), "{error}");
 }
 
 /// Reserve an ephemeral port for the HTTP server: ws_port 0 means "disabled",
