@@ -26,7 +26,7 @@ path that exempts it.
 |---|---|---|---|---|---|
 | **7047** | `--port` | `NOTARY_PORT` | off unless set | Rust provers inside the cluster, MPC-TLS over TCP | Internal: no per-client limits |
 | **7048** | `--ws-port` | `NOTARY_WS_PORT` | `7048` | Browsers, ProxyMode over WebSocket, behind the load balancer | Public: every per-client limit in force |
-| **7049** | `--internal-ws-port` | `NOTARY_INTERNAL_WS_PORT` | off unless set | Our own services, ProxyMode over WebSocket | Internal: no per-client limits, no `X-Forwarded-For` handling |
+| **7049** | `--internal-ws-port` | `NOTARY_INTERNAL_WS_PORT` | off unless set | Our own services, ProxyMode over WebSocket | Internal: no per-client limits, no client header read |
 
 The internal ports are off unless set because they have no limits: a
 deployment that wants them says so, and publishes them through the cluster
@@ -74,7 +74,7 @@ Flags or environment variables:
 | `--max-sessions-per-ip` | `NOTARY_MAX_SESSIONS_PER_IP` | `4` | Concurrent public ProxyMode sessions one client may hold; past it the session is closed with code 1013. One browser ceremony opens two, so the default leaves one ceremony of headroom. `0` disables |
 | `--per-ip-upgrades` | `NOTARY_PER_IP_UPGRADES` | `10/1m,60/30m,100/1h` | Sessions one client may start per window on the public port, `<count>/<window>`; every window must have room. Empty disables |
 | `--per-ip-bytes` | `NOTARY_PER_IP_BYTES` | `100MB/1m,600MB/30m,1GB/1h` | Bytes one client may relay per window on the public port, `<size>/<window>`, both directions; charged when a session ends, refused at the next upgrade. Empty disables |
-| `--trusted-proxies` | `NOTARY_TRUSTED_PROXIES` | — | Addresses whose `X-Forwarded-For` names the client, as CIDRs; `direct` if nothing proxies this notary |
+| `--client-ip-header` | `NOTARY_CLIENT_IP_HEADER` | `x-forwarded-for` | Which header names the client on the public port: `x-forwarded-for` (the rightmost entry; notary directly behind the ALB) or `cf-connecting-ip` (Cloudflare proxied record only). A public upgrade without it is refused with 400 |
 | `--limits-store` | `NOTARY_LIMITS_STORE` | — | Where the per-client counts live: a `postgres://` URL, or `memory` for a single replica |
 
 Windows are `<limit>/<window>` lists: a limit is a count, or bytes with a
@@ -99,40 +99,39 @@ session limits bound sessions rather than connection attempts.
 ### Who a session counts against
 
 The per-client limits need to know who is calling, and behind a load balancer
-every request arrives from the balancer. On the public port:
+every request arrives from the balancer: the socket peer says nothing about
+the client. A header does, and `--client-ip-header` says which one:
 
-- `--trusted-proxies` — the balancer's own subnets. Only from these addresses
-  is `X-Forwarded-For` read, and then right to left, stopping at the first
-  address outside the set. An AWS ALB *appends* to whatever the client sent, so
-  only the rightmost entry is the balancer's own word; everything left of it
-  was written by the caller. A trusted peer that forwards no client, or that
-  sends the header twice, is refused with 400 rather than counted against the
-  balancer — which would quietly make the per-client cap a cap on the whole
-  service.
-- Anything else reaching the public port directly is a public client keyed on
-  its own address — and it must not carry `X-Forwarded-For` at all. A direct
-  connection with the header is either forged or from a hop this notary was
-  not told to trust; both are refused with 400, so a stale trusted list is
-  loud on the first request instead of quietly keying every user behind the
-  new hop to one address.
-- IPv6 clients are keyed by their /48. A residential allocation is a /56, so
-  keying finer would let one subscriber mint 256 identities. An IPv4 peer on
-  a `::` bind arrives as `::ffff:a.b.c.d` and is keyed, and matched against
-  `--trusted-proxies`, as `a.b.c.d`.
+- `x-forwarded-for` (the default) — the client is the **rightmost**
+  `X-Forwarded-For` entry. A balancer appends the address that connected to
+  it, after whatever the caller already sent, so the last entry is the
+  balancer's own word and everything left of it was written by the caller.
+  Only the last entry is read; the rest are neither believed nor validated.
+  Set this when the notary sits directly behind the ALB — the Cloudflare DNS
+  record is DNS-only (grey cloud), or there is no Cloudflare at all.
+- `cf-connecting-ip` — the client is the `CF-Connecting-IP` value Cloudflare
+  sets to the address that connected to its edge. Set this **only** when the
+  Cloudflare DNS record is proxied (orange cloud). With it set while the
+  record is grey, nothing sets the header and every public upgrade is a 400 —
+  loud, rather than quietly wrong.
+
+A public upgrade without the configured header, or with it sent twice, is
+refused with 400. It is never keyed on the socket peer: behind the balancer
+that peer is the balancer, and the per-client cap would quietly become a cap
+on the whole service — which looks exactly like ordinary load.
+
+The limitation: nothing verifies who wrote the header. Anything that can
+reach the public port directly can set it and choose its own key. So the
+public port must be reachable only through the load balancer — a security
+group that admits the ALB's subnets alone. That is the deployment's job, not
+the notary's.
+
+IPv6 clients are keyed by their /48. A residential allocation is a /56, so
+keying finer would let one subscriber mint 256 identities. An IPv4 address
+written as `::ffff:a.b.c.d` is keyed as `a.b.c.d`.
 
 Our own workloads are not exempted by address: they use the internal ports,
-which have no per-client limits at all (see Listeners).
-
-With a per-client limit on a non-loopback bind, an empty `--trusted-proxies` is
-a startup error. Say `direct` to mean it: an empty setting is also what a
-missing environment variable looks like, and the failure it causes looks
-exactly like ordinary load.
-
-For the testnet cluster the value is the ALB's public subnets:
-
-```
-NOTARY_TRUSTED_PROXIES=10.60.200.0/24,10.60.201.0/24
-```
+which read no header and have no per-client limits at all (see Listeners).
 
 ### Where the counts live
 
@@ -150,8 +149,7 @@ per window — are kept in `--limits-store`, which takes one of two forms:
   client gets each limit once per replica, and nothing in the logs says so.
 
 With a per-client limit on a non-loopback bind, an empty setting is a startup
-error for the same reason `--trusted-proxies` is: the failure it hides looks
-like ordinary load.
+error: the failure it hides looks like ordinary load.
 
 ## Docker
 
@@ -161,16 +159,20 @@ Released images are published to GitHub Container Registry:
 docker run --rm \
   -p 7048:7048 \
   -e NOTARY_HOST=0.0.0.0 \
-  -e NOTARY_TRUSTED_PROXIES=direct \
   -e NOTARY_LIMITS_STORE=memory \
   -e SIGNING_KEY=<hex-or-kms:…> \
   ghcr.io/libid-org/notary:latest
 ```
 
-That is the public port only. A Rust prover needs the MPC-TLS port, which is
-off unless asked for: add `-e NOTARY_PORT=7047 -p 7047:7047`. Likewise
-`NOTARY_INTERNAL_WS_PORT=7049` for the internal HTTP port. The image
-`EXPOSE`s all three; exposing is documentation, not a listener.
+That is the public port only, and it expects a load balancer in front:
+every upgrade must carry `X-Forwarded-For` (or `CF-Connecting-IP` with
+`NOTARY_CLIENT_IP_HEADER=cf-connecting-ip`), or it is refused with 400. To
+drive it by hand, send the header yourself; for local work without one, run
+the internal HTTP port instead — `-e NOTARY_INTERNAL_WS_PORT=7049 -p
+7049:7049` — which reads no header and has no per-client limits. A Rust
+prover needs the MPC-TLS port, which is off unless asked for: add
+`-e NOTARY_PORT=7047 -p 7047:7047`. The image `EXPOSE`s all three; exposing
+is documentation, not a listener.
 
 The image runs as uid 10001, not root. Its `HEALTHCHECK` GETs `/healthcheck`
 on `NOTARY_WS_PORT` over loopback and passes on `200` only, so a draining
@@ -216,8 +218,11 @@ amd64 only.
   service uses ProxyMode.
 - Only the public port goes behind the load balancer. 7047 and 7049 are
   published through the cluster Service alone: they have no limits.
-- `NOTARY_TRUSTED_PROXIES` = the ALB's subnets, not the VPC. Anything inside
-  the set can name its own client.
+- `NOTARY_CLIENT_IP_HEADER`: leave it at `x-forwarded-for` while the
+  Cloudflare record is DNS-only (grey); set `cf-connecting-ip` only once the
+  record is proxied (orange). Either way the public port must be reachable
+  only through the ALB — nothing checks who wrote the header, so anything
+  that can reach the port directly can choose its own key.
 - `NOTARY_LIMITS_STORE` is required on any non-loopback bind: `memory` at
   exactly one replica, a Postgres URL beyond that. `memory` multiplies every
   per-client limit by the replica count.
