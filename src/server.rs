@@ -2,13 +2,19 @@
 //!
 //! # Endpoints
 //!
-//! - **TCP** (port `NOTARY_PORT`): MPC-TLS verifier for Rust backend provers.
-//!   The section 9.1 ceremony attestation is written back down the socket the
-//!   prover opened. Nothing here dispatches on the server name: the record
-//!   carries it, and the contract that reads the record pins it.
+//! - **TCP** (`--port`): MPC-TLS verifier for Rust backend provers. The section
+//!   9.1 ceremony attestation is written back down the socket the prover
+//!   opened. Nothing here dispatches on the server name: the record carries
+//!   it, and the contract that reads the record pins it.
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
 //! - **GET /notarize-proxy** (WS upgrade): ProxyMode session followed by one
 //!   length-prefixed ceremony attestation in its own WebSocket message.
+//!
+//! The HTTP routes are served on two listeners, the public one (`--ws-port`)
+//! and the internal one (`--internal-ws-port`). The listening port is the
+//! whole classification: every per-client limit applies on the public port
+//! and none on the internal one, and nothing a connection carries -- header,
+//! peer address, anything -- moves it from one tier to the other.
 //!
 //! # Trust model
 //!
@@ -54,6 +60,7 @@ use axum::{
     response::{
         IntoResponse,
         Json,
+        Response,
     },
     routing::get,
     Router,
@@ -96,6 +103,7 @@ use tokio::{
     },
     net::TcpListener,
     sync::{
+        watch,
         Semaphore,
         TryAcquireError,
     },
@@ -133,7 +141,8 @@ use crate::{
 pub struct NotaryServerHandle {
     local_addr: Option<SocketAddr>,
     ws_local_addr: Option<SocketAddr>,
-    shutdown: tokio::sync::watch::Sender<bool>,
+    internal_ws_local_addr: Option<SocketAddr>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl NotaryServerHandle {
@@ -143,15 +152,41 @@ impl NotaryServerHandle {
         self.local_addr
     }
 
-    /// Returns the address the HTTP/WebSocket server is bound to, if enabled.
+    /// Returns the address the public HTTP/WebSocket server is bound to, if
+    /// enabled.
     pub fn ws_local_addr(&self) -> Option<SocketAddr> {
         self.ws_local_addr
     }
 
-    /// Signals every background task (TCP accept loop and WS server) to stop.
+    /// Returns the address the internal HTTP/WebSocket server is bound to,
+    /// if enabled.
+    pub fn internal_ws_local_addr(&self) -> Option<SocketAddr> {
+        self.internal_ws_local_addr
+    }
+
+    /// Signals every background task (TCP accept loop and HTTP servers) to
+    /// stop.
     pub fn shutdown(self) {
         let _ = self.shutdown.send(true);
     }
+}
+
+/// Which listener a request arrived on. This, and nothing about the request,
+/// decides whether the per-client limits apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tier {
+    /// `--ws-port`: browsers behind the load balancer; every limit applies.
+    Public,
+    /// `--internal-ws-port`: our own services; no per-client limit, no
+    /// `X-Forwarded-For`, and its own session pool.
+    Internal,
+}
+
+/// The state one HTTP listener serves its routes from.
+#[derive(Clone)]
+struct ListenerState {
+    tier: Tier,
+    notary: NotaryState,
 }
 
 /// Owns a spawned task and aborts it on drop unless the handle was taken back
@@ -211,9 +246,14 @@ impl<T> Drop for AbortOnDrop<T> {
 struct NotaryState {
     /// Notary signing identity (local hex key or AWS KMS).
     signer: Arc<ManagedSigner>,
-    /// ProxyMode slots: an upgrade that finds none is refused with 503.
+    /// Public ProxyMode slots: an upgrade that finds none is refused with
+    /// 503.
     proxy_sessions: Arc<Semaphore>,
-    /// ProxyMode slots each client may hold at once; `0` disables the cap.
+    /// Internal ProxyMode slots: their own pool, so public load never
+    /// queues our own services behind it.
+    internal_proxy_sessions: Arc<Semaphore>,
+    /// ProxyMode slots each public client may hold at once; `0` disables
+    /// the cap.
     max_sessions_per_ip: usize,
     /// Sessions per client, for the cap above.
     client_sessions: Arc<ClientSessions>,
@@ -250,6 +290,7 @@ impl NotaryState {
             public_key_hex: hex::encode(signer.compressed_public_key()),
             signer: Arc::new(signer),
             proxy_sessions: Arc::new(Semaphore::new(1024)),
+            internal_proxy_sessions: Arc::new(Semaphore::new(1024)),
             max_sessions_per_ip: 4,
             client_sessions: ClientSessions::new(),
             trusted_proxies: Arc::new(Vec::new()),
@@ -272,7 +313,8 @@ struct InfoResponse {
 
 // ─── Server startup ──────────────────────────────────────────────────────────
 
-/// Start the notary server (TCP + optional browser TLSNotary WebSocket).
+/// Start the notary server: the MPC-TLS listener and the public and internal
+/// HTTP/WebSocket servers, each only if configured.
 pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     // Before anything else, because a per-client cap with nothing to key on
     // is a global cap that looks like ordinary load.
@@ -299,6 +341,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     let mpc_max_sessions = config.mpc_max_sessions.resolve(cores);
     info!(
         proxy_max_sessions = config.max_sessions,
+        internal_max_sessions = config.internal_max_sessions,
         proxy_max_bytes = config.proxy_max_bytes,
         mpc_max_sessions,
         mpc_max_sessions_setting = %config.mpc_max_sessions,
@@ -314,6 +357,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     let state = NotaryState {
         signer: Arc::new(signer),
         proxy_sessions: Arc::new(Semaphore::new(config.max_sessions)),
+        internal_proxy_sessions: Arc::new(Semaphore::new(config.internal_max_sessions)),
         max_sessions_per_ip: config.max_sessions_per_ip,
         client_sessions: ClientSessions::new(),
         trusted_proxies: Arc::new(trusted_proxies),
@@ -326,8 +370,8 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         public_key_hex,
     };
 
-    // Broadcast shutdown to the TCP and WebSocket servers.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Broadcast shutdown to the listeners.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // ── Internal MPC-TLS listener (Rust provers in the cluster) ───────
     // Off unless configured: it has no per-client limits.
@@ -341,21 +385,35 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         None => info!("Notary MPC-TLS port off (--port not set)"),
     }
 
-    // ── WebSocket HTTP server (browser / tlsn-js) ─────────────────────
+    // ── Public HTTP/WebSocket server (browser / tlsn-js) ──────────────
     let ws_listener = if config.ws_port == 0 {
         None
     } else {
         let ws_addr = format!("{}:{}", config.host, config.ws_port);
-        TcpListener::bind(&ws_addr).await.ok()
+        Some(TcpListener::bind(&ws_addr).await?)
     };
     let ws_local_addr = ws_listener.as_ref().and_then(|l| l.local_addr().ok());
-    if let Some(addr) = ws_local_addr {
-        info!("Notary WebSocket listening on {addr} (browser TLSNotary API)");
+    match ws_local_addr {
+        Some(addr) => info!("Notary WebSocket listening on {addr} (public)"),
+        None => info!("Notary public WebSocket port off (--ws-port 0)"),
     }
 
-    let tcp_state = state.clone();
-    let mut tcp_shutdown = shutdown_rx.clone();
+    // ── Internal HTTP/WebSocket server (our own services) ─────────────
+    let internal_ws_listener = match config.internal_ws_port {
+        Some(port) => Some(TcpListener::bind(format!("{}:{port}", config.host)).await?),
+        None => None,
+    };
+    let internal_ws_local_addr = internal_ws_listener
+        .as_ref()
+        .and_then(|l| l.local_addr().ok());
+    match internal_ws_local_addr {
+        Some(addr) => info!("Notary WebSocket listening on {addr} (internal)"),
+        None => info!("Notary internal WebSocket port off (--internal-ws-port not set)"),
+    }
+
     if let Some(tcp_listener) = tcp_listener {
+        let tcp_state = state.clone();
+        let mut tcp_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -385,47 +443,63 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         });
     }
 
-    if let Some(ws_listener) = ws_listener {
-        let ws_state = state.clone();
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_headers(Any)
-            .allow_methods(Any);
-
-        let app = Router::new()
-            .route("/info", get(info_handler))
-            .route("/notarize-proxy", get(notarize_proxy_ws_handler))
-            .layer(cors)
-            .with_state(ws_state);
-
-        let mut ws_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            // Connect info so a session's log lines can name the peer.
-            axum::serve(
-                ws_listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                let _ = ws_shutdown.changed().await;
-            })
-            .await
-            .unwrap_or_else(|e| error!("WS server error: {}", e));
-        });
+    if let Some(listener) = ws_listener {
+        spawn_http_server(listener, Tier::Public, state.clone(), shutdown_rx.clone());
+    }
+    if let Some(listener) = internal_ws_listener {
+        spawn_http_server(listener, Tier::Internal, state.clone(), shutdown_rx.clone());
     }
 
     Ok(NotaryServerHandle {
         local_addr,
         ws_local_addr,
+        internal_ws_local_addr,
         shutdown: shutdown_tx,
     })
 }
 
+/// The HTTP routes, served as `tier`. Both listeners are built here; only
+/// the tier differs.
+fn router(tier: Tier, notary: NotaryState) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_headers(Any)
+        .allow_methods(Any);
+    Router::new()
+        .route("/info", get(info_handler))
+        .route("/notarize-proxy", get(notarize_proxy_ws_handler))
+        .layer(cors)
+        .with_state(ListenerState { tier, notary })
+}
+
+/// Serve `router(tier, state)` on `listener` until shutdown.
+fn spawn_http_server(
+    listener: TcpListener,
+    tier: Tier,
+    state: NotaryState,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let app = router(tier, state);
+    tokio::spawn(async move {
+        // Connect info so a session's log lines can name the peer.
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.changed().await;
+        })
+        .await
+        .unwrap_or_else(|e| error!("{tier:?} HTTP server error: {}", e));
+    });
+}
+
 // ─── REST handlers ───────────────────────────────────────────────────────────
 
-async fn info_handler(State(state): State<NotaryState>) -> Json<InfoResponse> {
+async fn info_handler(State(listener): State<ListenerState>) -> Json<InfoResponse> {
     Json(InfoResponse {
         version: format!("v{}", env!("CARGO_PKG_VERSION")),
-        public_key: state.public_key_hex.clone(),
+        public_key: listener.notary.public_key_hex.clone(),
     })
 }
 
@@ -511,17 +585,47 @@ async fn notarize_proxy_ws_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
-    State(state): State<NotaryState>,
-) -> impl IntoResponse {
+    State(listener): State<ListenerState>,
+) -> Response {
+    let state = listener.notary;
+
+    // The port is the whole classification. The internal listener asks
+    // nothing about the client: our own services are the protocol, not
+    // users of it.
+    let client = match listener.tier {
+        Tier::Internal => {
+            if state.internal_proxy_sessions.available_permits() == 0 {
+                info!(%peer, "ProxyMode (internal): all session slots busy; upgrade refused with 503");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            None
+        }
+        Tier::Public => match admit_public_upgrade(peer, &headers, &state).await {
+            Ok(client) => Some(client),
+            Err(refusal) => return refusal,
+        },
+    };
+
+    ws.on_upgrade(move |socket| handle_ws_proxy_notarize(socket, peer, client, state))
+}
+
+/// The public port's checks before an upgrade, cheapest first, and the
+/// client the session counts against if it passes them all. A refusal is the
+/// response to send instead.
+async fn admit_public_upgrade(
+    peer: SocketAddr,
+    headers: &axum::http::HeaderMap,
+    state: &NotaryState,
+) -> std::result::Result<ClientKey, Response> {
     // Who this session counts against. A refusal here is a refusal, never a
     // fallback to the socket peer: behind a load balancer that peer is the
     // balancer, so falling back would quietly turn the per-client cap into a
     // cap on the whole service.
-    let client = match client_ip::resolve(peer, &headers, &state.trusted_proxies) {
+    let client = match client_ip::resolve(peer, headers, &state.trusted_proxies) {
         Ok(client) => client,
         Err(reason) => {
             info!(%peer, %reason, "ProxyMode: upgrade refused, client unidentified");
-            return (StatusCode::BAD_REQUEST, reason.to_string()).into_response();
+            return Err((StatusCode::BAD_REQUEST, reason.to_string()).into_response());
         }
     };
 
@@ -536,10 +640,9 @@ async fn notarize_proxy_ws_handler(
     // request per slot.
     if state.proxy_sessions.available_permits() == 0 {
         info!(%peer, "ProxyMode: all session slots busy; upgrade refused with 503");
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
-    ws.on_upgrade(move |socket| handle_ws_proxy_notarize(socket, peer, client, state))
-        .into_response()
+    Ok(client)
 }
 
 /// How a ProxyMode WebSocket ends once the session is over: with the
@@ -580,10 +683,13 @@ async fn first_relayed_bytes(
     None
 }
 
+/// One ProxyMode session on an upgraded socket. `client` is `Some` on the
+/// public port, where the session counts against its client's cap, and
+/// `None` on the internal port, where nothing is counted per client.
 async fn handle_ws_proxy_notarize(
     socket: WebSocket,
     peer: SocketAddr,
-    client: ClientKey,
+    client: Option<ClientKey>,
     state: NotaryState,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -618,14 +724,14 @@ async fn handle_ws_proxy_notarize(
     // This client's own slot first: one client at its cap must not spend a
     // slot from the shared pool to find that out. Held for the session
     // lifetime, like the pool permit below.
-    let _client_slot = if state.max_sessions_per_ip == 0 {
-        None
-    } else {
-        match state
+    let (pool, _client_slot) = match client {
+        None => (&state.internal_proxy_sessions, None),
+        Some(_) if state.max_sessions_per_ip == 0 => (&state.proxy_sessions, None),
+        Some(client) => match state
             .client_sessions
             .try_take(client, state.max_sessions_per_ip)
         {
-            Some(slot) => Some(slot),
+            Some(slot) => (&state.proxy_sessions, Some(slot)),
             None => {
                 info!(
                     %peer, %client,
@@ -640,11 +746,11 @@ async fn handle_ws_proxy_notarize(
                     .await;
                 return;
             }
-        }
+        },
     };
 
     // Held for the session lifetime; dropping it returns the slot.
-    let Ok(_permit) = Arc::clone(&state.proxy_sessions).try_acquire_owned() else {
+    let Ok(_permit) = Arc::clone(pool).try_acquire_owned() else {
         info!(%peer, "ProxyMode: all session slots busy; session refused with 1013");
         let _ = ws_tx
             .send(Message::Close(Some(CloseFrame {
@@ -1366,10 +1472,6 @@ mod tests {
             time::Duration,
         };
 
-        use axum::{
-            routing::get,
-            Router,
-        };
         use futures_util::{
             SinkExt,
             StreamExt,
@@ -1408,8 +1510,9 @@ mod tests {
         };
 
         use super::{
-            notarize_proxy_ws_handler,
+            router,
             NotaryState,
+            Tier,
         };
 
         const TEST_KEY: &str =
@@ -1444,9 +1547,7 @@ mod tests {
         let notary_task = tokio::spawn(async move {
             axum::serve(
                 notary_listener,
-                Router::new()
-                    .route("/notarize-proxy", get(notarize_proxy_ws_handler))
-                    .with_state(state)
+                router(Tier::Public, state)
                     .into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
@@ -1724,10 +1825,6 @@ mod tests {
             time::Duration,
         };
 
-        use axum::{
-            routing::get,
-            Router,
-        };
         use futures_util::{
             SinkExt,
             StreamExt,
@@ -1785,11 +1882,12 @@ mod tests {
             super::{
                 handle_tcp_prover,
                 handle_verified_session,
-                notarize_proxy_ws_handler,
+                router,
                 with_mpc_slot,
                 AttestationWire,
                 NotaryState,
                 Result,
+                Tier,
             },
             ONE_SESSION_AT_A_TIME,
         };
@@ -1911,9 +2009,7 @@ mod tests {
             let notary_task = tokio::spawn(async move {
                 axum::serve(
                     notary_listener,
-                    Router::new()
-                        .route("/notarize-proxy", get(notarize_proxy_ws_handler))
-                        .with_state(state)
+                    router(Tier::Public, state)
                         .into_make_service_with_connect_info::<SocketAddr>(),
                 )
                 .await
