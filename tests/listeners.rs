@@ -447,12 +447,12 @@ async fn sigterm_waits_for_the_mpc_session_then_exits_zero() {
 
 /// A second SIGTERM while draining is an operator who will not wait: the
 /// process exits at once, still with 0, and the session it was waiting for
-/// is cut off.
+/// is cut off. Any session will do; the internal port's needs no client.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_sigterm_exits_zero_without_waiting() {
     let ports = Ports::free().await;
     let mut notary = spawn_notary(&ports).await;
-    let mut holder = ws_session(&ports.ws(ports.public), Some("203.0.113.7")).await;
+    let mut holder = ws_session(&ports.ws(ports.internal), None).await;
 
     notary.signal(libc::SIGTERM);
     until_draining(ports.public).await;
