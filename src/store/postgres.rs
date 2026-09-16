@@ -386,10 +386,16 @@ mod tests {
 
     /// `NOTARY_TEST_DATABASE_URL`, or `None` with a note: a checkout
     /// without a database still passes, and CI with one runs these with no
-    /// extra flags.
+    /// extra flags. CI without one is a broken workflow, not a checkout
+    /// without a database: it fails here rather than passing on skips.
     fn url() -> Option<String> {
         match std::env::var("NOTARY_TEST_DATABASE_URL") {
             Ok(url) if !url.trim().is_empty() => Some(url),
+            _ if std::env::var_os("CI").is_some() => panic!(
+                "NOTARY_TEST_DATABASE_URL is unset under CI: the Postgres store tests \
+                 would skip silently. Restore the env line on the test step in \
+                 .github/workflows/ci.yml"
+            ),
             _ => {
                 println!("skipped: NOTARY_TEST_DATABASE_URL not set");
                 None
@@ -427,6 +433,30 @@ mod tests {
         Ok(granted)
     }
 
+    /// Twenty tasks count one upgrade at once, four allowed in the hour;
+    /// how many were counted.
+    async fn counts_granted_to_twenty_racers(
+        store: Arc<PostgresStore>,
+    ) -> Result<usize, StoreError> {
+        let client = fresh_client();
+        let limits = Arc::new(WindowLimits::parse("4/1h").unwrap());
+        let racers: Vec<_> = (0..20)
+            .map(|_| {
+                let (store, limits) = (store.clone(), limits.clone());
+                tokio::spawn(async move {
+                    store.count(&client, Dimension::Upgrades, 1, &limits).await
+                })
+            })
+            .collect();
+        let mut counted = 0;
+        for racer in racers {
+            if racer.await.expect("racer ran")? {
+                counted += 1;
+            }
+        }
+        Ok(counted)
+    }
+
     #[tokio::test]
     async fn conforms() -> Result<(), StoreError> {
         let Some(store) = store().await? else {
@@ -445,6 +475,15 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn twenty_racers_count_exactly_four() -> Result<(), StoreError> {
+        let Some(store) = store().await? else {
+            return Ok(());
+        };
+        assert_eq!(counts_granted_to_twenty_racers(Arc::new(store)).await?, 4);
+        Ok(())
+    }
+
     /// `name` as an SQL identifier: `ALTER DATABASE` takes a name, not a
     /// parameter.
     fn quote_ident(name: &str) -> String {
@@ -459,7 +498,7 @@ mod tests {
     /// test process killed in between leaves it set; `ALTER DATABASE ...
     /// RESET default_transaction_isolation` puts it back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn twenty_racers_get_exactly_four_leases_under_repeatable_read(
+    async fn twenty_racers_get_exactly_four_under_repeatable_read(
     ) -> Result<(), StoreError> {
         let Some(url) = url() else {
             return Ok(());
@@ -483,7 +522,9 @@ mod tests {
                     .fetch_one(&store.pool)
                     .await?;
             assert_eq!(default, "repeatable read", "the new default did not take");
-            leases_granted_to_twenty_racers(store).await
+            let leases = leases_granted_to_twenty_racers(store.clone()).await?;
+            let counts = counts_granted_to_twenty_racers(store).await?;
+            Ok::<_, StoreError>((leases, counts))
         })
         .await;
         sqlx::query(&format!(
@@ -491,7 +532,7 @@ mod tests {
         ))
         .execute(&mut admin)
         .await?;
-        assert_eq!(outcome.expect("racers ran")?, 4);
+        assert_eq!(outcome.expect("racers ran")?, (4, 4), "(leases, counts)");
         Ok(())
     }
 
