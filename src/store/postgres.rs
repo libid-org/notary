@@ -552,14 +552,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_dead_database_is_an_error_with_the_password_redacted() {
-        let err = PostgresStore::connect("postgres://notary:hunter2@127.0.0.1:1/limits")
-            .await
-            .expect_err("nothing listens on port 1");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("postgres (postgres://notary:***@127.0.0.1:1/limits)"),
-            "{msg}"
-        );
-        assert!(!msg.contains("hunter2"), "{msg}");
+        for (url, shown) in [
+            (
+                "postgres://notary:hunter2@127.0.0.1:1/limits",
+                "postgres://notary:***@127.0.0.1:1/limits",
+            ),
+            (
+                "postgres://notary@127.0.0.1:1/limits?password=hunter2",
+                "postgres://notary:***@127.0.0.1:1/limits?password=***",
+            ),
+        ] {
+            let err = PostgresStore::connect(url)
+                .await
+                .expect_err("nothing listens on port 1");
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("postgres ({shown})")), "{msg}");
+            assert!(!msg.contains("hunter2"), "{msg}");
+        }
     }
 }

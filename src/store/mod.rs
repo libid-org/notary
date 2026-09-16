@@ -255,16 +255,40 @@ pub async fn connect(spec: &LimitsStoreSpec) -> Result<Arc<dyn LimitStore>, Stor
     })
 }
 
-/// A URL with any password replaced, for logs and errors.
+/// A URL with any password replaced, for logs and errors: the one in the
+/// user info, and a `password=` query parameter, which sqlx honours too.
+///
+/// Cut the way a URL parser cuts: the authority ends at the first `/`, `?`
+/// or `#` (a password holding one has to be percent-encoded to parse at
+/// all), and the user info is everything before its last `@`.
 pub fn redact(url: &str) -> String {
-    match url.split_once("://").and_then(|(scheme, rest)| {
-        let (creds, host) = rest.split_once('@')?;
-        let user = creds.split_once(':').map_or(creds, |(u, _)| u);
-        Some(format!("{scheme}://{user}:***@{host}"))
-    }) {
-        Some(redacted) => redacted,
-        None => url.to_string(),
-    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let (authority, tail) =
+        rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let authority = match authority.rsplit_once('@') {
+        Some((creds, host)) => {
+            let user = creds.split_once(':').map_or(creds, |(u, _)| u);
+            format!("{user}:***@{host}")
+        }
+        None => authority.to_string(),
+    };
+    let tail = match tail.split_once('?') {
+        Some((path, query)) => {
+            let query = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some(("password", _)) => "password=***",
+                    _ => pair,
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            format!("{path}?{query}")
+        }
+        None => tail.to_string(),
+    };
+    format!("{scheme}://{authority}{tail}")
 }
 
 /// The windows a store keys on: one per length, the tightest limit winning.
@@ -349,6 +373,31 @@ mod tests {
         );
         assert_eq!(redact("postgres://db/limits"), "postgres://db/limits");
         assert_eq!(redact("memory"), "memory");
+    }
+
+    #[test]
+    fn a_password_in_the_query_is_redacted_too() {
+        assert_eq!(
+            redact("postgres://notary@db/limits?password=hunter2&sslmode=require"),
+            "postgres://notary:***@db/limits?password=***&sslmode=require"
+        );
+        assert_eq!(
+            redact("postgres://db:5432/limits?sslmode=require&password=hunter2"),
+            "postgres://db:5432/limits?sslmode=require&password=***"
+        );
+        assert_eq!(
+            redact("postgres://db?password=hunter2"),
+            "postgres://db?password=***"
+        );
+        // Both at once, and a `@` in the query is not a user info marker.
+        assert_eq!(
+            redact("postgres://n:hunter2@db/l?password=hunter2&application_name=a@b"),
+            "postgres://n:***@db/l?password=***&application_name=a@b"
+        );
+        assert_eq!(
+            redact("postgres://db/l?not_password=x&passwordx=y"),
+            "postgres://db/l?not_password=x&passwordx=y"
+        );
     }
 
     /// A client no other test run has seen. `ClientKey` is an address, so
