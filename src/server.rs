@@ -172,7 +172,10 @@ pub struct NotaryServerHandle {
     phase: watch::Sender<Phase>,
     draining: Arc<AtomicBool>,
     in_flight: Arc<InFlight>,
-    connection_deadline: Duration,
+    /// How long a drain waits for the sessions in flight: the setup
+    /// deadline plus the connection deadline, because a connection counts
+    /// from its handler's first moment and is bounded by both in turn.
+    drain_deadline: Duration,
 }
 
 impl NotaryServerHandle {
@@ -207,20 +210,20 @@ impl NotaryServerHandle {
     /// balancer stops routing here while the sessions already running
     /// finish; the MPC listener closes at once and its queue empties with an
     /// error. The HTTP listeners keep answering -- 503 to every upgrade --
-    /// until the last session ends or the connection deadline elapses,
-    /// because a closed port looks like a crash to the balancer and a 503
-    /// looks like what it is. Then they close too, and this returns.
+    /// until the last session ends or the setup and connection deadlines
+    /// together elapse, because a closed port looks like a crash to the
+    /// balancer and a 503 looks like what it is. Then they close too, and
+    /// this returns.
     pub async fn drain(self) {
         self.draining.store(true, Ordering::SeqCst);
         let _ = self.phase.send(Phase::Draining);
         let open = self.in_flight.count();
         info!(
             sessions = open,
-            deadline_secs = self.connection_deadline.as_secs(),
+            deadline_secs = self.drain_deadline.as_secs(),
             "draining: no new sessions; waiting for the ones in flight"
         );
-        match tokio::time::timeout(self.connection_deadline, self.in_flight.idle()).await
-        {
+        match tokio::time::timeout(self.drain_deadline, self.in_flight.idle()).await {
             Ok(()) => info!("drained: every session finished"),
             Err(_) => warn!(
                 sessions = self.in_flight.count(),
@@ -233,7 +236,8 @@ impl NotaryServerHandle {
 
 /// The sessions running right now, on every listener, so a drain knows when
 /// it is done. A connection counts from the moment its handler starts to the
-/// moment it returns: the setup and connection deadlines already bound both.
+/// moment it returns: the setup deadline bounds the first stretch and the
+/// connection deadline the second, so their sum bounds the drain.
 #[derive(Debug, Default)]
 struct InFlight {
     count: AtomicUsize,
@@ -625,7 +629,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         phase: phase_tx,
         draining: Arc::clone(&state.draining),
         in_flight: Arc::clone(&state.in_flight),
-        connection_deadline: state.connection_deadline,
+        drain_deadline: state.setup_deadline + state.connection_deadline,
     })
 }
 
@@ -785,6 +789,11 @@ async fn notarize_proxy_ws_handler(
 ) -> Response {
     let state = listener.notary;
 
+    // In flight from here, before the draining check: admission is two
+    // store round trips, and an upgrade inside them when the drain starts
+    // must be waited for, not raced. Every refusal below drops the guard.
+    let in_flight = state.in_flight.enter();
+
     // Nothing new once the process is stopping; the sessions already
     // running finish, and the balancer has been told by the health check.
     if state.draining.load(Ordering::SeqCst) {
@@ -809,7 +818,6 @@ async fn notarize_proxy_ws_handler(
         },
     };
 
-    let in_flight = state.in_flight.enter();
     ws.on_upgrade(move |socket| async move {
         let _in_flight = in_flight;
         handle_ws_proxy_notarize(socket, peer, client, state).await;
@@ -2249,8 +2257,15 @@ mod tests {
                 handle_tcp_prover,
                 handle_verified_session,
                 router,
+                store::{
+                    Dimension,
+                    LeaseId,
+                    StoreError,
+                },
                 with_mpc_slot,
                 AttestationWire,
+                ClientKey,
+                LimitStore,
                 NotaryState,
                 Result,
                 Tier,
@@ -2341,6 +2356,153 @@ mod tests {
                 }
             });
             (browser_io, pump)
+        }
+
+        /// Serve `router(tier, state)` on an ephemeral port; the task is
+        /// aborted by the test that spawned it.
+        async fn serve(
+            tier: Tier,
+            state: NotaryState,
+        ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    router(tier, state)
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            });
+            (addr, task)
+        }
+
+        /// A store whose every call parks until the test lets it go, so the
+        /// notary can be looked at while admission is in progress. Once let
+        /// go, everything fits.
+        struct Gate {
+            entered: tokio::sync::Notify,
+            go: Semaphore,
+        }
+
+        impl Gate {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    entered: tokio::sync::Notify::new(),
+                    go: Semaphore::new(0),
+                })
+            }
+
+            async fn park(&self) {
+                self.entered.notify_one();
+                self.go.acquire().await.expect("never closed").forget();
+            }
+        }
+
+        struct ParkedStore(Arc<Gate>);
+
+        #[async_trait::async_trait]
+        impl LimitStore for ParkedStore {
+            async fn try_lease(
+                &self,
+                _: &ClientKey,
+                _: usize,
+                _: Duration,
+            ) -> std::result::Result<Option<LeaseId>, StoreError> {
+                self.0.park().await;
+                Ok(Some(LeaseId::new()))
+            }
+
+            async fn release(&self, _: &LeaseId) -> std::result::Result<(), StoreError> {
+                self.0.park().await;
+                Ok(())
+            }
+
+            async fn count(
+                &self,
+                _: &ClientKey,
+                _: Dimension,
+                _: u64,
+                _: &WindowLimits,
+            ) -> std::result::Result<bool, StoreError> {
+                self.0.park().await;
+                Ok(true)
+            }
+
+            async fn would_fit(
+                &self,
+                _: &ClientKey,
+                _: Dimension,
+                _: u64,
+                _: &WindowLimits,
+            ) -> std::result::Result<bool, StoreError> {
+                self.0.park().await;
+                Ok(true)
+            }
+
+            async fn charge(
+                &self,
+                _: &ClientKey,
+                _: Dimension,
+                _: u64,
+                _: &WindowLimits,
+            ) -> std::result::Result<(), StoreError> {
+                self.0.park().await;
+                Ok(())
+            }
+
+            async fn sweep(&self) -> std::result::Result<u64, StoreError> {
+                self.0.park().await;
+                Ok(0)
+            }
+
+            fn describe(&self) -> String {
+                "parked".into()
+            }
+        }
+
+        /// An upgrade is in flight from before its admission -- two store
+        /// round trips -- so a drain that starts meanwhile waits for it
+        /// rather than stopping the listeners under it; and it is out of
+        /// flight once its handler returns.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_upgrade_counts_as_in_flight_while_admission_runs() {
+            let gate = Gate::new();
+            let mut state = NotaryState::for_tests(test_signer().await);
+            state.limits = Arc::new(ParkedStore(Arc::clone(&gate)));
+            let in_flight = Arc::clone(&state.in_flight);
+            let (notary_addr, notary_task) = serve(Tier::Public, state).await;
+
+            let upgrade = tokio::spawn(async move {
+                connect_async(format!("ws://{notary_addr}/notarize-proxy"))
+                    .await
+                    .expect("the upgrade is admitted once the store answers")
+            });
+            tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                .await
+                .expect("admission never asked the store");
+            assert_eq!(
+                in_flight.count(),
+                1,
+                "an upgrade inside admission is in flight"
+            );
+
+            // Let admission through; the socket is dropped unstarted, and
+            // the handler's return takes the connection out of flight.
+            gate.go.add_permits(2);
+            let (socket, _) = upgrade.await.unwrap();
+            drop(socket);
+            let idle = async {
+                while in_flight.count() != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), idle)
+                .await
+                .expect("the connection never left flight");
+
+            notary_task.abort();
         }
 
         /// A relay that crosses the cap is aborted mid-stream: the browser's

@@ -220,9 +220,11 @@ amd64 only.
   the set can name its own client.
 - `NOTARY_LIMITS_STORE` = a Postgres URL at more than one replica; `memory`
   multiplies every per-client limit by the replica count.
-- `terminationGracePeriodSeconds` must exceed `--connection-deadline-secs`
-  (default `300`): SIGTERM drains in-flight sessions, and a shorter grace
-  period kills them mid-attestation.
+- `terminationGracePeriodSeconds` must exceed `--setup-deadline-secs` +
+  `--connection-deadline-secs` (defaults `15` + `300` = `315`): SIGTERM
+  drains the sessions in flight, that sum is the longest one can take, and
+  a shorter grace period kills them mid-attestation. A second SIGTERM ends
+  the drain at once, still with exit 0.
 - The ALB health check targets `GET /healthcheck` on the public port. It
   returns `503` from SIGTERM until the process exits, which is how the
   balancer learns to stop sending work to a draining pod.

@@ -21,6 +21,7 @@ use notary::{
     server,
     NotaryServerConfig,
 };
+use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::{
     connect_async,
     tungstenite,
@@ -223,23 +224,42 @@ async fn healthcheck_is_ok_on_both_listeners() {
     handle.shutdown();
 }
 
-/// The real binary under SIGTERM: the health check flips to 503 at once,
-/// new upgrades are refused, the session in flight finishes, and only then
-/// does the process exit -- with 0.
-#[tokio::test(flavor = "multi_thread")]
-async fn sigterm_drains_the_session_in_flight_then_exits_zero() {
-    let ws_port = free_port().await;
-    let mut notary = Spawned(
+/// The three listeners of a spawned notary, on ports reserved up front:
+/// its stdout is not read, so ephemeral ports could not be learned.
+struct Ports {
+    mpc: u16,
+    public: u16,
+    internal: u16,
+}
+
+impl Ports {
+    async fn free() -> Self {
+        Self {
+            mpc: free_port().await,
+            public: free_port().await,
+            internal: free_port().await,
+        }
+    }
+
+    fn ws(&self, port: u16) -> String {
+        format!("ws://127.0.0.1:{port}/notarize-proxy")
+    }
+}
+
+/// The real binary, on `ports`, with the memory store; returns once its
+/// public health check answers 200.
+async fn spawn_notary(ports: &Ports) -> Spawned {
+    let notary = Spawned(
         Command::new(env!("CARGO_BIN_EXE_notary"))
             .args([
                 "--host",
                 "127.0.0.1",
                 "--port",
-                "0",
+                &ports.mpc.to_string(),
                 "--ws-port",
-                &ws_port.to_string(),
+                &ports.public.to_string(),
                 "--internal-ws-port",
-                "0",
+                &ports.internal.to_string(),
                 "--limits-store",
                 "memory",
                 "--signing-key",
@@ -250,16 +270,10 @@ async fn sigterm_drains_the_session_in_flight_then_exits_zero() {
             .spawn()
             .expect("the notary binary starts"),
     );
-    let health = format!("http://127.0.0.1:{ws_port}/healthcheck");
-    let ws = format!("ws://127.0.0.1:{ws_port}/notarize-proxy");
-    let client = reqwest::Client::new();
-
     let up = async {
         loop {
-            if let Ok(r) = client.get(&health).send().await {
-                if r.status() == 200 {
-                    return;
-                }
+            if health(ports.public).await == Some(200) {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -267,50 +281,54 @@ async fn sigterm_drains_the_session_in_flight_then_exits_zero() {
     tokio::time::timeout(Duration::from_secs(20), up)
         .await
         .expect("the notary never answered its health check");
+    notary
+}
 
-    // A session past its first frame: the drain must wait for it.
-    let (mut holder, _) = connect_async(&ws).await.expect("upgrade");
-    holder
-        .send(Message::Binary(b"\x16\x03\x01".to_vec().into()))
+/// The health check's status on `port`, or `None` while nothing answers.
+async fn health(port: u16) -> Option<u16> {
+    reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/healthcheck"))
+        .send()
         .await
-        .unwrap();
-    assert!(holds(&mut holder, Duration::from_millis(200)).await);
+        .ok()
+        .map(|r| r.status().as_u16())
+}
 
-    notary.signal(libc::SIGTERM);
-
+/// Wait for the health check to say `draining`, within 2s of the signal.
+async fn until_draining(port: u16) {
     let draining = async {
-        loop {
-            if let Ok(r) = client.get(&health).send().await {
-                if r.status() == 503 {
-                    let body: serde_json::Value = r.json().await.unwrap();
-                    assert_eq!(body["status"], "draining");
-                    return;
-                }
-            }
+        while health(port).await != Some(503) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let body: serde_json::Value = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/healthcheck"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["status"], "draining");
     };
     tokio::time::timeout(Duration::from_secs(2), draining)
         .await
         .expect("the health check did not flip to 503 within 2s of SIGTERM");
-    assert!(
-        notary.0.try_wait().unwrap().is_none(),
-        "the notary exited with a session still in flight"
-    );
+}
 
-    // Nothing new is taken while draining.
-    assert!(
-        connect_async(&ws).await.is_err(),
-        "a new session was accepted while draining"
-    );
-    assert!(
-        holds(&mut holder, Duration::from_millis(200)).await,
-        "the session in flight was cut off by the drain"
-    );
+/// A ProxyMode session past its first frame on `url`: the drain must wait
+/// for it.
+async fn ws_session(url: &str) -> Socket {
+    let (mut socket, _) = connect_async(url).await.expect("upgrade");
+    socket
+        .send(Message::Binary(b"\x16\x03\x01".to_vec().into()))
+        .await
+        .unwrap();
+    assert!(holds(&mut socket, Duration::from_millis(200)).await);
+    socket
+}
 
-    // The session ends; the process follows.
-    holder.close(None).await.unwrap();
-    drop(holder);
+/// The process's exit status within `within`, or a panic.
+async fn exit_status(notary: &mut Spawned, within: Duration) -> std::process::ExitStatus {
     let exited = async {
         loop {
             if let Some(status) = notary.0.try_wait().unwrap() {
@@ -319,10 +337,128 @@ async fn sigterm_drains_the_session_in_flight_then_exits_zero() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     };
-    let status = tokio::time::timeout(Duration::from_secs(5), exited)
+    tokio::time::timeout(within, exited)
         .await
-        .expect("the notary did not exit within 5s of its last session ending");
+        .unwrap_or_else(|_| panic!("the notary did not exit within {within:?}"))
+}
+
+/// Which listener's session is the last one a drain waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Last {
+    Public,
+    Internal,
+    Mpc,
+}
+
+/// The real binary under SIGTERM: the health check flips to 503 at once,
+/// new upgrades are refused with 503, and the process exits -- with 0 --
+/// only once the last session has ended. One session is held on every
+/// listener, the other two are closed first, and `last` alone must keep
+/// the process alive: each listener's sessions are counted on their own.
+async fn sigterm_drains_then_exits_zero(last: Last) {
+    let ports = Ports::free().await;
+    let mut notary = spawn_notary(&ports).await;
+
+    // One session on every listener, each past the point where it counts:
+    // the browser's first frame on both HTTP ports, the prover's first byte
+    // on the MPC port.
+    let mut public = Some(ws_session(&ports.ws(ports.public)).await);
+    let mut internal = Some(ws_session(&ports.ws(ports.internal)).await);
+    let mut mpc = tokio::net::TcpStream::connect(("127.0.0.1", ports.mpc))
+        .await
+        .expect("MPC connect");
+    mpc.write_all(b"\x16")
+        .await
+        .expect("the prover's first byte");
+    let mut mpc = Some(mpc);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    notary.signal(libc::SIGTERM);
+    until_draining(ports.public).await;
+    assert!(
+        notary.0.try_wait().unwrap().is_none(),
+        "the notary exited with sessions still in flight"
+    );
+
+    // Nothing new is taken while draining -- and the listener is still
+    // open to say so, because a closed port reads as a crash.
+    let refused = connect_async(ports.ws(ports.public))
+        .await
+        .expect_err("a new session was accepted while draining");
+    let tungstenite::Error::Http(response) = refused else {
+        panic!("expected an HTTP 503 while draining, got: {refused}");
+    };
+    assert_eq!(response.status(), 503);
+    assert!(
+        holds(public.as_mut().unwrap(), Duration::from_millis(200)).await,
+        "the public session in flight was cut off by the drain"
+    );
+    assert!(
+        holds(internal.as_mut().unwrap(), Duration::from_millis(200)).await,
+        "the internal session in flight was cut off by the drain"
+    );
+
+    // Everything but `last` ends; `last` alone keeps the process alive.
+    let mut end = |which: Last| match which {
+        Last::Public => drop(public.take()),
+        Last::Internal => drop(internal.take()),
+        Last::Mpc => drop(mpc.take()),
+    };
+    for which in [Last::Public, Last::Internal, Last::Mpc] {
+        if which != last {
+            end(which);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        notary.0.try_wait().unwrap().is_none(),
+        "the notary exited with a {last:?} session still in flight"
+    );
+
+    end(last);
+    let status = exit_status(&mut notary, Duration::from_secs(5)).await;
     assert!(status.success(), "exit status: {status}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_waits_for_the_public_session_then_exits_zero() {
+    sigterm_drains_then_exits_zero(Last::Public).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_waits_for_the_internal_session_then_exits_zero() {
+    sigterm_drains_then_exits_zero(Last::Internal).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_waits_for_the_mpc_session_then_exits_zero() {
+    sigterm_drains_then_exits_zero(Last::Mpc).await;
+}
+
+/// A second SIGTERM while draining is an operator who will not wait: the
+/// process exits at once, still with 0, and the session it was waiting for
+/// is cut off.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_sigterm_exits_zero_without_waiting() {
+    let ports = Ports::free().await;
+    let mut notary = spawn_notary(&ports).await;
+    let mut holder = ws_session(&ports.ws(ports.public)).await;
+
+    notary.signal(libc::SIGTERM);
+    until_draining(ports.public).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        notary.0.try_wait().unwrap().is_none(),
+        "one SIGTERM must wait for the session in flight"
+    );
+
+    notary.signal(libc::SIGTERM);
+    let status = exit_status(&mut notary, Duration::from_secs(2)).await;
+    assert!(status.success(), "exit status: {status}");
+    assert!(
+        !holds(&mut holder, Duration::from_secs(2)).await,
+        "the session outlived the process"
+    );
 }
 
 /// The spawned notary, killed if the test fails before it exits.
