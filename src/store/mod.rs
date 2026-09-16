@@ -415,7 +415,8 @@ mod tests {
         let long = Duration::from_secs(60);
         let hour = WindowLimits::parse("10/1h").unwrap();
 
-        // Leases up to the limit, then refused; a release frees a slot.
+        // Leases up to the limit, then refused; a release frees exactly one
+        // slot: the other lease keeps its own.
         let c = fresh_client();
         let a = store.try_lease(&c, 2, long).await?.expect("first lease");
         let _b = store.try_lease(&c, 2, long).await?.expect("second lease");
@@ -427,6 +428,10 @@ mod tests {
         assert!(
             store.try_lease(&c, 2, long).await?.is_some(),
             "released slot"
+        );
+        assert!(
+            store.try_lease(&c, 2, long).await?.is_none(),
+            "the release freed one slot, not the client"
         );
         store.release(&a).await?; // twice is not an error
         store.release(&LeaseId::new()).await?; // nor is an unknown lease
@@ -456,6 +461,25 @@ mod tests {
                 .would_fit(&c, Dimension::Upgrades, 1, &two_hours)
                 .await?,
             "the refused count must not have charged the 2h window"
+        );
+
+        // The same the other way round: a count the LONGER window refuses
+        // must not have charged the shorter one. Two used of five in the
+        // hour; three more fit only if the refusal counted nothing there.
+        let c = fresh_client();
+        let both = WindowLimits::parse("5/1h,2/2h").unwrap();
+        let one_hour = WindowLimits::parse("5/1h").unwrap();
+        assert!(store.count(&c, Dimension::Upgrades, 1, &both).await?);
+        assert!(store.count(&c, Dimension::Upgrades, 1, &both).await?);
+        assert!(
+            !store.count(&c, Dimension::Upgrades, 1, &both).await?,
+            "2h full"
+        );
+        assert!(
+            store
+                .would_fit(&c, Dimension::Upgrades, 3, &one_hour)
+                .await?,
+            "the refused count must not have charged the 1h window"
         );
 
         // Units are counted, not calls, and would_fit counts nothing.
@@ -501,15 +525,27 @@ mod tests {
 
         // A sweep drops expired leases and windows past their own length,
         // and says how many: three leases and one window here, plus whatever
-        // else has expired in a shared database.
+        // else has expired in a shared database. What is still live stays:
+        // a lease with time left, a window that is still open.
         let c = fresh_client();
         for _ in 0..3 {
             store.try_lease(&c, 3, short).await?.expect("lease");
         }
         let second = WindowLimits::parse("10/1s").unwrap();
         store.charge(&c, Dimension::Bytes, 1, &second).await?;
+        let live = fresh_client();
+        store.try_lease(&live, 1, long).await?.expect("long lease");
+        store.charge(&live, Dimension::Bytes, 10, &hour).await?;
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(store.sweep().await? >= 4);
+        assert!(
+            store.try_lease(&live, 1, long).await?.is_none(),
+            "the sweep took a live lease"
+        );
+        assert!(
+            !store.would_fit(&live, Dimension::Bytes, 1, &hour).await?,
+            "the sweep took an open window"
+        );
         Ok(())
     }
 }

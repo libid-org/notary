@@ -84,6 +84,10 @@ jobs:
 
       - name: Tests
         env:
+          # Under CI (which GitHub sets) the Postgres store tests panic when
+          # this is unset (src/store/postgres.rs), so losing this line fails
+          # the job instead of skipping them. The user is a superuser: one
+          # test ALTERs the database's default isolation and resets it.
           NOTARY_TEST_DATABASE_URL: postgres://postgres:notary@localhost:5432/postgres
         run: cargo test --all
 
