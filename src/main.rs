@@ -27,8 +27,27 @@ fn main() -> anyhow::Result<()> {
                 internal_ws = ?handle.internal_ws_local_addr(),
                 "Notary server up"
             );
-            tokio::signal::ctrl_c().await?;
-            handle.shutdown();
+            let signal = stop_signal().await?;
+            info!(signal, "stop requested; draining");
+            handle.drain().await;
             Ok(())
         })
+}
+
+/// Resolves on Ctrl-C or, on Unix, SIGTERM -- what the orchestrator sends a
+/// pod before its grace period starts -- with the signal's name.
+async fn stop_signal() -> std::io::Result<&'static str> {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map(|()| "SIGINT"),
+            _ = sigterm.recv() => Ok("SIGTERM"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.map(|()| "ctrl-c")
+    }
 }
