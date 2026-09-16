@@ -862,7 +862,8 @@ async fn admit_public_upgrade(
     // anything is spent on it; the bytes window only has to have room, since
     // the bytes are charged when the session ends. A store that cannot
     // answer is a refusal: a limit that fails open under a store outage is a
-    // limit an attacker can switch off.
+    // limit an attacker can switch off. An empty window is no limit, and
+    // asks the store nothing.
     let store_down = |error: store::StoreError| {
         warn!(%peer, %client, %error, "ProxyMode: upgrade refused, limits store unavailable");
         (StatusCode::SERVICE_UNAVAILABLE, "limits store unavailable").into_response()
@@ -876,23 +877,27 @@ async fn admit_public_upgrade(
         )
             .into_response()
     };
-    match state
-        .limits
-        .count(&client, Dimension::Upgrades, 1, &state.per_ip_upgrades)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return Err(too_many("sessions started")),
-        Err(error) => return Err(store_down(error)),
+    if !state.per_ip_upgrades.is_empty() {
+        match state
+            .limits
+            .count(&client, Dimension::Upgrades, 1, &state.per_ip_upgrades)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(too_many("sessions started")),
+            Err(error) => return Err(store_down(error)),
+        }
     }
-    match state
-        .limits
-        .would_fit(&client, Dimension::Bytes, 1, &state.per_ip_bytes)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return Err(too_many("bytes relayed")),
-        Err(error) => return Err(store_down(error)),
+    if !state.per_ip_bytes.is_empty() {
+        match state
+            .limits
+            .would_fit(&client, Dimension::Bytes, 1, &state.per_ip_bytes)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(too_many("bytes relayed")),
+            Err(error) => return Err(store_down(error)),
+        }
     }
     Ok(client)
 }
@@ -2599,13 +2604,31 @@ mod tests {
             target_task.await.unwrap();
         }
 
-        /// `--per-ip-bytes` is charged with what a session really relayed:
-        /// one full session -- a TLS handshake alone is more than a
-        /// kilobyte -- fills a 1 KB window, and the client's next upgrade is
-        /// refused with 429.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn the_bytes_window_is_charged_when_a_session_ends() {
-            let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
+        /// A WebSocket upgrade as an HTTP client sends it, so a refusal's
+        /// status and body can be read whole: tungstenite keeps only what
+        /// arrived in the same read as the headers.
+        async fn upgrade_request(notary_addr: SocketAddr) -> reqwest::Response {
+            reqwest::Client::new()
+                .get(format!("http://{notary_addr}/notarize-proxy"))
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .send()
+                .await
+                .expect("the notary answers the upgrade")
+        }
+
+        /// One complete ProxyMode session against the fixture server,
+        /// through `router(tier, state)`: the browser's request, its reveal,
+        /// and the attestation frame read back. Returns the notary's
+        /// address, what the browser saw, and the serving task, for what
+        /// the test wants to check next. The caller holds
+        /// `ONE_SESSION_AT_A_TIME`.
+        async fn complete_session(
+            tier: Tier,
+            mut state: NotaryState,
+        ) -> (SocketAddr, BrowserSide, tokio::task::JoinHandle<()>) {
             let prover_config = ProverConfig::builder(SERVER_DOMAIN)
                 .mode(ProverMode::Proxy)
                 .root_certs(vec![CA_CERT_DER.to_vec()])
@@ -2619,21 +2642,9 @@ mod tests {
                 tlsn_server_fixture::bind(socket.compat()).await.unwrap();
             });
 
-            let mut state = NotaryState::for_tests(test_signer().await);
-            state.per_ip_bytes = WindowLimits::parse("1KB/1h").unwrap();
             state.proxy_root_store = Arc::new(prover_config.root_store.clone());
             state.proxy_server_addr = Some(target_addr);
-            let notary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let notary_addr = notary_listener.local_addr().unwrap();
-            let notary_task = tokio::spawn(async move {
-                axum::serve(
-                    notary_listener,
-                    router(Tier::Public, state)
-                        .into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                .unwrap();
-            });
+            let (notary_addr, notary_task) = serve(tier, state).await;
 
             let (browser_io, pump) = browser(notary_addr).await;
             let mut prover = SdkProver::new(prover_config).unwrap();
@@ -2668,22 +2679,36 @@ mod tests {
                 .await
                 .expect("local ProxyMode session timed out");
             let seen = pump.await.unwrap();
+            target_task.await.unwrap();
+            (notary_addr, seen, notary_task)
+        }
+
+        /// `--per-ip-bytes` is charged with what a session really relayed:
+        /// one full session -- a TLS handshake alone is more than a
+        /// kilobyte -- fills a 1 KB window, and the client's next upgrade is
+        /// refused with 429 naming the bytes window. The upgrades window is
+        /// off, so nothing else can be what refuses.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_bytes_window_is_charged_when_a_session_ends() {
+            let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
+            let mut state = NotaryState::for_tests(test_signer().await);
+            state.per_ip_bytes = WindowLimits::parse("1KB/1h").unwrap();
+            state.per_ip_upgrades = WindowLimits::default();
+            let (notary_addr, seen, notary_task) =
+                complete_session(Tier::Public, state).await;
             assert!(
                 seen.close.is_none(),
                 "the session did not end cleanly: {:?}",
                 seen.close
             );
-            target_task.await.unwrap();
 
             // The charge lands as the handler returns, a moment after the
             // browser saw its close frame.
             let refused = async {
                 loop {
-                    match connect_async(format!("ws://{notary_addr}/notarize-proxy"))
-                        .await
-                    {
-                        Err(error) => return error,
-                        Ok((socket, _)) => drop(socket),
+                    let response = upgrade_request(notary_addr).await;
+                    if response.status() != 101 {
+                        return response;
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -2691,12 +2716,202 @@ mod tests {
             let refused = tokio::time::timeout(Duration::from_secs(5), refused)
                 .await
                 .expect("the bytes window never refused an upgrade");
-            let tokio_tungstenite::tungstenite::Error::Http(response) = refused else {
-                panic!("expected an HTTP refusal, got: {refused}");
-            };
-            assert_eq!(response.status(), 429);
-            assert!(response.headers().contains_key("retry-after"));
+            assert_eq!(refused.status(), 429);
+            assert!(refused.headers().contains_key("retry-after"));
+            let body = refused.text().await.unwrap();
+            assert!(body.contains("bytes"), "{body}");
 
+            notary_task.abort();
+        }
+
+        /// A store that answers nothing but errors.
+        struct DownStore;
+
+        #[async_trait::async_trait]
+        impl LimitStore for DownStore {
+            async fn try_lease(
+                &self,
+                _: &ClientKey,
+                _: usize,
+                _: Duration,
+            ) -> std::result::Result<Option<LeaseId>, StoreError> {
+                Err(StoreError("down".into()))
+            }
+
+            async fn release(&self, _: &LeaseId) -> std::result::Result<(), StoreError> {
+                Err(StoreError("down".into()))
+            }
+
+            async fn count(
+                &self,
+                _: &ClientKey,
+                _: Dimension,
+                _: u64,
+                _: &WindowLimits,
+            ) -> std::result::Result<bool, StoreError> {
+                Err(StoreError("down".into()))
+            }
+
+            async fn would_fit(
+                &self,
+                _: &ClientKey,
+                _: Dimension,
+                _: u64,
+                _: &WindowLimits,
+            ) -> std::result::Result<bool, StoreError> {
+                Err(StoreError("down".into()))
+            }
+
+            async fn charge(
+                &self,
+                _: &ClientKey,
+                _: Dimension,
+                _: u64,
+                _: &WindowLimits,
+            ) -> std::result::Result<(), StoreError> {
+                Err(StoreError("down".into()))
+            }
+
+            async fn sweep(&self) -> std::result::Result<u64, StoreError> {
+                Err(StoreError("down".into()))
+            }
+
+            fn describe(&self) -> String {
+                "down".into()
+            }
+        }
+
+        /// A store the internal port must never reach: every call panics,
+        /// and a panic in the handler ends the session.
+        struct PanickingStore;
+
+        #[async_trait::async_trait]
+        impl LimitStore for PanickingStore {
+            async fn try_lease(
+                &self,
+                _: &ClientKey,
+                _: usize,
+                _: Duration,
+            ) -> std::result::Result<Option<LeaseId>, StoreError> {
+                panic!("the internal port asked the store for a lease")
+            }
+
+            async fn release(&self, _: &LeaseId) -> std::result::Result<(), StoreError> {
+                panic!("the internal port released a lease")
+            }
+
+            async fn count(
+                &self,
+                _: &ClientKey,
+                _: Dimension,
+                _: u64,
+                _: &WindowLimits,
+            ) -> std::result::Result<bool, StoreError> {
+                panic!("the internal port counted in the store")
+            }
+
+            async fn would_fit(
+                &self,
+                _: &ClientKey,
+                _: Dimension,
+                _: u64,
+                _: &WindowLimits,
+            ) -> std::result::Result<bool, StoreError> {
+                panic!("the internal port asked the store for room")
+            }
+
+            async fn charge(
+                &self,
+                _: &ClientKey,
+                _: Dimension,
+                _: u64,
+                _: &WindowLimits,
+            ) -> std::result::Result<(), StoreError> {
+                panic!("the internal port charged the store")
+            }
+
+            async fn sweep(&self) -> std::result::Result<u64, StoreError> {
+                panic!("the internal port swept the store")
+            }
+
+            fn describe(&self) -> String {
+                "panicking".into()
+            }
+        }
+
+        /// A store that cannot answer is a refusal, never a pass: with a
+        /// window in force the upgrade itself is refused with 503, naming
+        /// the store -- whichever of the two windows is the one in force.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_store_that_cannot_answer_refuses_the_upgrade() {
+            for (upgrades, bytes) in [("1/1h", ""), ("", "1KB/1h")] {
+                let mut state = NotaryState::for_tests(test_signer().await);
+                state.limits = Arc::new(DownStore);
+                state.per_ip_upgrades = WindowLimits::parse(upgrades).unwrap();
+                state.per_ip_bytes = WindowLimits::parse(bytes).unwrap();
+                let (notary_addr, notary_task) = serve(Tier::Public, state).await;
+
+                let refused = upgrade_request(notary_addr).await;
+                assert_eq!(refused.status(), 503, "windows {upgrades:?} {bytes:?}");
+                assert_eq!(refused.text().await.unwrap(), "limits store unavailable");
+
+                notary_task.abort();
+            }
+        }
+
+        /// With no window in force the store is not asked at the upgrade,
+        /// which goes through; the session's lease is the next thing asked
+        /// of it, and that refusal closes the socket with 1013 on the first
+        /// frame, naming the store.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_store_that_cannot_answer_refuses_the_session_with_1013() {
+            let mut state = NotaryState::for_tests(test_signer().await);
+            state.limits = Arc::new(DownStore);
+            state.per_ip_upgrades = WindowLimits::default();
+            state.per_ip_bytes = WindowLimits::default();
+            let (notary_addr, notary_task) = serve(Tier::Public, state).await;
+
+            let (mut socket, _) =
+                connect_async(format!("ws://{notary_addr}/notarize-proxy"))
+                    .await
+                    .expect("with no window in force the upgrade does not ask the store");
+            socket
+                .send(WsMessage::Binary(b"\x16\x03\x01".to_vec().into()))
+                .await
+                .unwrap();
+            let close = async {
+                loop {
+                    match socket.next().await {
+                        Some(Ok(WsMessage::Close(frame))) => return frame,
+                        Some(Ok(_)) => {}
+                        other => panic!("expected a close frame, got {other:?}"),
+                    }
+                }
+            };
+            let frame = tokio::time::timeout(Duration::from_secs(5), close)
+                .await
+                .expect("the notary never closed the session")
+                .expect("closed without a close frame");
+            assert_eq!(u16::from(frame.code), 1013, "reason: {}", frame.reason);
+            assert_eq!(frame.reason, "limits store unavailable");
+
+            notary_task.abort();
+        }
+
+        /// The internal port never touches the store: a full session
+        /// completes, attestation and all, against a store that panics on
+        /// every call.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_internal_port_never_touches_the_store() {
+            let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
+            let mut state = NotaryState::for_tests(test_signer().await);
+            state.limits = Arc::new(PanickingStore);
+            let (_, seen, notary_task) = complete_session(Tier::Internal, state).await;
+            assert!(
+                seen.close.is_none(),
+                "the session did not end cleanly: {:?}",
+                seen.close
+            );
             notary_task.abort();
         }
 
