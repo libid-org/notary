@@ -29,6 +29,11 @@ const MAX_HOPS: usize = 64;
 
 /// The identity a per-client limit counts against.
 ///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, which is how every IPv4
+/// peer arrives on a `::` bind) is keyed as the IPv4 address it carries.
+/// Without that, every one of them shares the first six octets, and the
+/// /48 rule below keys the whole IPv4 internet to `::`.
+///
 /// IPv6 is keyed by its /48 prefix. A residential allocation is a /56 and a
 /// site's is a /48, so keying anything finer lets one subscriber mint a new
 /// identity per /64 -- 256 of them from a /56 -- and hold that many times the
@@ -40,7 +45,7 @@ pub struct ClientKey(IpAddr);
 impl ClientKey {
     /// The key `ip` counts against.
     pub fn from_ip(ip: IpAddr) -> Self {
-        match ip {
+        match ip.to_canonical() {
             IpAddr::V4(v4) => Self(IpAddr::V4(v4)),
             IpAddr::V6(v6) => {
                 let mut octets = v6.octets();
@@ -122,6 +127,8 @@ pub fn resolve(
     let line = lines.next();
     let repeated = lines.next().is_some();
 
+    // On a `::` bind an IPv4 peer is `::ffff:a.b.c.d`; `contains` and
+    // `ClientKey::from_ip` both read it as `a.b.c.d`.
     if !contains(trusted, peer.ip()) {
         if line.is_some() && !trusted.is_empty() {
             return Err(Unattributed::Unexpected);
@@ -159,7 +166,11 @@ pub fn resolve(
     Ok(ClientKey::from_ip(*client))
 }
 
+/// Whether `ip` is in any of `nets`. An IPv4-mapped IPv6 address is matched
+/// as its IPv4 address: `IpNet::contains` never matches a v4 network
+/// against a v6 address, mapped or not.
 fn contains(nets: &[IpNet], ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
     nets.iter().any(|net| net.contains(&ip))
 }
 
@@ -244,7 +255,12 @@ mod tests {
     }
 
     fn peer(addr: &str) -> std::net::SocketAddr {
-        format!("{addr}:44321").parse().unwrap()
+        let host = if addr.contains(':') {
+            format!("[{addr}]")
+        } else {
+            addr.to_string()
+        };
+        format!("{host}:44321").parse().unwrap()
     }
 
     fn xff(value: &str) -> HeaderMap {
@@ -420,6 +436,40 @@ mod tests {
         assert_eq!(key("2001:db8:0:1::1"), key("2001:db8:0:ff:ffff::9"));
         assert_eq!(key("2001:db8:0:1::1"), key("2001:db8::1"));
         assert_ne!(key("2001:db8:0:1::1"), key("2001:db8:1::1"));
+    }
+
+    /// On a `::` bind every IPv4 peer is `::ffff:a.b.c.d`. It is keyed as
+    /// `a.b.c.d` -- the /48 rule would otherwise key all of IPv4 to `::` --
+    /// and it matches the IPv4 networks in the trusted list, so the ALB is
+    /// still a proxy and the client it forwards is still the client.
+    #[test]
+    fn an_ipv4_mapped_peer_is_its_ipv4_address() {
+        assert_eq!(key("::ffff:203.0.113.7"), key("203.0.113.7"));
+        assert_ne!(key("::ffff:203.0.113.7"), key("::ffff:203.0.113.8"));
+        assert_ne!(key("::ffff:203.0.113.7"), key("::"));
+
+        // A direct client, and a trusted proxy, both v4-mapped.
+        assert_eq!(
+            resolve(peer("::ffff:203.0.113.7"), &HeaderMap::new(), &alb()),
+            Ok(key("203.0.113.7"))
+        );
+        assert_eq!(
+            resolve(peer("::ffff:10.60.200.31"), &xff("203.0.113.7"), &alb()),
+            Ok(key("203.0.113.7"))
+        );
+        assert_eq!(
+            resolve(peer("::ffff:10.60.200.31"), &HeaderMap::new(), &alb()),
+            Err(Unattributed::Missing)
+        );
+        // A mapped entry in the header, and a mapped proxy hop in it.
+        assert_eq!(
+            resolve(
+                peer("10.60.200.31"),
+                &xff("::ffff:203.0.113.7, ::ffff:10.60.201.4"),
+                &alb()
+            ),
+            Ok(key("203.0.113.7"))
+        );
     }
 
     #[test]

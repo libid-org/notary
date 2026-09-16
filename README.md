@@ -116,7 +116,9 @@ every request arrives from the balancer. On the public port:
   loud on the first request instead of quietly keying every user behind the
   new hop to one address.
 - IPv6 clients are keyed by their /48. A residential allocation is a /56, so
-  keying finer would let one subscriber mint 256 identities.
+  keying finer would let one subscriber mint 256 identities. An IPv4 peer on
+  a `::` bind arrives as `::ffff:a.b.c.d` and is keyed, and matched against
+  `--trusted-proxies`, as `a.b.c.d`.
 
 Our own workloads are not exempted by address: they use the internal ports,
 which have no per-client limits at all (see Listeners).
