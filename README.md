@@ -47,6 +47,9 @@ Flags or environment variables:
 | `--mpc-max-sessions` | `NOTARY_MPC_MAX_SESSIONS` | `4x` | Concurrent MPC-TLS sessions: a count (`16`) or per-core multiplier (`4x`), resolved at startup; provers past it wait, never refused |
 | `--connection-deadline-secs` | `NOTARY_CONNECTION_DEADLINE_SECS` | `300` | Lifetime of one session on either transport, queue time included; past it the connection is dropped |
 | `--setup-deadline-secs` | `NOTARY_SETUP_DEADLINE_SECS` | `15` | How long a connection may sit before starting its session; until it does it holds no session slot |
+| `--max-sessions-per-ip` | `NOTARY_MAX_SESSIONS_PER_IP` | `4` | Concurrent ProxyMode sessions one client may hold; past it the session is closed with code 1013. `0` disables |
+| `--trusted-proxies` | `NOTARY_TRUSTED_PROXIES` | — | Addresses whose `X-Forwarded-For` names the client, as CIDRs; `direct` if nothing proxies this notary |
+| `--exempt-networks` | `NOTARY_EXEMPT_NETWORKS` | — | Networks whose direct connections skip the per-client cap: this cluster's pod subnets |
 
 With a KMS key the private material never enters the process: every signature
 is a `kms:Sign` call.
@@ -60,6 +63,40 @@ TCP port, the browser's first binary frame on the WebSocket — and not when the
 connection is accepted. Opening sockets therefore reserves nothing: an idle
 connection costs a socket until `--setup-deadline-secs` drops it, and the
 session limits bound sessions rather than connection attempts.
+
+### Who a session counts against
+
+The per-client cap needs to know who is calling, and behind a load balancer
+every request arrives from the balancer. Three settings decide it:
+
+- `--trusted-proxies` — the balancer's own subnets. Only from these addresses
+  is `X-Forwarded-For` read, and then right to left, stopping at the first
+  address outside the set. An AWS ALB *appends* to whatever the client sent, so
+  only the rightmost entry is the balancer's own word; everything left of it
+  was written by the caller. A trusted peer that forwards no client, or that
+  sends the header twice, is refused with 400 rather than counted against the
+  balancer — which would quietly make the per-client cap a cap on the whole
+  service.
+- `--exempt-networks` — this cluster's pod subnets. A direct connection from
+  one of them is our own workload and is never capped. Exemption is decided on
+  the socket peer alone, so a request that came through the balancer can never
+  claim it by naming a private address in a header. The two lists may not
+  overlap: a balancer inside the exempt set would exempt the whole internet.
+- Anything else reaching the notary directly is a public client keyed on its
+  own address.
+
+With a per-client cap on a non-loopback bind, an empty `--trusted-proxies` is a
+startup error. Say `direct` to mean it: an empty setting is also what a missing
+environment variable looks like, and the failure it causes looks exactly like
+ordinary load.
+
+For the testnet cluster the values are the ALB's public subnets and the pods'
+private subnets:
+
+```
+NOTARY_TRUSTED_PROXIES=10.60.200.0/24,10.60.201.0/24
+NOTARY_EXEMPT_NETWORKS=10.60.0.0/20,10.60.16.0/20
+```
 
 ## Docker
 

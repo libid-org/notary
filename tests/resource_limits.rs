@@ -9,7 +9,10 @@ use std::{
 };
 
 use clap::Parser;
-use futures_util::SinkExt;
+use futures_util::{
+    SinkExt,
+    StreamExt,
+};
 use notary::{
     limits::Concurrency,
     server,
@@ -18,7 +21,11 @@ use notary::{
 use tokio_tungstenite::{
     connect_async,
     tungstenite,
-    tungstenite::Message,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::HeaderValue,
+        Message,
+    },
 };
 
 /// anvil #0 — public test key.
@@ -53,6 +60,68 @@ fn every_limit_has_a_default() {
     assert_eq!(config.connection_deadline(), Duration::from_secs(300));
     assert_eq!(config.setup_deadline_secs, 15);
     assert_eq!(config.setup_deadline(), Duration::from_secs(15));
+    assert_eq!(config.max_sessions_per_ip, 4);
+    assert_eq!(config.trusted_proxies, "");
+    assert_eq!(config.exempt_networks, "");
+}
+
+/// A per-client cap with nothing to key on is a cap on the whole service, and
+/// it looks exactly like ordinary load. The notary refuses to start instead --
+/// unless it is bound to loopback, where there is no load balancer to hide
+/// behind and `cargo run` must keep working.
+#[test]
+fn a_per_ip_cap_without_trusted_proxies_refuses_to_start() {
+    let public = NotaryServerConfig::try_parse_from([
+        "notary",
+        "--port",
+        "0",
+        "--signing-key",
+        TEST_KEY,
+        "--host",
+        "0.0.0.0",
+    ])
+    .unwrap();
+    let error = public
+        .trusted_proxies()
+        .expect_err("a public bind with a per-client cap and no proxy must not start");
+    assert!(error.contains("--trusted-proxies"), "{error}");
+    assert!(error.contains("direct"), "{error}");
+
+    for allowed in ["direct", "10.60.200.0/24"] {
+        let config = NotaryServerConfig::try_parse_from([
+            "notary",
+            "--port",
+            "0",
+            "--signing-key",
+            TEST_KEY,
+            "--host",
+            "0.0.0.0",
+            "--trusted-proxies",
+            allowed,
+        ])
+        .unwrap();
+        config
+            .trusted_proxies()
+            .unwrap_or_else(|e| panic!("{allowed:?} must start: {e}"));
+    }
+
+    // The cap off needs no proxy setting at all.
+    let uncapped = NotaryServerConfig::try_parse_from([
+        "notary",
+        "--port",
+        "0",
+        "--signing-key",
+        TEST_KEY,
+        "--host",
+        "0.0.0.0",
+        "--max-sessions-per-ip",
+        "0",
+    ])
+    .unwrap();
+    assert!(uncapped.trusted_proxies().unwrap().is_empty());
+
+    // The default bind is loopback, so the whole suite above it still starts.
+    assert!(parse(&[]).unwrap().trusted_proxies().unwrap().is_empty());
 }
 
 #[test]
@@ -220,4 +289,234 @@ async fn until_refused(url: &str) -> tungstenite::Error {
     tokio::time::timeout(Duration::from_secs(5), refused)
         .await
         .expect("the session cap never refused an upgrade")
+}
+
+/// Open a ProxyMode session claiming to come from `client`, as the load
+/// balancer would say it: the notary trusts loopback as its proxy, so the
+/// header this sets is the one the walk lands on.
+async fn session_from(
+    url: &str,
+    client: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    tungstenite::Error,
+> {
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_str(client).unwrap());
+    let (mut socket, _) = connect_async(request).await?;
+    // The slot is spent on a session, so start one.
+    socket
+        .send(Message::Binary(b"\x16\x03\x01".to_vec().into()))
+        .await
+        .expect("the browser sends its first TLS bytes");
+    Ok(socket)
+}
+
+/// The close code and reason the notary ended a session with.
+async fn close_reason(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> (u16, String) {
+    let next = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the notary never answered");
+    match next {
+        Some(Ok(Message::Close(Some(frame)))) => {
+            (frame.code.into(), frame.reason.to_string())
+        }
+        other => panic!("expected a close frame, got: {other:?}"),
+    }
+}
+
+/// A client gets `--max-sessions-per-ip` sessions at once and no more, counted
+/// against the address the load balancer forwarded -- not against the balancer,
+/// which every browser shares.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_per_ip_cap_counts_the_forwarded_client_not_the_proxy() {
+    let ws_port = free_port().await;
+    let config = parse(&[
+        "--ws-port",
+        &ws_port.to_string(),
+        "--max-sessions",
+        "64",
+        "--max-sessions-per-ip",
+        "2",
+        "--trusted-proxies",
+        "127.0.0.0/8",
+    ])
+    .unwrap();
+    let handle = server::run(config).await.expect("server starts");
+    let url = format!(
+        "ws://{}/notarize-proxy",
+        handle.ws_local_addr().expect("ws server enabled")
+    );
+
+    let _first = session_from(&url, "203.0.113.7")
+        .await
+        .expect("first session");
+    let _second = session_from(&url, "203.0.113.7")
+        .await
+        .expect("second session");
+
+    // A third from the same client is upgraded -- the notary has 64 slots --
+    // and then closed, because this client has none.
+    let mut third = session_from(&url, "203.0.113.7")
+        .await
+        .expect("the upgrade itself is not refused");
+    let (code, reason) = close_reason(&mut third).await;
+    assert_eq!(code, 1013, "reason: {reason}");
+    assert!(reason.contains("this client"), "{reason}");
+
+    // A forged prefix does not buy a fresh budget: the balancer's entry is
+    // still the rightmost, and still this client.
+    let mut forged = session_from(&url, "9.9.9.9, 203.0.113.7")
+        .await
+        .expect("upgrade");
+    assert_eq!(close_reason(&mut forged).await.0, 1013);
+
+    // Another client is unaffected -- the cap is per client, and the key is
+    // the forwarded address rather than the proxy every one of these shares.
+    let _other = session_from(&url, "198.51.100.4")
+        .await
+        .expect("a different client must not share the budget");
+
+    handle.shutdown();
+}
+
+/// Our own pods dial the Service directly, and are not capped. Without this
+/// the protocol would rate-limit itself: one backend pod is one address, and
+/// every user it serves would queue behind the same handful of slots.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_direct_connection_from_an_exempt_network_is_never_capped() {
+    let ws_port = free_port().await;
+    let config = parse(&[
+        "--ws-port",
+        &ws_port.to_string(),
+        "--max-sessions",
+        "64",
+        "--max-sessions-per-ip",
+        "1",
+        // Nothing proxies this notary, and loopback is "our own network" --
+        // the shape the cluster has, with the ALB absent instead of trusted.
+        "--trusted-proxies",
+        "direct",
+        "--exempt-networks",
+        "127.0.0.0/8",
+    ])
+    .unwrap();
+    let handle = server::run(config).await.expect("server starts");
+    let url = format!(
+        "ws://{}/notarize-proxy",
+        handle.ws_local_addr().expect("ws server enabled")
+    );
+
+    // Four sessions from one address, against a cap of one. None is refused,
+    // and none needs a header to be let through.
+    let mut internal = Vec::new();
+    for i in 0..4 {
+        let (mut socket, _) = connect_async(&url)
+            .await
+            .unwrap_or_else(|e| panic!("internal session {i} was refused: {e}"));
+        socket
+            .send(Message::Binary(b"\x16\x03\x01".to_vec().into()))
+            .await
+            .expect("first bytes");
+        internal.push(socket);
+    }
+
+    // Nothing was closed for exceeding a cap.
+    for (i, socket) in internal.iter_mut().enumerate() {
+        if let Ok(Some(Ok(Message::Close(Some(frame))))) =
+            tokio::time::timeout(Duration::from_millis(300), socket.next()).await
+        {
+            assert_ne!(
+                u16::from(frame.code),
+                1013,
+                "internal session {i} was capped: {}",
+                frame.reason
+            );
+        }
+    }
+
+    handle.shutdown();
+}
+
+/// A load balancer inside the exempt set would exempt the whole internet.
+#[test]
+fn exempt_networks_may_not_contain_a_trusted_proxy() {
+    let config = parse(&[
+        "--trusted-proxies",
+        "10.60.200.0/24",
+        "--exempt-networks",
+        "10.60.0.0/16",
+    ])
+    .unwrap();
+    let proxies = config.trusted_proxies().unwrap();
+    let error = config
+        .exempt_networks(&proxies)
+        .expect_err("an exempt load balancer must not start");
+    assert!(error.contains("--exempt-networks"), "{error}");
+    assert!(error.contains("--trusted-proxies"), "{error}");
+
+    // The real pair does not overlap: pods are in the private /20s, the ALB in
+    // the public /24s.
+    let config = parse(&[
+        "--trusted-proxies",
+        "10.60.200.0/24,10.60.201.0/24",
+        "--exempt-networks",
+        "10.60.0.0/20,10.60.16.0/20",
+    ])
+    .unwrap();
+    let proxies = config.trusted_proxies().unwrap();
+    assert_eq!(config.exempt_networks(&proxies).unwrap().len(), 2);
+}
+
+/// Behind a trusted proxy the header is the only evidence of who is calling.
+/// Missing, or arriving twice, it is refused at the upgrade -- never treated
+/// as "the proxy is the client", which would key every browser together.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unattributable_request_is_refused_at_the_upgrade() {
+    let ws_port = free_port().await;
+    let config = parse(&[
+        "--ws-port",
+        &ws_port.to_string(),
+        "--trusted-proxies",
+        "127.0.0.0/8",
+    ])
+    .unwrap();
+    let handle = server::run(config).await.expect("server starts");
+    let url = format!(
+        "ws://{}/notarize-proxy",
+        handle.ws_local_addr().expect("ws server enabled")
+    );
+
+    let refused = connect_async(&url)
+        .await
+        .expect_err("no forwarded client must not be keyed to the proxy");
+    let tungstenite::Error::Http(response) = refused else {
+        panic!("expected an HTTP refusal, got: {refused}");
+    };
+    assert_eq!(response.status(), 400);
+
+    let mut request = url.as_str().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .append("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+    request
+        .headers_mut()
+        .append("x-forwarded-for", HeaderValue::from_static("9.9.9.9"));
+    let repeated = connect_async(request)
+        .await
+        .expect_err("two forwarded-for lines must not be joined and guessed at");
+    let tungstenite::Error::Http(response) = repeated else {
+        panic!("expected an HTTP refusal, got: {repeated}");
+    };
+    assert_eq!(response.status(), 400);
+
+    handle.shutdown();
 }

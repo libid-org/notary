@@ -15,6 +15,7 @@
 //! as a library so tests can embed [`run`]; the prover-side helpers for the
 //! JWKS reading live in the keeper, on libid-rs's primitives.
 
+pub mod client_ip;
 pub mod config;
 pub mod error;
 pub mod limits;

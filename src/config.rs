@@ -2,7 +2,10 @@
 
 use clap::Parser;
 
-use crate::limits::Concurrency;
+use crate::{
+    client_ip::parse_networks,
+    limits::Concurrency,
+};
 
 /// Configuration for the notary server.
 #[derive(Parser, Debug)]
@@ -88,6 +91,51 @@ pub struct NotaryServerConfig {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub setup_deadline_secs: u64,
+
+    /// Max concurrent ProxyMode sessions from one client. `0` disables the
+    /// per-client cap entirely.
+    ///
+    /// Concurrency, not request rate, because that is what a session costs:
+    /// one relay task, its transcript, and up to `--proxy-max-bytes`, held
+    /// until it ends. A request-rate limit counts the upgrade and is then
+    /// blind for the whole `--connection-deadline-secs`, so a client within
+    /// any rate can still accumulate sessions until the pod runs out of
+    /// memory. One browser ceremony opens two sessions at once, so the
+    /// default leaves a user one ceremony of headroom -- and a shared office
+    /// address two users.
+    ///
+    /// Needs `--trusted-proxies` to mean anything behind a load balancer; see
+    /// there.
+    #[arg(long, env = "NOTARY_MAX_SESSIONS_PER_IP", default_value_t = 4)]
+    pub max_sessions_per_ip: usize,
+
+    /// Addresses whose `X-Forwarded-For` is believed: the proxies in front of
+    /// this notary, as a comma-separated list of CIDRs or addresses. The
+    /// literal `direct` says nothing proxies this notary.
+    ///
+    /// Behind a load balancer every request arrives from it, so without this
+    /// a per-client cap is a global cap -- and it fails quietly, because the
+    /// notary looks merely busy. Set the load balancer's own subnets, not the
+    /// whole VPC: anything inside the trusted set can name its own client.
+    ///
+    /// Spelled out rather than inferred, because an empty setting is also
+    /// what a missing environment variable looks like. With a per-client cap
+    /// on a non-loopback address, an empty setting refuses to start.
+    #[arg(long, env = "NOTARY_TRUSTED_PROXIES", default_value = "")]
+    pub trusted_proxies: String,
+
+    /// Networks whose DIRECT connections are exempt from the per-client cap:
+    /// this cluster's pod subnets, as a comma-separated list of CIDRs.
+    ///
+    /// Our own services are part of the protocol, not users of it, and a cap
+    /// on them is a cap on the protocol against itself. Exemption is decided
+    /// on the socket peer alone, so a request that came through a proxy can
+    /// never claim it by naming a private address in a header.
+    ///
+    /// Must not overlap `--trusted-proxies`: a load balancer inside the exempt
+    /// set would exempt everything it forwards, which is the whole internet.
+    #[arg(long, env = "NOTARY_EXEMPT_NETWORKS", default_value = "")]
+    pub exempt_networks: String,
 }
 
 impl NotaryServerConfig {
@@ -99,5 +147,60 @@ impl NotaryServerConfig {
     /// `--setup-deadline-secs` as a duration.
     pub fn setup_deadline(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.setup_deadline_secs)
+    }
+
+    /// `--trusted-proxies` as networks, checked against the rest of the
+    /// configuration.
+    ///
+    /// The error is a startup failure by design. A per-client cap with no
+    /// trusted proxy behind a load balancer serves `--max-sessions-per-ip`
+    /// browsers worldwide and refuses everyone else, which is indistinguishable
+    /// from real load; refusing to start is the only version of that an
+    /// operator notices.
+    pub fn trusted_proxies(&self) -> Result<Vec<ipnet::IpNet>, String> {
+        let proxies = parse_networks(&self.trusted_proxies)?;
+        let bound_locally = self
+            .host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+        if self.max_sessions_per_ip > 0
+            && proxies.is_empty()
+            && self.trusted_proxies.trim() != "direct"
+            && !bound_locally
+        {
+            return Err(format!(
+                "--max-sessions-per-ip is {} but --trusted-proxies is empty: \
+                 behind a load balancer every request would share one key and \
+                 the cap would apply to the whole service. Set the balancer's \
+                 subnets, or \"direct\" if nothing proxies this notary, or \
+                 0 to disable the cap",
+                self.max_sessions_per_ip
+            ));
+        }
+        Ok(proxies)
+    }
+
+    /// `--exempt-networks` as networks, checked against the proxies.
+    ///
+    /// A load balancer inside the exempt set would exempt everything it
+    /// forwards, so the overlap is a startup error rather than a limit that
+    /// silently applies to nobody.
+    pub fn exempt_networks(
+        &self,
+        proxies: &[ipnet::IpNet],
+    ) -> Result<Vec<ipnet::IpNet>, String> {
+        let exempt = parse_networks(&self.exempt_networks)?;
+        for proxy in proxies {
+            if let Some(net) = exempt
+                .iter()
+                .find(|net| net.contains(&proxy.addr()) || proxy.contains(&net.addr()))
+            {
+                return Err(format!(
+                    "--exempt-networks {net} overlaps --trusted-proxies {proxy}: \
+                     every request the proxy forwards would be exempt"
+                ));
+            }
+        }
+        Ok(exempt)
     }
 }
