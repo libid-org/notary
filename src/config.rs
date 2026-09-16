@@ -35,12 +35,18 @@ pub struct NotaryServerConfig {
     #[arg(long, env = "NOTARY_WS_PORT", default_value_t = 7048)]
     pub ws_port: u16,
 
-    /// The internal HTTP/WebSocket port: ProxyMode for our own services, with
-    /// no per-client limits and no client address header read. Off unless
-    /// set, for the same reason as `--port`. The conventional value is 7049;
-    /// `0` binds an ephemeral port.
-    #[arg(long, env = "NOTARY_INTERNAL_WS_PORT")]
-    pub internal_ws_port: Option<u16>,
+    /// Mount `GET /internal/notarize-proxy` on the public port: ProxyMode for
+    /// our own in-cluster services, with no per-client limits, its own
+    /// session pool (`--internal-max-sessions`), and the limits store never
+    /// consulted. Off unless set; without it the route does not exist (404).
+    ///
+    /// The route MUST be blocked at the load balancer -- a fixed-response 403
+    /// for `/internal/*` -- because nothing on it limits a caller. As defence
+    /// in depth the notary answers 403 itself whenever the request carries
+    /// `X-Forwarded-For` or `CF-Connecting-IP`, since the balancer always adds
+    /// one; that backstop is not the control.
+    #[arg(long, env = "NOTARY_INTERNAL_PROXY_ROUTE")]
+    pub internal_proxy_route: bool,
 
     /// Notary signing key: a hex-encoded secp256k1 private key, or
     /// `kms:<key-id-or-alias>` for an AWS KMS key.
@@ -57,8 +63,8 @@ pub struct NotaryServerConfig {
     #[arg(long, env = "NOTARY_MAX_SESSIONS", default_value_t = 1024)]
     pub max_sessions: usize,
 
-    /// Max concurrent ProxyMode sessions on the internal port. Its own pool,
-    /// so public load can never queue our own services behind it.
+    /// Max concurrent ProxyMode sessions on the internal route. Its own
+    /// pool, so public load can never queue our own services behind it.
     #[arg(long, env = "NOTARY_INTERNAL_MAX_SESSIONS", default_value_t = 1024)]
     pub internal_max_sessions: usize,
 
@@ -172,7 +178,8 @@ pub struct NotaryServerConfig {
     /// can reach the public port directly can set it and choose its own
     /// key, so the public port must be reachable only through the load
     /// balancer. That is the deployment's job, not the notary's. The
-    /// internal ports read no header at all.
+    /// internal route keys on no header; a request there carrying one is
+    /// refused.
     #[arg(
         long,
         env = "NOTARY_CLIENT_IP_HEADER",

@@ -1,7 +1,6 @@
-//! The port is the classifier: what the internal HTTP listener does not
-//! count, what both listeners answer on `/healthcheck`, how a store that
-//! cannot be reached fails the start, and what SIGTERM does to the real
-//! binary.
+//! The route is the classifier: when the internal ProxyMode route exists,
+//! what it refuses and what it does not count, how a store that cannot be
+//! reached fails the start, and what SIGTERM does to the real binary.
 
 mod common;
 
@@ -49,13 +48,29 @@ fn parse(args: &[&str]) -> NotaryServerConfig {
     NotaryServerConfig::parse_from(all)
 }
 
+/// The public ProxyMode route on `addr`.
+fn public_url(addr: impl std::fmt::Display) -> String {
+    format!("ws://{addr}/notarize-proxy")
+}
+
+/// The internal ProxyMode route, on the same port as the public one.
+fn internal_url(addr: impl std::fmt::Display) -> String {
+    format!("ws://{addr}/internal/notarize-proxy")
+}
+
 /// Open a ProxyMode session and start it, the way the browser does, naming
-/// `client` in `X-Forwarded-For` as the load balancer would.
-async fn session_from(url: &str, client: &str) -> Result<Socket, tungstenite::Error> {
+/// `client` in `X-Forwarded-For` as the load balancer would -- or naming
+/// nobody, as a service inside the cluster does on the internal route.
+async fn session_from(
+    url: &str,
+    client: Option<&str>,
+) -> Result<Socket, tungstenite::Error> {
     let mut request = url.into_client_request().unwrap();
-    request
-        .headers_mut()
-        .insert("x-forwarded-for", HeaderValue::from_str(client).unwrap());
+    if let Some(client) = client {
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", HeaderValue::from_str(client).unwrap());
+    }
     let (mut socket, _) = connect_async(request).await?;
     socket
         .send(Message::Binary(b"\x16\x03\x01".to_vec().into()))
@@ -78,37 +93,103 @@ async fn holds(socket: &mut Socket, wait: Duration) -> bool {
     tokio::time::timeout(wait, closed).await.is_err()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn the_internal_http_listener_is_off_unless_configured() {
-    let handle = server::run(parse(&["--ws-port", "0"]))
-        .await
-        .expect("server starts");
-    assert!(handle.internal_ws_local_addr().is_none());
-    assert!(handle.ws_local_addr().is_none());
-    handle.shutdown();
+/// How an upgrade was refused, as the browser sees it.
+fn refusal(error: tungstenite::Error) -> (u16, String) {
+    let tungstenite::Error::Http(response) = error else {
+        panic!("expected an HTTP refusal, got: {error}");
+    };
+    let body = response
+        .body()
+        .as_deref()
+        .map(|body| String::from_utf8_lossy(body).into_owned())
+        .unwrap_or_default();
+    (response.status().as_u16(), body)
+}
 
-    let handle = server::run(parse(&["--ws-port", "0", "--internal-ws-port", "0"]))
-        .await
-        .expect("server starts");
-    let addr = handle
-        .internal_ws_local_addr()
-        .expect("an ephemeral internal port");
-    assert_ne!(addr.port(), 0);
+/// Without `--internal-proxy-route` the internal route does not exist: a
+/// 404 like any other path, header or no header.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_internal_route_is_absent_unless_configured() {
+    let (handle, _) =
+        common::start_server(|ws_port| parse(&["--ws-port", &ws_port.to_string()])).await;
+    let internal = internal_url(handle.ws_local_addr().unwrap());
+
+    for client in [None, Some("203.0.113.7")] {
+        let (status, _) = refusal(
+            session_from(&internal, client)
+                .await
+                .expect_err("the internal route must not exist"),
+        );
+        assert_eq!(status, 404, "client {client:?}");
+    }
     handle.shutdown();
 }
 
-/// Every per-client limit is on and set to one; the internal port ignores
-/// all of them, and the public port refuses the second session -- at the
+/// With `--internal-proxy-route` the route admits a request that came from
+/// inside the cluster -- no forwarding header -- and refuses one that came
+/// through a proxy, whichever header the proxy set, with 403 and a body
+/// that names the rule. The balancer is meant to answer that 403 itself;
+/// this is the backstop.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_internal_route_refuses_a_proxied_request_and_admits_a_direct_one() {
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&["--ws-port", &ws_port.to_string(), "--internal-proxy-route"])
+    })
+    .await;
+    let internal = internal_url(handle.ws_local_addr().unwrap());
+
+    for header in ["x-forwarded-for", "cf-connecting-ip"] {
+        let mut request = internal.as_str().into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert(header, HeaderValue::from_static("203.0.113.7"));
+        let (status, body) = refusal(
+            connect_async(request)
+                .await
+                .expect_err("a proxied request must be refused"),
+        );
+        assert_eq!(status, 403, "{header}");
+        assert_eq!(
+            body, "internal route is not served through a proxy",
+            "{header}"
+        );
+    }
+
+    let mut direct = session_from(&internal, None)
+        .await
+        .expect("a direct request is admitted");
+    assert!(
+        holds(&mut direct, Duration::from_millis(300)).await,
+        "the direct session was closed"
+    );
+    handle.shutdown();
+}
+
+/// The route rides the public port, so asking for it with that port off is
+/// a configuration that cannot mean anything: a startup error, not a
+/// notary that comes up without the route it was told to serve.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_internal_route_needs_the_public_port() {
+    let error = server::run(parse(&["--ws-port", "0", "--internal-proxy-route"]))
+        .await
+        .err()
+        .expect("--internal-proxy-route with --ws-port 0 must not start")
+        .to_string();
+    assert!(error.contains("--internal-proxy-route"), "{error}");
+    assert!(error.contains("--ws-port 0"), "{error}");
+}
+
+/// Every per-client limit is on and set to one; the internal route ignores
+/// all of them, and the public route refuses the second session -- at the
 /// upgrade, with 429, because the upgrades window is checked before the
 /// session's lease is taken.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_internal_port_counts_nothing_per_client() {
+async fn the_internal_route_counts_nothing_per_client() {
     let (handle, _) = common::start_server(|ws_port| {
         parse(&[
             "--ws-port",
             &ws_port.to_string(),
-            "--internal-ws-port",
-            "0",
+            "--internal-proxy-route",
             "--max-sessions-per-ip",
             "1",
             "--per-ip-upgrades",
@@ -118,17 +199,14 @@ async fn the_internal_port_counts_nothing_per_client() {
         ])
     })
     .await;
-    let internal = format!(
-        "ws://{}/notarize-proxy",
-        handle.internal_ws_local_addr().unwrap()
-    );
-    let public = format!("ws://{}/notarize-proxy", handle.ws_local_addr().unwrap());
+    let internal = internal_url(handle.ws_local_addr().unwrap());
+    let public = public_url(handle.ws_local_addr().unwrap());
 
     // Three at once from one peer, all past the upgrade and the first
-    // frame, and all still running: no lease, no window, no header read.
+    // frame, and all still running: no lease, no window, no header.
     let mut internal_sessions = Vec::new();
     for n in 1..=3 {
-        let socket = session_from(&internal, "203.0.113.7")
+        let socket = session_from(&internal, None)
             .await
             .unwrap_or_else(|e| panic!("internal session {n}: {e}"));
         internal_sessions.push(socket);
@@ -141,12 +219,12 @@ async fn the_internal_port_counts_nothing_per_client() {
         );
     }
 
-    // The same client on the public port: one session, then 429.
-    let mut first = session_from(&public, "203.0.113.7")
+    // One client on the public route: one session, then 429.
+    let mut first = session_from(&public, Some("203.0.113.7"))
         .await
         .expect("the first public session");
     assert!(holds(&mut first, Duration::from_millis(300)).await);
-    let refused = session_from(&public, "203.0.113.7")
+    let refused = session_from(&public, Some("203.0.113.7"))
         .await
         .expect_err("a second public session from one client must be refused");
     let tungstenite::Error::Http(response) = refused else {
@@ -191,35 +269,37 @@ async fn an_unreachable_limits_store_fails_the_start() {
     assert!(error.contains("postgres://127.0.0.1:1/x"), "{error}");
 }
 
+/// `/healthcheck` answers 200 on the public port, with or without the
+/// internal route mounted beside it.
 #[tokio::test(flavor = "multi_thread")]
-async fn healthcheck_is_ok_on_both_listeners() {
-    let (handle, _) = common::start_server(|ws_port| {
-        parse(&["--ws-port", &ws_port.to_string(), "--internal-ws-port", "0"])
-    })
-    .await;
-    let client = reqwest::Client::new();
-    for addr in [
-        handle.ws_local_addr().unwrap(),
-        handle.internal_ws_local_addr().unwrap(),
-    ] {
-        let response = client
+async fn healthcheck_is_ok_with_and_without_the_internal_route() {
+    for flags in [&[][..], &["--internal-proxy-route"][..]] {
+        let (handle, _) = common::start_server(|ws_port| {
+            let mut args = vec!["--ws-port"];
+            let port = ws_port.to_string();
+            args.push(&port);
+            args.extend_from_slice(flags);
+            parse(&args)
+        })
+        .await;
+        let addr = handle.ws_local_addr().unwrap();
+        let response = reqwest::Client::new()
             .get(format!("http://{addr}/healthcheck"))
             .send()
             .await
             .expect("GET /healthcheck");
-        assert_eq!(response.status(), 200, "{addr}");
+        assert_eq!(response.status(), 200, "{flags:?}");
         let body: serde_json::Value = response.json().await.unwrap();
-        assert_eq!(body["status"], "ok", "{addr}");
+        assert_eq!(body["status"], "ok", "{flags:?}");
+        handle.shutdown();
     }
-    handle.shutdown();
 }
 
-/// The three listeners of a spawned notary, on ports reserved up front:
-/// its stdout is not read, so ephemeral ports could not be learned.
+/// The two listeners of a spawned notary, on ports reserved up front: its
+/// stdout is not read, so ephemeral ports could not be learned.
 struct Ports {
     mpc: u16,
     public: u16,
-    internal: u16,
 }
 
 impl Ports {
@@ -227,17 +307,21 @@ impl Ports {
         Self {
             mpc: common::free_port().await,
             public: common::free_port().await,
-            internal: common::free_port().await,
         }
     }
 
-    fn ws(&self, port: u16) -> String {
-        format!("ws://127.0.0.1:{port}/notarize-proxy")
+    fn public(&self) -> String {
+        public_url(format!("127.0.0.1:{}", self.public))
+    }
+
+    fn internal(&self) -> String {
+        internal_url(format!("127.0.0.1:{}", self.public))
     }
 }
 
-/// The real binary, with the memory store, on three ports reserved up
-/// front; returns once its public health check answers 200. A start that
+/// The real binary, with the memory store and the internal route, on two
+/// ports reserved up front; returns once its public health check answers
+/// 200. A start that
 /// lost a port race exits at once instead, and is retried on fresh ports,
 /// up to [`common::TRIES`] times; an exit for any other reason fails the
 /// test with the process's stderr.
@@ -256,7 +340,8 @@ async fn spawn_notary() -> (Spawned, Ports) {
     panic!("no free ports in {} tries", common::TRIES)
 }
 
-/// The real binary, on `ports`, with the memory store, its stderr kept.
+/// The real binary, on `ports`, with the memory store and the internal
+/// route, its stderr kept.
 fn spawn_on(ports: &Ports) -> Spawned {
     let mut child = Command::new(env!("CARGO_BIN_EXE_notary"))
         .args([
@@ -266,8 +351,7 @@ fn spawn_on(ports: &Ports) -> Spawned {
             &ports.mpc.to_string(),
             "--ws-port",
             &ports.public.to_string(),
-            "--internal-ws-port",
-            &ports.internal.to_string(),
+            "--internal-proxy-route",
             "--limits-store",
             "memory",
             "--signing-key",
@@ -346,20 +430,10 @@ async fn until_draining(port: u16) {
 }
 
 /// A ProxyMode session past its first frame on `url`: the drain must wait
-/// for it. `client` is named in `X-Forwarded-For`, which the public port
-/// requires and the internal port never reads.
+/// for it. `client` is named in `X-Forwarded-For`, which the public route
+/// requires and the internal route refuses.
 async fn ws_session(url: &str, client: Option<&str>) -> Socket {
-    let mut request = url.into_client_request().unwrap();
-    if let Some(client) = client {
-        request
-            .headers_mut()
-            .insert("x-forwarded-for", HeaderValue::from_str(client).unwrap());
-    }
-    let (mut socket, _) = connect_async(request).await.expect("upgrade");
-    socket
-        .send(Message::Binary(b"\x16\x03\x01".to_vec().into()))
-        .await
-        .unwrap();
+    let mut socket = session_from(url, client).await.expect("upgrade");
     assert!(holds(&mut socket, Duration::from_millis(200)).await);
     socket
 }
@@ -379,7 +453,7 @@ async fn exit_status(notary: &mut Spawned, within: Duration) -> std::process::Ex
         .unwrap_or_else(|_| panic!("the notary did not exit within {within:?}"))
 }
 
-/// Which listener's session is the last one a drain waits for.
+/// Whose session is the last one a drain waits for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Last {
     Public,
@@ -389,17 +463,16 @@ enum Last {
 
 /// The real binary under SIGTERM: the health check flips to 503 at once,
 /// new upgrades are refused with 503, and the process exits -- with 0 --
-/// only once the last session has ended. One session is held on every
-/// listener, the other two are closed first, and `last` alone must keep
-/// the process alive: each listener's sessions are counted on their own.
+/// only once the last session has ended. One session is held on each
+/// route and on the MPC port, the other two are closed first, and `last`
+/// alone must keep the process alive: each is counted on its own.
 async fn sigterm_drains_then_exits_zero(last: Last) {
     let (mut notary, ports) = spawn_notary().await;
 
-    // One session on every listener, each past the point where it counts:
-    // the browser's first frame on both HTTP ports, the prover's first byte
-    // on the MPC port.
-    let mut public = Some(ws_session(&ports.ws(ports.public), Some("203.0.113.7")).await);
-    let mut internal = Some(ws_session(&ports.ws(ports.internal), None).await);
+    // One session on each route and on the MPC port, each past the point
+    // where it counts: the browser's first frame, the prover's first byte.
+    let mut public = Some(ws_session(&ports.public(), Some("203.0.113.7")).await);
+    let mut internal = Some(ws_session(&ports.internal(), None).await);
     let mut mpc = tokio::net::TcpStream::connect(("127.0.0.1", ports.mpc))
         .await
         .expect("MPC connect");
@@ -419,7 +492,7 @@ async fn sigterm_drains_then_exits_zero(last: Last) {
     // Nothing new is taken while draining -- and the listener is still
     // open to say so, because a closed port reads as a crash. The client is
     // named, so the draining check is the only thing that can refuse.
-    let mut request = ports.ws(ports.public).into_client_request().unwrap();
+    let mut request = ports.public().into_client_request().unwrap();
     request
         .headers_mut()
         .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
@@ -478,11 +551,11 @@ async fn sigterm_waits_for_the_mpc_session_then_exits_zero() {
 
 /// A second SIGTERM while draining is an operator who will not wait: the
 /// process exits at once, still with 0, and the session it was waiting for
-/// is cut off. Any session will do; the internal port's needs no client.
+/// is cut off. Any session will do; the internal route's needs no client.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_sigterm_exits_zero_without_waiting() {
     let (mut notary, ports) = spawn_notary().await;
-    let mut holder = ws_session(&ports.ws(ports.internal), None).await;
+    let mut holder = ws_session(&ports.internal(), None).await;
 
     notary.signal(libc::SIGTERM);
     until_draining(ports.public).await;

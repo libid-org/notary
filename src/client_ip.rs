@@ -26,8 +26,9 @@
 //! A request without the header is refused, never keyed on the socket peer:
 //! falling back to the peer would key every proxied request to the balancer,
 //! and the per-client cap would quietly become a cap on the whole service --
-//! which looks exactly like real load. The internal listeners never call
-//! this: our own services are the protocol, not users of it.
+//! which looks exactly like real load. The MPC-TLS port and the internal
+//! route never call this: our own services are the protocol, not users of
+//! it.
 
 use std::net::{
     IpAddr,
