@@ -136,8 +136,8 @@ impl PostgresStore {
     /// password never appears in the error.
     ///
     /// The schema goes in over a connection of its own, opened under
-    /// [`CONNECT_TIMEOUT`]: the pool bounds every acquire, the first
-    /// included, by [`ACQUIRE_TIMEOUT`], which is right for a request and
+    /// `CONNECT_TIMEOUT`: the pool bounds every acquire, the first
+    /// included, by `ACQUIRE_TIMEOUT`, which is right for a request and
     /// short for a cold start. The pool itself connects on first use.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let description = format!("postgres ({})", redact(url));

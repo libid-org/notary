@@ -85,7 +85,7 @@ pub enum Unattributed {
     /// so refusing costs nothing real.
     Repeated,
     /// An entry was not an IP address, or the chain was longer than
-    /// [`MAX_HOPS`].
+    /// `MAX_HOPS` (64).
     Malformed,
 }
 
