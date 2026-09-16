@@ -7,6 +7,8 @@
 //!   opened. Nothing here dispatches on the server name: the record carries
 //!   it, and the contract that reads the record pins it.
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
+//! - **GET  /healthcheck**: `{"status":"ok"}`, or 503 `{"status":"draining"}`
+//!   once the process has been told to stop.
 //! - **GET /notarize-proxy** (WS upgrade): ProxyMode session followed by one
 //!   length-prefixed ceremony attestation in its own WebSocket message.
 //!
@@ -34,6 +36,7 @@ use std::{
     sync::{
         atomic::{
             AtomicBool,
+            AtomicUsize,
             Ordering,
         },
         Arc,
@@ -107,6 +110,7 @@ use tokio::{
     net::TcpListener,
     sync::{
         watch,
+        Notify,
         Semaphore,
         TryAcquireError,
     },
@@ -147,12 +151,27 @@ use crate::{
     },
 };
 
+/// How far along the server is in stopping. The listeners watch this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Accepting everything.
+    Running,
+    /// Told to stop: the MPC listener is closed, the HTTP listeners answer
+    /// only to say so (503), and the sessions already running finish.
+    Draining,
+    /// Every session is done or out of time; the HTTP listeners close.
+    Stopped,
+}
+
 /// Handle for controlling the running notary server.
 pub struct NotaryServerHandle {
     local_addr: Option<SocketAddr>,
     ws_local_addr: Option<SocketAddr>,
     internal_ws_local_addr: Option<SocketAddr>,
-    shutdown: watch::Sender<bool>,
+    phase: watch::Sender<Phase>,
+    draining: Arc<AtomicBool>,
+    in_flight: Arc<InFlight>,
+    connection_deadline: Duration,
 }
 
 impl NotaryServerHandle {
@@ -174,10 +193,85 @@ impl NotaryServerHandle {
         self.internal_ws_local_addr
     }
 
-    /// Signals every background task (TCP accept loop and HTTP servers) to
-    /// stop.
+    /// Stops every listener now, without waiting for the sessions in
+    /// flight. For tests; a deployment calls [`NotaryServerHandle::drain`].
     pub fn shutdown(self) {
-        let _ = self.shutdown.send(true);
+        self.draining.store(true, Ordering::SeqCst);
+        let _ = self.phase.send(Phase::Stopped);
+    }
+
+    /// Stop taking work, finish what is running, then stop the listeners.
+    ///
+    /// The health check answers 503 from the first moment, so the load
+    /// balancer stops routing here while the sessions already running
+    /// finish; the MPC listener closes at once and its queue empties with an
+    /// error. The HTTP listeners keep answering -- 503 to every upgrade --
+    /// until the last session ends or the connection deadline elapses,
+    /// because a closed port looks like a crash to the balancer and a 503
+    /// looks like what it is. Then they close too, and this returns.
+    pub async fn drain(self) {
+        self.draining.store(true, Ordering::SeqCst);
+        let _ = self.phase.send(Phase::Draining);
+        let open = self.in_flight.count();
+        info!(
+            sessions = open,
+            deadline_secs = self.connection_deadline.as_secs(),
+            "draining: no new sessions; waiting for the ones in flight"
+        );
+        match tokio::time::timeout(self.connection_deadline, self.in_flight.idle()).await
+        {
+            Ok(()) => info!("drained: every session finished"),
+            Err(_) => warn!(
+                sessions = self.in_flight.count(),
+                "drain deadline reached with sessions still running; stopping anyway"
+            ),
+        }
+        let _ = self.phase.send(Phase::Stopped);
+    }
+}
+
+/// The sessions running right now, on every listener, so a drain knows when
+/// it is done. A connection counts from the moment its handler starts to the
+/// moment it returns: the setup and connection deadlines already bound both.
+#[derive(Debug, Default)]
+struct InFlight {
+    count: AtomicUsize,
+    idle: Notify,
+}
+
+impl InFlight {
+    /// Count one more connection until the guard drops.
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        InFlightGuard(Arc::clone(self))
+    }
+
+    fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once nothing is in flight. Registers for the wake-up before
+    /// reading the count, so a guard dropped in between is not missed.
+    async fn idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.count() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct InFlightGuard(Arc<InFlight>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
     }
 }
 
@@ -294,6 +388,11 @@ struct NotaryState {
     /// else.
     setup_deadline: Duration,
     public_key_hex: String,
+    /// Set once the process has been told to stop: the health check says
+    /// so, and no upgrade is accepted.
+    draining: Arc<AtomicBool>,
+    /// The connections a drain waits for.
+    in_flight: Arc<InFlight>,
 }
 
 #[cfg(test)]
@@ -317,6 +416,8 @@ impl NotaryState {
             mpc_sessions: Arc::new(Semaphore::new(4)),
             connection_deadline: Duration::from_secs(300),
             setup_deadline: Duration::from_secs(15),
+            draining: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(InFlight::default()),
         }
     }
 }
@@ -408,10 +509,12 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         connection_deadline: config.connection_deadline(),
         setup_deadline: config.setup_deadline(),
         public_key_hex,
+        draining: Arc::new(AtomicBool::new(false)),
+        in_flight: Arc::new(InFlight::default()),
     };
 
-    // Broadcast shutdown to the listeners.
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Broadcast the phase to the listeners.
+    let (phase_tx, phase_rx) = watch::channel(Phase::Running);
 
     // ── Internal MPC-TLS listener (Rust provers in the cluster) ───────
     // Off unless configured: it has no per-client limits.
@@ -453,7 +556,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
 
     if let Some(tcp_listener) = tcp_listener {
         let tcp_state = state.clone();
-        let mut tcp_shutdown = shutdown_rx.clone();
+        let mut tcp_phase = phase_rx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -462,7 +565,9 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
                             Ok((stream, peer)) => {
                                 info!("TCP connection from {}", peer);
                                 let s = tcp_state.clone();
+                                let in_flight = s.in_flight.enter();
                                 tokio::spawn(async move {
+                                    let _in_flight = in_flight;
                                     if let Err(e) = handle_tcp_prover(stream, &s).await {
                                         error!("TCP handler error for {}: {}", peer, e);
                                     }
@@ -471,7 +576,8 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
                             Err(e) => error!("TCP accept failed: {}", e),
                         }
                     }
-                    _ = tcp_shutdown.changed() => {
+                    // Any change is at least Draining: stop accepting.
+                    _ = tcp_phase.changed() => {
                         info!("Notary TCP shutting down");
                         // Provers still waiting for a slot fail now with a clear
                         // error; the ones holding a slot keep it to the end.
@@ -484,17 +590,20 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     }
 
     if let Some(listener) = ws_listener {
-        spawn_http_server(listener, Tier::Public, state.clone(), shutdown_rx.clone());
+        spawn_http_server(listener, Tier::Public, state.clone(), phase_rx.clone());
     }
     if let Some(listener) = internal_ws_listener {
-        spawn_http_server(listener, Tier::Internal, state.clone(), shutdown_rx.clone());
+        spawn_http_server(listener, Tier::Internal, state.clone(), phase_rx.clone());
     }
 
     Ok(NotaryServerHandle {
         local_addr,
         ws_local_addr,
         internal_ws_local_addr,
-        shutdown: shutdown_tx,
+        phase: phase_tx,
+        draining: Arc::clone(&state.draining),
+        in_flight: Arc::clone(&state.in_flight),
+        connection_deadline: state.connection_deadline,
     })
 }
 
@@ -507,17 +616,20 @@ fn router(tier: Tier, notary: NotaryState) -> Router {
         .allow_methods(Any);
     Router::new()
         .route("/info", get(info_handler))
+        .route("/healthcheck", get(healthcheck_handler))
         .route("/notarize-proxy", get(notarize_proxy_ws_handler))
         .layer(cors)
         .with_state(ListenerState { tier, notary })
 }
 
-/// Serve `router(tier, state)` on `listener` until shutdown.
+/// Serve `router(tier, state)` on `listener` until the phase reaches
+/// `Stopped`. Draining keeps the listener open on purpose: the health check
+/// has to be reachable to say 503.
 fn spawn_http_server(
     listener: TcpListener,
     tier: Tier,
     state: NotaryState,
-    mut shutdown: watch::Receiver<bool>,
+    mut phase: watch::Receiver<Phase>,
 ) {
     let app = router(tier, state);
     tokio::spawn(async move {
@@ -527,7 +639,11 @@ fn spawn_http_server(
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
-            let _ = shutdown.changed().await;
+            while *phase.borrow_and_update() != Phase::Stopped {
+                if phase.changed().await.is_err() {
+                    break;
+                }
+            }
         })
         .await
         .unwrap_or_else(|e| error!("{tier:?} HTTP server error: {}", e));
@@ -541,6 +657,21 @@ async fn info_handler(State(listener): State<ListenerState>) -> Json<InfoRespons
         version: format!("v{}", env!("CARGO_PKG_VERSION")),
         public_key: listener.notary.public_key_hex.clone(),
     })
+}
+
+/// `{"status":"ok"}`, or 503 `{"status":"draining"}` once the process has
+/// been told to stop, so the balancer takes this replica out before its
+/// listeners close.
+async fn healthcheck_handler(State(listener): State<ListenerState>) -> Response {
+    if listener.notary.draining.load(Ordering::SeqCst) {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "draining" })),
+        )
+            .into_response()
+    } else {
+        Json(serde_json::json!({ "status": "ok" })).into_response()
+    }
 }
 
 // ─── Ceremony attestation ───────────────────────────────────────────────────
@@ -632,6 +763,13 @@ async fn notarize_proxy_ws_handler(
 ) -> Response {
     let state = listener.notary;
 
+    // Nothing new once the process is stopping; the sessions already
+    // running finish, and the balancer has been told by the health check.
+    if state.draining.load(Ordering::SeqCst) {
+        info!(%peer, "ProxyMode: upgrade refused, notary is draining");
+        return (StatusCode::SERVICE_UNAVAILABLE, "notary is draining").into_response();
+    }
+
     // The port is the whole classification. The internal listener asks
     // nothing about the client and consults no store: our own services are
     // the protocol, not users of it.
@@ -649,7 +787,11 @@ async fn notarize_proxy_ws_handler(
         },
     };
 
-    ws.on_upgrade(move |socket| handle_ws_proxy_notarize(socket, peer, client, state))
+    let in_flight = state.in_flight.enter();
+    ws.on_upgrade(move |socket| async move {
+        let _in_flight = in_flight;
+        handle_ws_proxy_notarize(socket, peer, client, state).await;
+    })
 }
 
 /// The public port's checks before an upgrade, cheapest first, and the
