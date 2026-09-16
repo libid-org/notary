@@ -132,7 +132,10 @@ use crate::{
         self,
         ClientKey,
     },
-    config::NotaryServerConfig,
+    config::{
+        ClientIpHeader,
+        NotaryServerConfig,
+    },
     error::{
         Error,
         Result,
@@ -287,7 +290,7 @@ enum Tier {
     /// `--ws-port`: browsers behind the load balancer; every limit applies.
     Public,
     /// `--internal-ws-port`: our own services; no per-client limit, no
-    /// `X-Forwarded-For`, and its own session pool.
+    /// client address header read, and its own session pool.
     Internal,
 }
 
@@ -371,9 +374,9 @@ struct NotaryState {
     per_ip_upgrades: WindowLimits,
     /// Bytes one public client may relay per window.
     per_ip_bytes: WindowLimits,
-    /// Addresses whose `X-Forwarded-For` names the client. Empty means the
-    /// socket peer is the client.
-    trusted_proxies: Arc<Vec<ipnet::IpNet>>,
+    /// Which header names the client on the public port. Never read on the
+    /// internal port.
+    client_ip_header: ClientIpHeader,
     /// Bytes one ProxyMode session may relay, both directions combined.
     proxy_max_bytes: usize,
     proxy_root_store: Arc<tlsn::webpki::RootCertStore>,
@@ -414,7 +417,7 @@ impl NotaryState {
             limits: Arc::new(store::MemoryStore::new()),
             per_ip_upgrades: WindowLimits::parse("10/1m,60/30m,100/1h").unwrap(),
             per_ip_bytes: WindowLimits::parse("100MB/1m,600MB/30m,1GB/1h").unwrap(),
-            trusted_proxies: Arc::new(Vec::new()),
+            client_ip_header: ClientIpHeader::XForwardedFor,
             proxy_max_bytes: 10_000_000,
             proxy_root_store: Arc::new(libid_tlsn::root_store()),
             proxy_server_addr: None,
@@ -442,11 +445,6 @@ const SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// Start the notary server: the MPC-TLS listener and the public and internal
 /// HTTP/WebSocket servers, each only if configured.
 pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
-    // Before anything else, because a per-client cap with nothing to key on
-    // is a global cap that looks like ordinary load.
-    let trusted_proxies = config
-        .trusted_proxies()
-        .map_err(|detail| Error::NotaryServer { detail })?;
     let per_ip_upgrades = config
         .per_ip_upgrades()
         .map_err(|detail| Error::NotaryServer { detail })?;
@@ -497,7 +495,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         max_sessions_per_ip = config.max_sessions_per_ip,
         per_ip_upgrades = %per_ip_upgrades,
         per_ip_bytes = %per_ip_bytes,
-        trusted_proxies = %config.trusted_proxies,
+        client_ip_header = %config.client_ip_header,
         limits_store = %limits.describe(),
         "resource limits in force"
     );
@@ -509,7 +507,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         limits,
         per_ip_upgrades,
         per_ip_bytes,
-        trusted_proxies: Arc::new(trusted_proxies),
+        client_ip_header: config.client_ip_header,
         proxy_max_bytes: config.proxy_max_bytes,
         proxy_root_store: Arc::new(libid_tlsn::root_store()),
         proxy_server_addr: None,
@@ -836,7 +834,7 @@ async fn admit_public_upgrade(
     // fallback to the socket peer: behind a load balancer that peer is the
     // balancer, so falling back would quietly turn the per-client cap into a
     // cap on the whole service.
-    let client = match client_ip::resolve(peer, headers, &state.trusted_proxies) {
+    let client = match client_ip::resolve(headers, state.client_ip_header) {
         Ok(client) => client,
         Err(reason) => {
             info!(%peer, %reason, "ProxyMode: upgrade refused, client unidentified");
@@ -1918,15 +1916,17 @@ mod tests {
             .unwrap();
         let expected_pubkey = signer.compressed_public_key().to_vec();
         let mut state = NotaryState::for_tests(signer);
-        state.proxy_sessions = Arc::new(Semaphore::new(1));
+        state.internal_proxy_sessions = Arc::new(Semaphore::new(1));
         state.proxy_root_store = Arc::new(prover_config.root_store.clone());
         state.proxy_server_addr = Some(target_addr);
+        // The protocol is the same on both tiers; the internal one asks
+        // nothing about the client.
         let notary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let notary_addr = notary_listener.local_addr().unwrap();
         let notary_task = tokio::spawn(async move {
             axum::serve(
                 notary_listener,
-                router(Tier::Public, state)
+                router(Tier::Internal, state)
                     .into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
@@ -2248,6 +2248,8 @@ mod tests {
         use tokio_tungstenite::{
             connect_async,
             tungstenite::{
+                client::IntoClientRequest,
+                http::HeaderValue,
                 protocol::frame::coding::CloseCode,
                 Message as WsMessage,
             },
@@ -2298,15 +2300,43 @@ mod tests {
             close: Option<(u16, String)>,
         }
 
-        /// Open a ProxyMode WebSocket and pump it to and from a duplex the
-        /// prover drives, the way tlsn_wasm's transport does in the browser.
+        /// The client a session on `tier` is opened as: named in
+        /// `X-Forwarded-For` on the public tier, as the load balancer would;
+        /// nothing on the internal tier, which reads no header.
+        fn client_on(tier: Tier) -> Option<&'static str> {
+            match tier {
+                Tier::Public => Some("203.0.113.7"),
+                Tier::Internal => None,
+            }
+        }
+
+        /// The upgrade request for `notary_addr`, naming `client` in
+        /// `X-Forwarded-For` when there is one.
+        fn upgrade_from(
+            notary_addr: SocketAddr,
+            client: Option<&str>,
+        ) -> tokio_tungstenite::tungstenite::http::Request<()> {
+            let mut request = format!("ws://{notary_addr}/notarize-proxy")
+                .into_client_request()
+                .unwrap();
+            if let Some(client) = client {
+                request
+                    .headers_mut()
+                    .insert("x-forwarded-for", HeaderValue::from_str(client).unwrap());
+            }
+            request
+        }
+
+        /// Open a ProxyMode WebSocket as `client` and pump it to and from a
+        /// duplex the prover drives, the way tlsn_wasm's transport does in
+        /// the browser.
         async fn browser(
             notary_addr: SocketAddr,
+            client: Option<&str>,
         ) -> (DuplexStream, tokio::task::JoinHandle<BrowserSide>) {
-            let (websocket, _) =
-                connect_async(format!("ws://{notary_addr}/notarize-proxy"))
-                    .await
-                    .unwrap();
+            let (websocket, _) = connect_async(upgrade_from(notary_addr, client))
+                .await
+                .unwrap();
             let (mut ws_tx, mut ws_rx) = websocket.split();
             let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
             let pump = tokio::spawn(async move {
@@ -2480,7 +2510,7 @@ mod tests {
             let (notary_addr, notary_task) = serve(Tier::Public, state).await;
 
             let upgrade = tokio::spawn(async move {
-                connect_async(format!("ws://{notary_addr}/notarize-proxy"))
+                connect_async(upgrade_from(notary_addr, client_on(Tier::Public)))
                     .await
                     .expect("the upgrade is admitted once the store answers")
             });
@@ -2512,7 +2542,8 @@ mod tests {
 
         /// A relay that crosses the cap is aborted mid-stream: the browser's
         /// request fails, the WebSocket closes with code 1008 and a reason
-        /// naming the cap, and no attestation frame is ever sent.
+        /// naming the cap, and no attestation frame is ever sent. The cap is
+        /// per session on both tiers; the internal one needs no client.
         #[tokio::test(flavor = "multi_thread")]
         async fn proxy_session_over_the_data_cap_is_aborted_without_attestation() {
             let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
@@ -2538,19 +2569,9 @@ mod tests {
             state.proxy_max_bytes = CAP;
             state.proxy_root_store = Arc::new(prover_config.root_store.clone());
             state.proxy_server_addr = Some(target_addr);
-            let notary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let notary_addr = notary_listener.local_addr().unwrap();
-            let notary_task = tokio::spawn(async move {
-                axum::serve(
-                    notary_listener,
-                    router(Tier::Public, state)
-                        .into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                .unwrap();
-            });
+            let (notary_addr, notary_task) = serve(Tier::Internal, state).await;
 
-            let (browser_io, mut pump) = browser(notary_addr).await;
+            let (browser_io, mut pump) = browser(notary_addr, None).await;
             let mut prover = SdkProver::new(prover_config).unwrap();
             let session = async {
                 prover.setup(browser_io.compat()).await.unwrap();
@@ -2604,12 +2625,13 @@ mod tests {
             target_task.await.unwrap();
         }
 
-        /// A WebSocket upgrade as an HTTP client sends it, so a refusal's
-        /// status and body can be read whole: tungstenite keeps only what
-        /// arrived in the same read as the headers.
+        /// A public WebSocket upgrade as an HTTP client sends it, so a
+        /// refusal's status and body can be read whole: tungstenite keeps
+        /// only what arrived in the same read as the headers.
         async fn upgrade_request(notary_addr: SocketAddr) -> reqwest::Response {
             reqwest::Client::new()
                 .get(format!("http://{notary_addr}/notarize-proxy"))
+                .header("x-forwarded-for", client_on(Tier::Public).unwrap())
                 .header("connection", "upgrade")
                 .header("upgrade", "websocket")
                 .header("sec-websocket-version", "13")
@@ -2646,7 +2668,7 @@ mod tests {
             state.proxy_server_addr = Some(target_addr);
             let (notary_addr, notary_task) = serve(tier, state).await;
 
-            let (browser_io, pump) = browser(notary_addr).await;
+            let (browser_io, pump) = browser(notary_addr, client_on(tier)).await;
             let mut prover = SdkProver::new(prover_config).unwrap();
             let session = async {
                 prover.setup(browser_io.compat()).await.unwrap();
@@ -2872,7 +2894,7 @@ mod tests {
             let (notary_addr, notary_task) = serve(Tier::Public, state).await;
 
             let (mut socket, _) =
-                connect_async(format!("ws://{notary_addr}/notarize-proxy"))
+                connect_async(upgrade_from(notary_addr, client_on(Tier::Public)))
                     .await
                     .expect("with no window in force the upgrade does not ask the store");
             socket

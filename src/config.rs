@@ -1,9 +1,11 @@
 //! Runtime configuration (clap + environment).
 
-use clap::Parser;
+use clap::{
+    Parser,
+    ValueEnum,
+};
 
 use crate::{
-    client_ip::parse_networks,
     limits::Concurrency,
     store::{
         redact,
@@ -33,7 +35,7 @@ pub struct NotaryServerConfig {
     pub ws_port: u16,
 
     /// The internal HTTP/WebSocket port: ProxyMode for our own services, with
-    /// no per-client limits and no `X-Forwarded-For` handling. Off unless
+    /// no per-client limits and no client address header read. Off unless
     /// set, for the same reason as `--port`. The conventional value is 7049;
     /// `0` binds an ephemeral port.
     #[arg(long, env = "NOTARY_INTERNAL_WS_PORT")]
@@ -120,8 +122,7 @@ pub struct NotaryServerConfig {
     /// default leaves a user one ceremony of headroom -- and a shared office
     /// address two users.
     ///
-    /// Needs `--trusted-proxies` to mean anything behind a load balancer; see
-    /// there.
+    /// The client is whoever `--client-ip-header` names; see there.
     #[arg(long, env = "NOTARY_MAX_SESSIONS_PER_IP", default_value_t = 4)]
     pub max_sessions_per_ip: usize,
 
@@ -151,21 +152,33 @@ pub struct NotaryServerConfig {
     )]
     pub per_ip_bytes: String,
 
-    /// Addresses whose `X-Forwarded-For` is believed: the proxies in front of
-    /// the public port, as a comma-separated list of CIDRs or addresses. The
-    /// literal `direct` says nothing proxies this notary.
+    /// Which header names the client on the public port. Every per-client
+    /// limit counts against it, and a public upgrade without it is refused
+    /// with 400: behind a load balancer the socket peer is the balancer, so
+    /// there is nothing else to key on.
     ///
-    /// Behind a load balancer every request arrives from it, so without this
-    /// every client shares the balancer's address as its key and the
-    /// per-client limits refuse everyone at once. Set the load balancer's own
-    /// subnets, not the whole VPC: anything inside the trusted set can name
-    /// its own client.
+    /// `x-forwarded-for`: the client is the RIGHTMOST `X-Forwarded-For`
+    /// entry -- the address that connected to the load balancer, which the
+    /// balancer appends last. Set when the notary sits directly behind the
+    /// ALB (Cloudflare DNS-only, grey cloud).
     ///
-    /// Spelled out rather than inferred, because an empty setting is also
-    /// what a missing environment variable looks like. With a per-client
-    /// limit on a non-loopback address, an empty setting refuses to start.
-    #[arg(long, env = "NOTARY_TRUSTED_PROXIES", default_value = "")]
-    pub trusted_proxies: String,
+    /// `cf-connecting-ip`: the client is the `CF-Connecting-IP` value
+    /// Cloudflare adds. Set ONLY when the Cloudflare DNS record is proxied
+    /// (orange cloud); with it set while the record is grey, every public
+    /// request is a 400, which is loud rather than wrong.
+    ///
+    /// The limitation: nothing verifies who wrote the header. Anything that
+    /// can reach the public port directly can set it and choose its own
+    /// key, so the public port must be reachable only through the load
+    /// balancer. That is the deployment's job, not the notary's. The
+    /// internal ports read no header at all.
+    #[arg(
+        long,
+        env = "NOTARY_CLIENT_IP_HEADER",
+        value_enum,
+        default_value_t = ClientIpHeader::XForwardedFor
+    )]
+    pub client_ip_header: ClientIpHeader,
 
     /// Where the public port's per-client counts live: a Postgres URL
     /// (`postgres://user:pass@host/db`), or the literal `memory` for a
@@ -188,32 +201,6 @@ impl NotaryServerConfig {
     /// `--setup-deadline-secs` as a duration.
     pub fn setup_deadline(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.setup_deadline_secs)
-    }
-
-    /// `--trusted-proxies` as networks, checked against the rest of the
-    /// configuration.
-    ///
-    /// The error is a startup failure by design. With a load balancer in
-    /// front and nothing trusted, every client is keyed on the balancer's
-    /// address and the per-client limits refuse everyone together; refusing
-    /// to start is the only version of that an operator notices before users
-    /// do.
-    pub fn trusted_proxies(&self) -> Result<Vec<ipnet::IpNet>, String> {
-        let proxies = parse_networks(&self.trusted_proxies)?;
-        if self.public_limits_in_force()
-            && proxies.is_empty()
-            && self.trusted_proxies.trim() != "direct"
-            && !self.bound_locally()
-        {
-            return Err(
-                "per-client limits are on but --trusted-proxies is empty: behind a \
-                 load balancer every client would share its address and the limits \
-                 would refuse everyone at once. Set the balancer's subnets, or \
-                 \"direct\" if nothing proxies this notary"
-                    .into(),
-            );
-        }
-        Ok(proxies)
     }
 
     /// `--per-ip-upgrades` parsed.
@@ -269,6 +256,29 @@ impl NotaryServerConfig {
         self.host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
+    }
+}
+
+/// Which header names the client on the public port; `--client-ip-header`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ClientIpHeader {
+    /// The rightmost `X-Forwarded-For` entry: what the load balancer
+    /// appended, which is the address that connected to it. For a notary
+    /// directly behind the ALB (Cloudflare DNS-only, grey cloud).
+    XForwardedFor,
+    /// The `CF-Connecting-IP` value Cloudflare adds. Only for a proxied
+    /// Cloudflare record (orange cloud); with a grey record nothing sets it
+    /// and every public request is refused.
+    CfConnectingIp,
+}
+
+impl std::fmt::Display for ClientIpHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::XForwardedFor => "x-forwarded-for",
+            Self::CfConnectingIp => "cf-connecting-ip",
+        };
+        f.write_str(name)
     }
 }
 

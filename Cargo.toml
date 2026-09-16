@@ -49,8 +49,6 @@ tlsn = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15" }
 anyhow = "1.0"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
-# CIDR matching for the trusted-proxy list. Already in the graph via hyper-util.
-ipnet = "2"
 futures-util = "0.3"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
