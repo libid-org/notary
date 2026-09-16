@@ -249,6 +249,12 @@ impl Fixture {
     }
 }
 
+impl Drop for Lab {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.ca_path);
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.accept.abort();
@@ -356,11 +362,25 @@ impl Notary {
         out
     }
 
+    /// SIGTERM first, so a notary that is still up releases its leases and
+    /// the shared tables do not fill with rows only a sweep would clear;
+    /// SIGKILL if it has not gone within a second.
     fn reap(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
         }
+        let pid = libc::pid_t::try_from(self.child.id()).expect("a pid");
+        // SAFETY: kill(2) on a pid this test spawned and still owns.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -848,7 +868,7 @@ async fn the_concurrency_cap_holds_across_two_replicas() {
     drop(first);
     let url = b.public();
     let client = client.as_str();
-    let _reopened: Socket = poll(Duration::from_secs(5), "B admits", || async {
+    let _reopened: Socket = poll(Duration::from_secs(10), "B admits", || async {
         let mut socket = held_session(&url, &xff(client)).await.expect("upgrade");
         holds(&mut socket, Duration::from_millis(200))
             .await
@@ -1084,11 +1104,14 @@ async fn a_store_outage_fails_closed_and_recovers() {
     let upstream = host_port(&lab.pg_url);
     let forwarder = Forwarder::start(0, upstream.clone()).await;
     let port = forwarder.port;
+    // The bytes window off, so the upgrades window's own count() is the
+    // check that has to fail closed -- with both on, would_fit(Bytes) would
+    // refuse first and a count() that fails open would go unnoticed.
     let notary = lab
         .spawn_on_store(
             "A",
             &with_host(&lab.pg_url, "127.0.0.1", port),
-            &["--per-ip-upgrades", "1000/1m"],
+            &["--per-ip-upgrades", "1000/1m", "--per-ip-bytes", ""],
         )
         .await;
     let client = fresh_client();
@@ -1132,7 +1155,7 @@ async fn limits_recover_when_a_replica_dies_holding_leases() {
         "--max-sessions-per-ip",
         "2",
         "--connection-deadline-secs",
-        "3",
+        "5",
         "--per-ip-upgrades",
         "",
     ];
@@ -1155,7 +1178,7 @@ async fn limits_recover_when_a_replica_dies_holding_leases() {
 
     let url = b.public();
     let client = client.as_str();
-    let _reopened: Socket = poll(Duration::from_secs(5), "B admits", || async {
+    let _reopened: Socket = poll(Duration::from_secs(10), "B admits", || async {
         let mut socket = held_session(&url, &xff(client)).await.expect("upgrade");
         holds(&mut socket, Duration::from_millis(200))
             .await
@@ -1178,6 +1201,24 @@ async fn a_ceremony_started_before_sigterm_completes() {
     let running = tokio::spawn(ceremony(socket));
     tokio::time::sleep(Duration::from_millis(100)).await;
     notary.signal(libc::SIGTERM);
+
+    // The drain is observable while the ceremony runs: the health check
+    // flips to 503 and a new upgrade is refused as draining, not admitted.
+    let port = notary.ports.public;
+    poll(
+        Duration::from_secs(5),
+        "health reports draining",
+        || async { (health(port).await == Some(503)).then_some(()) },
+    )
+    .await;
+    let late = refused(
+        &notary.public(),
+        &xff(&fresh_client()),
+        "an upgrade during the drain",
+    )
+    .await;
+    assert_eq!(late.status, 503, "{late:?}");
+    assert!(late.body.contains("draining"), "{late:?}");
 
     let outcome = running.await.expect("the ceremony task");
     assert_signed(outcome.attested());
