@@ -3,7 +3,6 @@
 //! client sees when it trips; that lives in `server`.
 
 use std::{
-    collections::HashMap,
     fmt,
     io,
     num::NonZeroUsize,
@@ -15,7 +14,6 @@ use std::{
             Ordering,
         },
         Arc,
-        Mutex,
     },
     task::{
         Context,
@@ -29,8 +27,6 @@ use tokio::io::{
     ReadBuf,
 };
 use tracing::warn;
-
-use crate::client_ip::ClientKey;
 
 /// A concurrency limit: an absolute count (`16`) or a multiple of the cores
 /// the process may use (`4x`). A multiplier is resolved once, at startup, so a
@@ -299,88 +295,6 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for PeekedIo<T> {
     }
 }
 
-/// How many sessions each client has running, and the slot one of them holds.
-///
-/// A keyed concurrency limit, which the tower ecosystem has no equivalent of:
-/// `ConcurrencyLimitLayer` bounds the whole service, and a rate limiter counts
-/// arrivals rather than what they hold. Concurrency is what matters here,
-/// because a session costs its relay task and its transcript for as long as it
-/// lives, not for as long as it took to ask.
-///
-/// The table holds only clients with a live session, and every session is
-/// already bounded by the global session limit, so it needs no separate cap or
-/// eviction: the last slot to drop takes the entry with it.
-#[derive(Debug, Default)]
-pub struct ClientSessions {
-    live: Mutex<HashMap<ClientKey, usize>>,
-}
-
-impl ClientSessions {
-    /// An empty table.
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    /// A slot for `client`, or `None` if it already holds `limit` of them.
-    pub fn try_take(
-        self: &Arc<Self>,
-        client: ClientKey,
-        limit: usize,
-    ) -> Option<ClientSlot> {
-        let mut live = self.lock();
-        let held = live.get(&client).copied().unwrap_or(0);
-        if held >= limit {
-            // Insert nothing: a client at its limit must not leave an entry
-            // behind, or refusals alone would grow the table.
-            return None;
-        }
-        live.insert(client, held + 1);
-        drop(live);
-        Some(ClientSlot {
-            table: Arc::clone(self),
-            client,
-        })
-    }
-
-    /// Sessions `client` is running right now.
-    pub fn held_by(&self, client: ClientKey) -> usize {
-        self.lock().get(&client).copied().unwrap_or(0)
-    }
-
-    /// Clients with at least one live session.
-    pub fn tracked(&self) -> usize {
-        self.lock().len()
-    }
-
-    /// A poisoned lock here means a panic while holding a `HashMap`, which
-    /// leaves it structurally sound. Refusing every later session over it
-    /// would turn one panic into an outage.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ClientKey, usize>> {
-        self.live
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-/// One client's claim on one session, released when dropped.
-#[derive(Debug)]
-pub struct ClientSlot {
-    table: Arc<ClientSessions>,
-    client: ClientKey,
-}
-
-impl Drop for ClientSlot {
-    fn drop(&mut self) {
-        let mut live = self.table.lock();
-        if let Some(held) = live.get_mut(&self.client) {
-            *held -= 1;
-            if *held == 0 {
-                live.remove(&self.client);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
@@ -392,12 +306,10 @@ mod tests {
 
     use super::{
         CappedIo,
-        ClientSessions,
         Concurrency,
         DataCap,
         PeekedIo,
     };
-    use crate::client_ip::ClientKey;
 
     fn nz(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).unwrap()
@@ -490,68 +402,5 @@ mod tests {
             assert_eq!(one[0], *expected);
         }
         assert_eq!(peeked.read(&mut one).await.unwrap(), 0);
-    }
-
-    fn key(addr: &str) -> ClientKey {
-        ClientKey::from_ip(addr.parse().unwrap())
-    }
-
-    /// A client gets `limit` slots at once and no more, and each one comes
-    /// back the moment its session ends.
-    #[test]
-    fn a_client_holds_at_most_its_limit_of_sessions() {
-        let table = ClientSessions::new();
-        let client = key("203.0.113.7");
-
-        let first = table.try_take(client, 2).expect("first session");
-        let second = table.try_take(client, 2).expect("second session");
-        assert_eq!(table.held_by(client), 2);
-        assert!(
-            table.try_take(client, 2).is_none(),
-            "a third session was allowed past the limit"
-        );
-
-        drop(second);
-        assert_eq!(table.held_by(client), 1);
-        let third = table.try_take(client, 2).expect("the slot came back");
-
-        drop((first, third));
-        assert_eq!(table.held_by(client), 0);
-    }
-
-    /// One client at its limit does not spend another client's slots.
-    #[test]
-    fn clients_do_not_share_a_budget() {
-        let table = ClientSessions::new();
-        let busy = key("203.0.113.7");
-        let other = key("198.51.100.4");
-
-        let _held = (
-            table.try_take(busy, 1).expect("first client"),
-            table.try_take(other, 1).expect("second client"),
-        );
-        assert!(table.try_take(busy, 1).is_none());
-        assert!(table.try_take(other, 1).is_none());
-        assert_eq!(table.tracked(), 2);
-    }
-
-    /// The table only ever holds clients with a live session: a refusal adds
-    /// nothing, and the last slot to drop takes the entry with it. That is
-    /// what keeps it from needing a cap of its own.
-    #[test]
-    fn the_table_holds_nothing_at_rest() {
-        let table = ClientSessions::new();
-        let client = key("203.0.113.7");
-
-        let slot = table.try_take(client, 1).expect("first session");
-        assert!(table.try_take(client, 1).is_none());
-        assert_eq!(table.tracked(), 1, "a refusal left an entry behind");
-
-        drop(slot);
-        assert_eq!(
-            table.tracked(),
-            0,
-            "a finished session left an entry behind"
-        );
     }
 }

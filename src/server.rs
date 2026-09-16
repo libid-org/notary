@@ -56,7 +56,10 @@ use axum::{
         ConnectInfo,
         State,
     },
-    http::StatusCode,
+    http::{
+        header::RETRY_AFTER,
+        StatusCode,
+    },
     response::{
         IntoResponse,
         Json,
@@ -116,6 +119,7 @@ use tower_http::cors::{
 use tracing::{
     error,
     info,
+    warn,
 };
 
 use crate::{
@@ -131,9 +135,15 @@ use crate::{
     limits::{
         available_cores,
         CappedIo,
-        ClientSessions,
         DataCap,
         PeekedIo,
+    },
+    store::{
+        self,
+        Dimension,
+        LeaseId,
+        LimitStore,
+        WindowLimits,
     },
 };
 
@@ -255,8 +265,13 @@ struct NotaryState {
     /// ProxyMode slots each public client may hold at once; `0` disables
     /// the cap.
     max_sessions_per_ip: usize,
-    /// Sessions per client, for the cap above.
-    client_sessions: Arc<ClientSessions>,
+    /// Where the public port's per-client counts live. Never consulted for
+    /// the internal port.
+    limits: Arc<dyn LimitStore>,
+    /// Sessions one public client may start per window.
+    per_ip_upgrades: WindowLimits,
+    /// Bytes one public client may relay per window.
+    per_ip_bytes: WindowLimits,
     /// Addresses whose `X-Forwarded-For` names the client. Empty means the
     /// socket peer is the client.
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
@@ -292,7 +307,9 @@ impl NotaryState {
             proxy_sessions: Arc::new(Semaphore::new(1024)),
             internal_proxy_sessions: Arc::new(Semaphore::new(1024)),
             max_sessions_per_ip: 4,
-            client_sessions: ClientSessions::new(),
+            limits: Arc::new(store::MemoryStore::new()),
+            per_ip_upgrades: WindowLimits::parse("10/1m,60/30m,100/1h").unwrap(),
+            per_ip_bytes: WindowLimits::parse("100MB/1m,600MB/30m,1GB/1h").unwrap(),
             trusted_proxies: Arc::new(Vec::new()),
             proxy_max_bytes: 10_000_000,
             proxy_root_store: Arc::new(libid_tlsn::root_store()),
@@ -321,6 +338,24 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     let trusted_proxies = config
         .trusted_proxies()
         .map_err(|detail| Error::NotaryServer { detail })?;
+    let per_ip_upgrades = config
+        .per_ip_upgrades()
+        .map_err(|detail| Error::NotaryServer { detail })?;
+    let per_ip_bytes = config
+        .per_ip_bytes()
+        .map_err(|detail| Error::NotaryServer { detail })?;
+    let limits_store = config
+        .limits_store()
+        .map_err(|detail| Error::NotaryServer { detail })?;
+
+    // A store that cannot be reached is a startup error, not a limit that
+    // refuses every client once the process is up.
+    let limits =
+        store::connect(&limits_store)
+            .await
+            .map_err(|e| Error::NotaryServer {
+                detail: e.to_string(),
+            })?;
 
     // SIGNING_KEY accepts `kms:<key-id-or-alias>` or a hex key.
     let signer = SignerSource::from_spec(&config.signing_key)?
@@ -351,7 +386,10 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         connection_deadline_secs = config.connection_deadline_secs,
         setup_deadline_secs = config.setup_deadline_secs,
         max_sessions_per_ip = config.max_sessions_per_ip,
+        per_ip_upgrades = %per_ip_upgrades,
+        per_ip_bytes = %per_ip_bytes,
         trusted_proxies = %config.trusted_proxies,
+        limits_store = %limits.describe(),
         "resource limits in force"
     );
     let state = NotaryState {
@@ -359,7 +397,9 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         proxy_sessions: Arc::new(Semaphore::new(config.max_sessions)),
         internal_proxy_sessions: Arc::new(Semaphore::new(config.internal_max_sessions)),
         max_sessions_per_ip: config.max_sessions_per_ip,
-        client_sessions: ClientSessions::new(),
+        limits,
+        per_ip_upgrades,
+        per_ip_bytes,
         trusted_proxies: Arc::new(trusted_proxies),
         proxy_max_bytes: config.proxy_max_bytes,
         proxy_root_store: Arc::new(libid_tlsn::root_store()),
@@ -581,6 +621,9 @@ fn attestation_frame(attestation: &AttestationWire) -> Result<Vec<u8>> {
 // tags, then receives the prover's reveal request and captures what the
 // session disclosed.
 
+/// Seconds a refused client is told to wait before its next upgrade.
+const RETRY_AFTER_SECS: &str = "60";
+
 async fn notarize_proxy_ws_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -590,8 +633,8 @@ async fn notarize_proxy_ws_handler(
     let state = listener.notary;
 
     // The port is the whole classification. The internal listener asks
-    // nothing about the client: our own services are the protocol, not
-    // users of it.
+    // nothing about the client and consults no store: our own services are
+    // the protocol, not users of it.
     let client = match listener.tier {
         Tier::Internal => {
             if state.internal_proxy_sessions.available_permits() == 0 {
@@ -642,6 +685,43 @@ async fn admit_public_upgrade(
         info!(%peer, "ProxyMode: all session slots busy; upgrade refused with 503");
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
+
+    // The windows, in the shared store. An upgrade is counted here, before
+    // anything is spent on it; the bytes window only has to have room, since
+    // the bytes are charged when the session ends. A store that cannot
+    // answer is a refusal: a limit that fails open under a store outage is a
+    // limit an attacker can switch off.
+    let store_down = |error: store::StoreError| {
+        warn!(%peer, %client, %error, "ProxyMode: upgrade refused, limits store unavailable");
+        (StatusCode::SERVICE_UNAVAILABLE, "limits store unavailable").into_response()
+    };
+    let too_many = |what: &str| {
+        info!(%peer, %client, "ProxyMode: upgrade refused with 429, {what} window full");
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(RETRY_AFTER, RETRY_AFTER_SECS)],
+            format!("too many {what} from this client; retry later"),
+        )
+            .into_response()
+    };
+    match state
+        .limits
+        .count(&client, Dimension::Upgrades, 1, &state.per_ip_upgrades)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Err(too_many("sessions started")),
+        Err(error) => return Err(store_down(error)),
+    }
+    match state
+        .limits
+        .would_fit(&client, Dimension::Bytes, 1, &state.per_ip_bytes)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Err(too_many("bytes relayed")),
+        Err(error) => return Err(store_down(error)),
+    }
     Ok(client)
 }
 
@@ -683,9 +763,86 @@ async fn first_relayed_bytes(
     None
 }
 
+/// What one public session owes the store when it ends: the bytes it
+/// relayed, charged to its client's windows, and its lease back.
+///
+/// Settled on the way out of the handler; if the handler never gets there --
+/// a panic, or the task cancelled under it -- the drop settles from a task
+/// of its own, so no lease outlives its session and no bytes go uncharged.
+/// Neither can fail the session: a store that will not take the charge is
+/// logged and the session has already ended.
+struct Accounting {
+    store: Arc<dyn LimitStore>,
+    client: ClientKey,
+    lease: Option<LeaseId>,
+    relayed: Arc<DataCap>,
+    windows: WindowLimits,
+    settled: bool,
+}
+
+impl Accounting {
+    async fn settle(mut self) {
+        self.settled = true;
+        settle(
+            &*self.store,
+            self.client,
+            self.lease.take(),
+            self.relayed.used(),
+            &self.windows,
+        )
+        .await;
+    }
+}
+
+impl Drop for Accounting {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let client = self.client;
+        let lease = self.lease.take();
+        let used = self.relayed.used();
+        let windows = std::mem::take(&mut self.windows);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    settle(&*store, client, lease, used, &windows).await;
+                });
+            }
+            // The runtime itself is going away; the lease expires by itself.
+            Err(_) => {
+                warn!(%client, "ProxyMode: no runtime to settle a session's accounting")
+            }
+        }
+    }
+}
+
+async fn settle(
+    store: &dyn LimitStore,
+    client: ClientKey,
+    lease: Option<LeaseId>,
+    used: usize,
+    windows: &WindowLimits,
+) {
+    if used > 0 {
+        if let Err(error) = store
+            .charge(&client, Dimension::Bytes, used as u64, windows)
+            .await
+        {
+            warn!(%client, used, %error, "ProxyMode: relayed bytes not charged");
+        }
+    }
+    if let Some(lease) = lease {
+        if let Err(error) = store.release(&lease).await {
+            warn!(%client, %error, "ProxyMode: session lease not released; it expires by itself");
+        }
+    }
+}
+
 /// One ProxyMode session on an upgraded socket. `client` is `Some` on the
-/// public port, where the session counts against its client's cap, and
-/// `None` on the internal port, where nothing is counted per client.
+/// public port, where the session holds a lease and its bytes are charged,
+/// and `None` on the internal port, where nothing is counted per client.
 async fn handle_ws_proxy_notarize(
     socket: WebSocket,
     peer: SocketAddr,
@@ -721,32 +878,67 @@ async fn handle_ws_proxy_notarize(
             }
         };
 
-    // This client's own slot first: one client at its cap must not spend a
+    // Every relayed byte counts against the session cap on both tiers -- it
+    // is what bounds a transcript, not a rate -- and on the public tier the
+    // total is charged to the client when the session ends.
+    let relayed = DataCap::new(state.proxy_max_bytes);
+
+    // This client's own lease first: one client at its cap must not spend a
     // slot from the shared pool to find that out. Held for the session
     // lifetime, like the pool permit below.
-    let (pool, _client_slot) = match client {
+    let (pool, accounting) = match client {
         None => (&state.internal_proxy_sessions, None),
-        Some(_) if state.max_sessions_per_ip == 0 => (&state.proxy_sessions, None),
-        Some(client) => match state
-            .client_sessions
-            .try_take(client, state.max_sessions_per_ip)
-        {
-            Some(slot) => (&state.proxy_sessions, Some(slot)),
-            None => {
-                info!(
-                    %peer, %client,
-                    "ProxyMode: client already running {} sessions; refused with 1013",
-                    state.max_sessions_per_ip
-                );
-                let _ = ws_tx
-                    .send(Message::Close(Some(CloseFrame {
-                        code: CLOSE_TRY_AGAIN_LATER,
-                        reason: "too many sessions from this client; retry".into(),
-                    })))
-                    .await;
-                return;
-            }
-        },
+        Some(client) => {
+            let lease = if state.max_sessions_per_ip == 0 {
+                None
+            } else {
+                match state
+                    .limits
+                    .try_lease(
+                        &client,
+                        state.max_sessions_per_ip,
+                        state.connection_deadline,
+                    )
+                    .await
+                {
+                    Ok(Some(lease)) => Some(lease),
+                    Ok(None) => {
+                        info!(
+                            %peer, %client,
+                            "ProxyMode: client already running {} sessions; refused with 1013",
+                            state.max_sessions_per_ip
+                        );
+                        let _ = ws_tx
+                            .send(Message::Close(Some(CloseFrame {
+                                code: CLOSE_TRY_AGAIN_LATER,
+                                reason: "too many sessions from this client; retry"
+                                    .into(),
+                            })))
+                            .await;
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(%peer, %client, %error, "ProxyMode: session refused, limits store unavailable");
+                        let _ = ws_tx
+                            .send(Message::Close(Some(CloseFrame {
+                                code: CLOSE_TRY_AGAIN_LATER,
+                                reason: "limits store unavailable".into(),
+                            })))
+                            .await;
+                        return;
+                    }
+                }
+            };
+            let accounting = Accounting {
+                store: Arc::clone(&state.limits),
+                client,
+                lease,
+                relayed: Arc::clone(&relayed),
+                windows: state.per_ip_bytes.clone(),
+                settled: false,
+            };
+            (&state.proxy_sessions, Some(accounting))
+        }
     };
 
     // Held for the session lifetime; dropping it returns the slot.
@@ -758,6 +950,9 @@ async fn handle_ws_proxy_notarize(
                 reason: "notary is at capacity; retry".into(),
             })))
             .await;
+        if let Some(accounting) = accounting {
+            accounting.settle().await;
+        }
         return;
     };
 
@@ -824,7 +1019,7 @@ async fn handle_ws_proxy_notarize(
     }));
 
     let protocol = async {
-        let result = match run_proxy_verifier_session(io_b, &state).await {
+        let result = match run_proxy_verifier_session(io_b, &state, &relayed).await {
             Ok(attestation) => attestation_frame(&attestation).and_then(|frame| {
                 end_tx.send(SessionEnd::Attested(frame)).map_err(|_| {
                     Error::NotaryServer {
@@ -884,11 +1079,18 @@ async fn handle_ws_proxy_notarize(
             state.connection_deadline.as_secs()
         ),
     }
+
+    if let Some(accounting) = accounting {
+        accounting.settle().await;
+    }
 }
 
+/// The verifier's half of one ProxyMode session on `socket`; every byte
+/// relayed to the server counts against `relayed`.
 async fn run_proxy_verifier_session<T>(
     socket: T,
     state: &NotaryState,
+    relayed: &Arc<DataCap>,
 ) -> Result<AttestationWire>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
@@ -961,7 +1163,7 @@ where
         // server stream is the cap on this session's memory. Crossing it fails
         // the relay mid-stream; the transcript is never shortened, because a
         // shortened one would attest as complete.
-        let cap = DataCap::new(state.proxy_max_bytes);
+        let cap = Arc::clone(relayed);
         let verifier = proxy_verifier
             .accept()
             .await
