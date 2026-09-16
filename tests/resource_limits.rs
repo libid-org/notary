@@ -1,7 +1,8 @@
 //! The resource limits through the public surface: the flags an operator
-//! sets, and the ProxyMode session cap refusing an upgrade on the real HTTP
-//! server. The limits that need a session to trip (the ProxyMode data cap,
-//! the MPC-TLS queue) are unit tests beside the handlers.
+//! sets, and the ProxyMode session caps and windows refusing an upgrade on
+//! the real HTTP server. The limits that need a session to trip (the
+//! ProxyMode data cap, the bytes window, the MPC-TLS queue) are unit tests
+//! beside the handlers.
 
 use std::{
     num::NonZeroUsize,
@@ -419,9 +420,60 @@ async fn the_per_ip_cap_counts_the_forwarded_client_not_the_proxy() {
     handle.shutdown();
 }
 
-/// Our own pods dial the Service directly, and are not capped. Without this
-/// the protocol would rate-limit itself: one backend pod is one address, and
-/// every user it serves would queue behind the same handful of slots.
+/// `--per-ip-upgrades` counts sessions started per window, at the upgrade:
+/// past it the client gets 429 and a `Retry-After`, before anything has been
+/// spent on it, and another client is not affected.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_upgrades_window_refuses_the_next_upgrade_with_429() {
+    let ws_port = free_port().await;
+    let config = parse(&[
+        "--ws-port",
+        &ws_port.to_string(),
+        "--per-ip-upgrades",
+        "2/1h",
+        "--trusted-proxies",
+        "127.0.0.0/8",
+    ])
+    .unwrap();
+    let handle = server::run(config).await.expect("server starts");
+    let url = format!(
+        "ws://{}/notarize-proxy",
+        handle.ws_local_addr().expect("ws server enabled")
+    );
+
+    // Two sessions in the hour, finished or not: the window counts starts.
+    let first = session_from(&url, "203.0.113.7")
+        .await
+        .expect("first session");
+    drop(first);
+    let _second = session_from(&url, "203.0.113.7")
+        .await
+        .expect("second session");
+
+    let refused = session_from(&url, "203.0.113.7")
+        .await
+        .expect_err("a third upgrade in the window must be refused");
+    let tungstenite::Error::Http(response) = refused else {
+        panic!("expected an HTTP refusal, got: {refused}");
+    };
+    assert_eq!(response.status(), 429);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("60")
+    );
+
+    let _other = session_from(&url, "198.51.100.4")
+        .await
+        .expect("a different client has its own window");
+
+    handle.shutdown();
+}
+
+/// A trusted proxy that names no client is refused at the upgrade, never
+/// counted against the proxy itself -- which every browser shares.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unattributable_request_is_refused_at_the_upgrade() {
     let ws_port = free_port().await;
