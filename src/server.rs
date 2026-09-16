@@ -455,12 +455,19 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     let limits_store = config
         .limits_store()
         .map_err(|detail| Error::NotaryServer { detail })?;
+    let mut proxy_root_store = libid_tlsn::root_store();
     let proxy_upstream = config
         .proxy_upstream()
-        .map_err(|detail| Error::NotaryServer { detail })?;
-    if let Some(upstream) = proxy_upstream {
-        warn!(%upstream, "TEST HOOK: every ProxyMode session dials --proxy-upstream");
-    }
+        .map_err(|detail| Error::NotaryServer { detail })?
+        .map(|upstream| {
+            warn!(
+                addr = %upstream.addr,
+                extra_root = upstream.ca.is_some(),
+                "TEST HOOK: every ProxyMode session dials --proxy-upstream"
+            );
+            proxy_root_store.roots.extend(upstream.ca);
+            upstream.addr
+        });
 
     // A store that cannot be reached is a startup error, not a limit that
     // refuses every client once the process is up.
@@ -516,7 +523,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         per_ip_bytes,
         client_ip_header: config.client_ip_header,
         proxy_max_bytes: config.proxy_max_bytes,
-        proxy_root_store: Arc::new(libid_tlsn::root_store()),
+        proxy_root_store: Arc::new(proxy_root_store),
         proxy_server_addr: proxy_upstream,
         mpc_sessions: Arc::new(Semaphore::new(mpc_max_sessions)),
         connection_deadline: config.connection_deadline(),
