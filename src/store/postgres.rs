@@ -10,13 +10,31 @@
 //! Each takes a transaction-scoped advisory lock on the client's key first,
 //! so the read-then-write of one client is serialised across every replica
 //! while different clients never wait on each other.
+//!
+//! The lock only orders what is read after it: every transaction here is
+//! begun `READ COMMITTED` explicitly, so the read sees what the previous
+//! holder committed. Under a `REPEATABLE READ` default the snapshot would be
+//! taken before the lock was granted, and two racers would both see room.
+//!
+//! Every connection carries a lock, statement and idle-in-transaction
+//! timeout. Without them a lock held elsewhere, or a database that stops
+//! answering, parks a call forever; five such calls pin the whole pool and
+//! every other client is refused for as long as the stall lasts.
 
-use std::time::Duration;
+use std::{
+    str::FromStr,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use sqlx::{
-    postgres::PgPoolOptions,
+    postgres::{
+        PgConnectOptions,
+        PgPoolOptions,
+    },
+    Connection,
     Executor,
+    PgConnection,
     PgPool,
     Postgres,
     Transaction,
@@ -42,6 +60,22 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// this is refused rather than queued behind a stalled database.
 const MAX_CONNECTIONS: u32 = 5;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Set on every connection, in milliseconds. A call that waits longer than
+/// this for a client's lock, for a statement, or between statements of its
+/// own transaction fails instead of keeping its pool slot: one request is
+/// refused, and the other connections keep answering everyone else.
+const SESSION_OPTIONS: [(&str, &str); 3] = [
+    ("lock_timeout", "1000"),
+    ("statement_timeout", "2000"),
+    ("idle_in_transaction_session_timeout", "5000"),
+];
+
+/// How every transaction here begins. Pinned rather than inherited:
+/// `default_transaction_isolation` is settable per role, per database and
+/// per server, and under `REPEATABLE READ` the advisory lock no longer
+/// orders the reads (see the module docs).
+const BEGIN_READ_COMMITTED: &str = "BEGIN ISOLATION LEVEL READ COMMITTED";
 
 /// The advisory lock the schema is created under. Replicas start together,
 /// and two `CREATE TABLE IF NOT EXISTS` racing on one name fail on the
@@ -100,15 +134,22 @@ impl PostgresStore {
     /// Connect to `url`, create the tables if they are missing, and fail
     /// within ten seconds if the database does not answer. The URL's
     /// password never appears in the error.
+    ///
+    /// The schema goes in over a connection of its own, opened under
+    /// [`CONNECT_TIMEOUT`]: the pool bounds every acquire, the first
+    /// included, by [`ACQUIRE_TIMEOUT`], which is right for a request and
+    /// short for a cold start. The pool itself connects on first use.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let description = format!("postgres ({})", redact(url));
         let connect = async {
+            let options = PgConnectOptions::from_str(url)?.options(SESSION_OPTIONS);
+            let mut conn = PgConnection::connect_with(&options).await?;
+            create_schema(&mut conn).await?;
+            conn.close().await?;
             let pool = PgPoolOptions::new()
                 .max_connections(MAX_CONNECTIONS)
                 .acquire_timeout(ACQUIRE_TIMEOUT)
-                .connect(url)
-                .await?;
-            create_schema(&pool).await?;
+                .connect_lazy_with(options);
             Ok::<_, sqlx::Error>(pool)
         };
         let pool = tokio::time::timeout(CONNECT_TIMEOUT, connect)
@@ -122,10 +163,15 @@ impl PostgresStore {
             .map_err(|e| StoreError(format!("{description}: {e}")))?;
         Ok(Self { pool, description })
     }
+
+    /// A pooled transaction at the isolation this module is written for.
+    async fn begin(&self) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+        self.pool.begin_with(BEGIN_READ_COMMITTED).await
+    }
 }
 
-async fn create_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
+async fn create_schema(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    let mut tx = conn.begin_with(BEGIN_READ_COMMITTED).await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(SCHEMA_LOCK)
         .execute(&mut *tx)
@@ -205,7 +251,7 @@ impl LimitStore for PostgresStore {
         ttl: Duration,
     ) -> Result<Option<LeaseId>, StoreError> {
         let client = client.to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin().await?;
         lock_client(&mut tx, &client).await?;
         let live: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM notary_leases WHERE client_key = $1 AND expires_at > now()",
@@ -251,7 +297,7 @@ impl LimitStore for PostgresStore {
             return Ok(true);
         }
         let client = client.to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin().await?;
         lock_client(&mut tx, &client).await?;
         for w in &windows {
             let used = used(&mut *tx, &client, dimension, w.window).await?;
@@ -298,9 +344,13 @@ impl LimitStore for PostgresStore {
         }
         let db_units = as_db_units(units)?;
         let client = client.to_string();
+        // One transaction: a connection lost mid-way must not leave the
+        // short windows charged and the long ones not.
+        let mut tx = self.begin().await?;
         for w in windows {
-            add(&self.pool, &client, dimension, w.window, db_units).await?;
+            add(&mut *tx, &client, dimension, w.window, db_units).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -334,19 +384,47 @@ mod tests {
         fresh_client,
     };
 
-    /// The store under `NOTARY_TEST_DATABASE_URL`, or `None` with a note:
-    /// a checkout without a database still passes, and CI with one runs
-    /// these with no extra flags.
-    async fn store() -> Result<Option<PostgresStore>, StoreError> {
+    /// `NOTARY_TEST_DATABASE_URL`, or `None` with a note: a checkout
+    /// without a database still passes, and CI with one runs these with no
+    /// extra flags.
+    fn url() -> Option<String> {
         match std::env::var("NOTARY_TEST_DATABASE_URL") {
-            Ok(url) if !url.trim().is_empty() => {
-                Ok(Some(PostgresStore::connect(&url).await?))
-            }
+            Ok(url) if !url.trim().is_empty() => Some(url),
             _ => {
                 println!("skipped: NOTARY_TEST_DATABASE_URL not set");
-                Ok(None)
+                None
             }
         }
+    }
+
+    /// The store under [`url`], or `None` when there is none.
+    async fn store() -> Result<Option<PostgresStore>, StoreError> {
+        match url() {
+            Some(url) => Ok(Some(PostgresStore::connect(&url).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Twenty tasks ask for a lease at once, four allowed; how many got one.
+    async fn leases_granted_to_twenty_racers(
+        store: Arc<PostgresStore>,
+    ) -> Result<usize, StoreError> {
+        let client = fresh_client();
+        let racers: Vec<_> = (0..20)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store.try_lease(&client, 4, Duration::from_secs(60)).await
+                })
+            })
+            .collect();
+        let mut granted = 0;
+        for racer in racers {
+            if racer.await.expect("racer ran")?.is_some() {
+                granted += 1;
+            }
+        }
+        Ok(granted)
     }
 
     #[tokio::test]
@@ -363,23 +441,112 @@ mod tests {
         let Some(store) = store().await? else {
             return Ok(());
         };
-        let store = Arc::new(store);
-        let client = fresh_client();
-        let racers: Vec<_> = (0..20)
-            .map(|_| {
-                let store = store.clone();
-                tokio::spawn(async move {
-                    store.try_lease(&client, 4, Duration::from_secs(60)).await
-                })
-            })
-            .collect();
-        let mut granted = 0;
-        for racer in racers {
-            if racer.await.expect("racer ran")?.is_some() {
-                granted += 1;
-            }
-        }
-        assert_eq!(granted, 4);
+        assert_eq!(leases_granted_to_twenty_racers(Arc::new(store)).await?, 4);
+        Ok(())
+    }
+
+    /// `name` as an SQL identifier: `ALTER DATABASE` takes a name, not a
+    /// parameter.
+    fn quote_ident(name: &str) -> String {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+
+    /// The isolation is pinned per transaction, not inherited: with the
+    /// database defaulting to `REPEATABLE READ`, a store that merely
+    /// `BEGIN`s takes its snapshot before the advisory lock and grants
+    /// twice the cap. The default is set database-wide, which is where an
+    /// operator would set it, and reset whether or not the racers pass. A
+    /// test process killed in between leaves it set; `ALTER DATABASE ...
+    /// RESET default_transaction_isolation` puts it back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn twenty_racers_get_exactly_four_leases_under_repeatable_read(
+    ) -> Result<(), StoreError> {
+        let Some(url) = url() else {
+            return Ok(());
+        };
+        let mut admin = PgConnection::connect(&url).await?;
+        let db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&mut admin)
+            .await?;
+        let db = quote_ident(&db);
+        sqlx::query(&format!(
+            "ALTER DATABASE {db} SET default_transaction_isolation = 'repeatable read'"
+        ))
+        .execute(&mut admin)
+        .await?;
+        // A task of its own, so a panic inside is a `JoinError` here and the
+        // reset below still runs.
+        let outcome = tokio::spawn(async move {
+            let store = Arc::new(PostgresStore::connect(&url).await?);
+            let default: String =
+                sqlx::query_scalar("SHOW default_transaction_isolation")
+                    .fetch_one(&store.pool)
+                    .await?;
+            assert_eq!(default, "repeatable read", "the new default did not take");
+            leases_granted_to_twenty_racers(store).await
+        })
+        .await;
+        sqlx::query(&format!(
+            "ALTER DATABASE {db} RESET default_transaction_isolation"
+        ))
+        .execute(&mut admin)
+        .await?;
+        assert_eq!(outcome.expect("racers ran")?, 4);
+        Ok(())
+    }
+
+    /// A client's lock held elsewhere (a replica mid-transaction, a stuck
+    /// backend) fails that client's call within `lock_timeout` instead of
+    /// parking it: the pool slot comes back, and other clients never notice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lock_held_elsewhere_fails_fast_for_that_client_only(
+    ) -> Result<(), StoreError> {
+        let Some(store) = store().await? else {
+            return Ok(());
+        };
+        let url = url().expect("a store means a url");
+        let (stuck, other) = (fresh_client(), fresh_client());
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let holder = tokio::spawn(async move {
+            let mut conn = PgConnection::connect(&url).await?;
+            // The same key `lock_client` takes, as a session lock.
+            sqlx::query("SELECT pg_advisory_lock(hashtext($1)::bigint)")
+                .bind(stuck.to_string())
+                .execute(&mut conn)
+                .await?;
+            locked_tx.send(()).expect("test is waiting");
+            // Released on request, or after long enough that a call with
+            // no lock timeout comes back granted and fails the test rather
+            // than hanging it.
+            let _ = tokio::time::timeout(Duration::from_secs(8), release_rx).await;
+            conn.close().await
+        });
+        locked_rx.await.expect("holder took the lock");
+
+        let long = Duration::from_secs(60);
+        let started = std::time::Instant::now();
+        let err = store
+            .try_lease(&stuck, 1, long)
+            .await
+            .expect_err("the lock is held");
+        assert!(err.to_string().contains("lock timeout"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            store.try_lease(&other, 1, long).await?.is_some(),
+            "another client, meanwhile"
+        );
+
+        release_tx.send(()).expect("holder is waiting");
+        holder.await.expect("holder ran")?;
+        assert!(
+            store.try_lease(&stuck, 1, long).await?.is_some(),
+            "once released"
+        );
         Ok(())
     }
 
