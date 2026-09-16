@@ -17,24 +17,29 @@ registers nothing, and its public key is served at `/info`.
 
 ## Listeners
 
-Three ports, and the port a connection arrives on is its policy. No CIDR
-list, no header, nothing a caller can influence: a connection on an internal
-port has no code path that limits it, and one on the public port has no code
-path that exempts it.
+Two ports and one internal route. The port a connection arrives on, or the
+route it asks for, is its policy. No CIDR list, no header, nothing a caller
+can influence: an internal endpoint has no code path that limits it, and the
+public route has no code path that exempts it.
 
 | Port | Flag | Env | Default | Who | Policy |
 |---|---|---|---|---|---|
 | **7047** | `--port` | `NOTARY_PORT` | off unless set | Rust provers inside the cluster, MPC-TLS over TCP | Internal: no per-client limits |
 | **7048** | `--ws-port` | `NOTARY_WS_PORT` | `7048` | Browsers, ProxyMode over WebSocket, behind the load balancer | Public: every per-client limit in force |
-| **7049** | `--internal-ws-port` | `NOTARY_INTERNAL_WS_PORT` | off unless set | Our own services, ProxyMode over WebSocket | Internal: no per-client limits, no client header read |
+| 7048, `/internal/notarize-proxy` | `--internal-proxy-route` | `NOTARY_INTERNAL_PROXY_ROUTE` | off unless set | Our own services, ProxyMode over WebSocket | Internal: no per-client limits, no client header keyed on |
 
-The internal ports are off unless set because they have no limits: a
-deployment that wants them says so, and publishes them through the cluster
-Service only — never through the load balancer, never on a public address.
-7047 and 7049 are conventions, not defaults; `0` binds an ephemeral port.
-Each internal listener has its own session pool (`--mpc-max-sessions`,
-`--internal-max-sessions`), so public load can never queue our own services
-behind it.
+The internal endpoints are off unless set because they have no limits: a
+deployment that wants them says so. The MPC-TLS port is published through
+the cluster Service only — never through the load balancer, never on a
+public address; 7047 is a convention, not a default, and `0` binds an
+ephemeral port. The internal route shares the public port, so it is the
+load balancer that keeps it off the internet: the Ingress must answer 403
+for `/internal/*` (see Deployment notes). The notary refuses the route
+itself, also with 403, whenever a request carries `X-Forwarded-For` or
+`CF-Connecting-IP` — a balancer always adds one — but that is defence in
+depth, not the control. Each internal endpoint has its own session pool
+(`--mpc-max-sessions`, `--internal-max-sessions`), so public load can never
+queue our own services behind it.
 
 ## Endpoints
 
@@ -42,17 +47,16 @@ TCP wire protocol on the MPC-TLS port — length-prefixed JSON after MPC-TLS,
 for Rust backend provers. A server-side prover needs no route: it opens the
 TCP listener itself, and the same record is written back down that socket.
 
-HTTP / WebSocket on the public port and on the internal HTTP port:
+HTTP / WebSocket on the public port:
 
 | Route | What it does |
 |---|---|
 | `GET /info` | `{version, publicKey}` — compressed SEC1 notary public key, hex |
 | `GET /healthcheck` | `200` while serving; `503` from SIGTERM until the process exits, so the balancer stops sending work while in-flight sessions finish. Point health checks here, not at `/` |
 | `WS /notarize-proxy` | ProxyMode session, then one WebSocket binary message containing the length-prefixed section 9.1 attestation |
+| `WS /internal/notarize-proxy` | Only with `--internal-proxy-route`; otherwise `404`. The same session for our own in-cluster services: no per-client limits, its own pool, the limits store never consulted. `403` if the request carries `X-Forwarded-For` or `CF-Connecting-IP`, because then it came through the load balancer, which is meant to have refused it |
 
 The live WebSocket carries the TLSNotary session and its final attestation.
-The internal HTTP port serves the same router: `/info`, `/healthcheck` and
-`/notarize-proxy`.
 
 ## Configuration
 
@@ -63,10 +67,10 @@ Flags or environment variables:
 | `--host` | `NOTARY_HOST` | `127.0.0.1` | Bind address |
 | `--port` | `NOTARY_PORT` | off unless set | Internal MPC-TLS wire port; conventionally `7047`, `0` binds an ephemeral port |
 | `--ws-port` | `NOTARY_WS_PORT` | `7048` | Public HTTP/WS port (`0` disables) |
-| `--internal-ws-port` | `NOTARY_INTERNAL_WS_PORT` | off unless set | Internal HTTP/WS port; conventionally `7049`, `0` binds an ephemeral port |
+| `--internal-proxy-route` | `NOTARY_INTERNAL_PROXY_ROUTE` | off unless set | Mount `WS /internal/notarize-proxy` on the public port, ProxyMode for our own in-cluster services with no per-client limits. `true`/`false`. The load balancer must answer `403` for `/internal/*` |
 | `--signing-key` | `SIGNING_KEY` | — | Hex secp256k1 key, or `kms:<key-id-or-alias>` for AWS KMS |
 | `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent browser ProxyMode sessions on the public port; past it the upgrade is refused with 503 |
-| `--internal-max-sessions` | `NOTARY_INTERNAL_MAX_SESSIONS` | `1024` | Concurrent ProxyMode sessions on the internal HTTP port; its own pool |
+| `--internal-max-sessions` | `NOTARY_INTERNAL_MAX_SESSIONS` | `1024` | Concurrent ProxyMode sessions on the internal route; its own pool |
 | `--proxy-max-bytes` | `NOTARY_PROXY_MAX_BYTES` | `10000000` | Bytes one ProxyMode session may relay, both directions combined (10 MB); crossing it aborts the session, close code 1008 `PROXY_DATA_CAP_EXCEEDED`, nothing attested |
 | `--mpc-max-sessions` | `NOTARY_MPC_MAX_SESSIONS` | `4x` | Concurrent MPC-TLS sessions: a count (`16`) or per-core multiplier (`4x`), resolved at startup; provers past it wait, never refused |
 | `--connection-deadline-secs` | `NOTARY_CONNECTION_DEADLINE_SECS` | `300` | Lifetime of one session on either transport, queue time included; past it the connection is dropped |
@@ -83,7 +87,7 @@ Windows are `<limit>/<window>` lists: a limit is a count, or bytes with a
 `KB`/`MB`/`GB` suffix (powers of ten); a window is `<n>s`, `<n>m` or `<n>h`.
 The concurrency cap bounds what a client holds now; the windows bound how
 much of the pool's time it consumes by finishing one session and starting the
-next. Every per-client limit applies to the public port only.
+next. Every per-client limit applies to the public route only.
 
 With a KMS key the private material never enters the process: every signature
 is a `kms:Sign` call.
@@ -132,8 +136,10 @@ IPv6 clients are keyed by their /48. A residential allocation is a /56, so
 keying finer would let one subscriber mint 256 identities. An IPv4 address
 written as `::ffff:a.b.c.d` is keyed as `a.b.c.d`.
 
-Our own workloads are not exempted by address: they use the internal ports,
-which read no header and have no per-client limits at all (see Listeners).
+Our own workloads are not exempted by address: they use the MPC-TLS port or
+the internal route, which key on no header and have no per-client limits at
+all (see Listeners). The internal route goes further: a request there that
+carries either header is refused, because it came through a proxy.
 
 ### Where the counts live
 
@@ -169,18 +175,18 @@ docker run --rm \
 That is the public port only, and it expects a load balancer in front:
 every upgrade must carry `X-Forwarded-For` (or `CF-Connecting-IP` with
 `NOTARY_CLIENT_IP_HEADER=cf-connecting-ip`), or it is refused with 400. To
-drive it by hand, send the header yourself; for local work without one, run
-the internal HTTP port instead — `-e NOTARY_INTERNAL_WS_PORT=7049 -p
-7049:7049` — which reads no header and has no per-client limits. A Rust
-prover needs the MPC-TLS port, which is off unless asked for: add
-`-e NOTARY_PORT=7047 -p 7047:7047`. The image `EXPOSE`s all three; exposing
-is documentation, not a listener.
+drive it by hand, send the header yourself; for local work without one, mount
+the internal route instead — `-e NOTARY_INTERNAL_PROXY_ROUTE=true` — and use
+`ws://localhost:7048/internal/notarize-proxy`, which takes no header and has
+no per-client limits. A Rust prover needs the MPC-TLS port, which is off
+unless asked for: add `-e NOTARY_PORT=7047 -p 7047:7047`. The image
+`EXPOSE`s both ports; exposing is documentation, not a listener.
 
 The image runs as uid 10001, not root. Its `HEALTHCHECK` GETs `/healthcheck`
 on `NOTARY_WS_PORT` over loopback and passes on `200` only, so a draining
 container reads as unhealthy. The probe is `nc`, because the image has no
 curl or wget. With `NOTARY_WS_PORT=0` there is nothing to probe and the check
-fails; override it if you run the internal ports alone.
+fails; override it if you run the MPC-TLS port alone.
 
 ### Tags
 
@@ -216,10 +222,17 @@ amd64 only.
 
 - `NOTARY_PORT` must now be set explicitly (`7047`). A deployment that omits
   it has no MPC-TLS listener, and every Rust prover in the cluster fails to
-  connect. Same for `NOTARY_INTERNAL_WS_PORT` (`7049`) if any in-cluster
-  service uses ProxyMode.
-- Only the public port goes behind the load balancer. 7047 and 7049 are
-  published through the cluster Service alone: they have no limits.
+  connect.
+- `NOTARY_INTERNAL_PROXY_ROUTE=true` if any in-cluster service uses
+  ProxyMode; without it `/internal/notarize-proxy` is a 404. The route is
+  on the public port, so the Ingress must return 403 for `/internal/*` —
+  an `alb.ingress.kubernetes.io/actions.*` fixed-response action on that
+  path, ordered before the default backend. The notary's own 403 (any
+  request carrying `X-Forwarded-For` or `CF-Connecting-IP`) is the
+  backstop, not the control: verify the Ingress rule from outside before
+  turning the route on.
+- Only the public port goes behind the load balancer. 7047 is published
+  through the cluster Service alone: it has no limits.
 - `NOTARY_CLIENT_IP_HEADER`: leave it at `x-forwarded-for` while the
   Cloudflare record is DNS-only (grey); set `cf-connecting-ip` only once the
   record is proxied (orange). Either way the public port must be reachable

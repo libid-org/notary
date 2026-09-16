@@ -56,10 +56,11 @@ USER 10001:10001
 # 7047: MPC-TLS wire, internal (Rust provers in the cluster). Off unless
 #       NOTARY_PORT is set; no per-client limits, so never behind the balancer.
 # 7048: HTTP/WebSocket, public (browser tlsn_wasm clients, behind the load
-#       balancer, every per-client limit in force). On by default.
-# 7049: HTTP/WebSocket, internal (ProxyMode for our own services). Off unless
-#       NOTARY_INTERNAL_WS_PORT is set; no per-client limits.
-EXPOSE 7047 7048 7049
+#       balancer, every per-client limit in force). On by default. With
+#       NOTARY_INTERNAL_PROXY_ROUTE=true it also serves the internal ProxyMode
+#       route /internal/notarize-proxy (no per-client limits), which the load
+#       balancer must answer 403 for -- there is no separate internal port.
+EXPOSE 7047 7048
 
 # GET /healthcheck on the public port: 200 while serving, 503 from SIGTERM
 # until the in-flight sessions have drained, so an unhealthy container is one
