@@ -121,6 +121,7 @@ use tower_http::cors::{
     CorsLayer,
 };
 use tracing::{
+    debug,
     error,
     info,
     warn,
@@ -431,6 +432,9 @@ struct InfoResponse {
 
 // ─── Server startup ──────────────────────────────────────────────────────────
 
+/// How often expired leases and dead windows are swept from the store.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
+
 /// Start the notary server: the MPC-TLS listener and the public and internal
 /// HTTP/WebSocket servers, each only if configured.
 pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
@@ -513,7 +517,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         in_flight: Arc::new(InFlight::default()),
     };
 
-    // Broadcast the phase to the listeners.
+    // Broadcast the phase to the listeners and the sweeper.
     let (phase_tx, phase_rx) = watch::channel(Phase::Running);
 
     // ── Internal MPC-TLS listener (Rust provers in the cluster) ───────
@@ -595,6 +599,24 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     if let Some(listener) = internal_ws_listener {
         spawn_http_server(listener, Tier::Internal, state.clone(), phase_rx.clone());
     }
+
+    // Expired leases and dead windows go on their own; the sweep only keeps
+    // the store from growing. Every replica runs one, which is safe.
+    let sweep_store = Arc::clone(&state.limits);
+    let mut sweep_phase = phase_rx;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(SWEEP_EVERY) => {
+                    match sweep_store.sweep().await {
+                        Ok(rows) => debug!(rows, "limits store swept"),
+                        Err(error) => warn!(%error, "limits store sweep failed"),
+                    }
+                }
+                _ = sweep_phase.changed() => break,
+            }
+        }
+    });
 
     Ok(NotaryServerHandle {
         local_addr,
