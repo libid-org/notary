@@ -4,6 +4,8 @@
 //! ProxyMode data cap, the bytes window, the MPC-TLS queue) are unit tests
 //! beside the handlers.
 
+mod common;
+
 use std::{
     num::NonZeroUsize,
     time::Duration,
@@ -17,7 +19,6 @@ use futures_util::{
 use notary::{
     config::ClientIpHeader,
     limits::Concurrency,
-    server,
     NotaryServerConfig,
 };
 use tokio_tungstenite::{
@@ -168,13 +169,6 @@ fn other_limits_are_plain_numbers_and_the_deadline_is_never_zero() {
     assert!(error.contains("--setup-deadline-secs"), "{error}");
 }
 
-/// Reserve an ephemeral port for the HTTP server: ws_port 0 means "disabled",
-/// so bind-then-drop to learn a free port number.
-async fn free_port() -> u16 {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    l.local_addr().unwrap().port()
-}
-
 /// The one client the tests that are not about clients speak as.
 const A_CLIENT: &str = "203.0.113.7";
 
@@ -201,10 +195,10 @@ fn upgrade_from(url: &str, client: &str) -> tungstenite::http::Request<()> {
 /// and the slot comes back as soon as the session holding it ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn proxy_upgrade_past_max_sessions_is_refused_with_503() {
-    let ws_port = free_port().await;
-    let config =
-        parse(&["--ws-port", &ws_port.to_string(), "--max-sessions", "1"]).unwrap();
-    let handle = server::run(config).await.expect("server starts");
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&["--ws-port", &ws_port.to_string(), "--max-sessions", "1"]).unwrap()
+    })
+    .await;
     let url = format!(
         "ws://{}/notarize-proxy",
         handle.ws_local_addr().expect("ws server enabled")
@@ -250,10 +244,10 @@ async fn proxy_upgrade_past_max_sessions_is_refused_with_503() {
 /// socket and nothing else.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_upgrade_holds_no_session_slot() {
-    let ws_port = free_port().await;
-    let config =
-        parse(&["--ws-port", &ws_port.to_string(), "--max-sessions", "1"]).unwrap();
-    let handle = server::run(config).await.expect("server starts");
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&["--ws-port", &ws_port.to_string(), "--max-sessions", "1"]).unwrap()
+    })
+    .await;
     let url = format!(
         "ws://{}/notarize-proxy",
         handle.ws_local_addr().expect("ws server enabled")
@@ -364,20 +358,21 @@ async fn holds(socket: &mut Socket, wait: Duration) -> bool {
 /// ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_per_ip_cap_counts_the_rightmost_forwarded_address() {
-    let ws_port = free_port().await;
-    let config = parse(&[
-        "--ws-port",
-        &ws_port.to_string(),
-        "--max-sessions",
-        "64",
-        "--max-sessions-per-ip",
-        "2",
-        // Off, so the retries below are refused by the cap or by nothing.
-        "--per-ip-upgrades",
-        "",
-    ])
-    .unwrap();
-    let handle = server::run(config).await.expect("server starts");
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&[
+            "--ws-port",
+            &ws_port.to_string(),
+            "--max-sessions",
+            "64",
+            "--max-sessions-per-ip",
+            "2",
+            // Off, so the retries below are refused by the cap or by nothing.
+            "--per-ip-upgrades",
+            "",
+        ])
+        .unwrap()
+    })
+    .await;
     let url = format!(
         "ws://{}/notarize-proxy",
         handle.ws_local_addr().expect("ws server enabled")
@@ -436,15 +431,16 @@ async fn the_per_ip_cap_counts_the_rightmost_forwarded_address() {
 /// spent on it, and another client is not affected.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_upgrades_window_refuses_the_next_upgrade_with_429() {
-    let ws_port = free_port().await;
-    let config = parse(&[
-        "--ws-port",
-        &ws_port.to_string(),
-        "--per-ip-upgrades",
-        "2/1h",
-    ])
-    .unwrap();
-    let handle = server::run(config).await.expect("server starts");
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&[
+            "--ws-port",
+            &ws_port.to_string(),
+            "--per-ip-upgrades",
+            "2/1h",
+        ])
+        .unwrap()
+    })
+    .await;
     let url = format!(
         "ws://{}/notarize-proxy",
         handle.ws_local_addr().expect("ws server enabled")
@@ -486,9 +482,10 @@ async fn the_upgrades_window_refuses_the_next_upgrade_with_429() {
 /// that names it twice. The same upgrade with the header goes through.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unattributable_request_is_refused_at_the_upgrade() {
-    let ws_port = free_port().await;
-    let config = parse(&["--ws-port", &ws_port.to_string()]).unwrap();
-    let handle = server::run(config).await.expect("server starts");
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&["--ws-port", &ws_port.to_string()]).unwrap()
+    })
+    .await;
     let url = format!(
         "ws://{}/notarize-proxy",
         handle.ws_local_addr().expect("ws server enabled")
@@ -531,20 +528,21 @@ async fn an_unattributable_request_is_refused_at_the_upgrade() {
 /// per-client cap counts that header's value.
 #[tokio::test(flavor = "multi_thread")]
 async fn cf_connecting_ip_mode_keys_on_the_cloudflare_header() {
-    let ws_port = free_port().await;
-    let config = parse(&[
-        "--ws-port",
-        &ws_port.to_string(),
-        "--client-ip-header",
-        "cf-connecting-ip",
-        "--max-sessions-per-ip",
-        "1",
-        // Off, so the cap is the only thing that can close a session.
-        "--per-ip-upgrades",
-        "",
-    ])
-    .unwrap();
-    let handle = server::run(config).await.expect("server starts");
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&[
+            "--ws-port",
+            &ws_port.to_string(),
+            "--client-ip-header",
+            "cf-connecting-ip",
+            "--max-sessions-per-ip",
+            "1",
+            // Off, so the cap is the only thing that can close a session.
+            "--per-ip-upgrades",
+            "",
+        ])
+        .unwrap()
+    })
+    .await;
     let url = format!(
         "ws://{}/notarize-proxy",
         handle.ws_local_addr().expect("ws server enabled")

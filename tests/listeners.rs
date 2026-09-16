@@ -3,7 +3,10 @@
 //! cannot be reached fails the start, and what SIGTERM does to the real
 //! binary.
 
+mod common;
+
 use std::{
+    io::Read,
     process::{
         Child,
         Command,
@@ -44,13 +47,6 @@ fn parse(args: &[&str]) -> NotaryServerConfig {
     let mut all = vec!["notary", "--signing-key", TEST_KEY];
     all.extend_from_slice(args);
     NotaryServerConfig::parse_from(all)
-}
-
-/// Reserve an ephemeral port for the public HTTP server: ws_port 0 means
-/// "disabled", so bind-then-drop to learn a free port number.
-async fn free_port() -> u16 {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    l.local_addr().unwrap().port()
 }
 
 /// Open a ProxyMode session and start it, the way the browser does, naming
@@ -107,20 +103,21 @@ async fn the_internal_http_listener_is_off_unless_configured() {
 /// session's lease is taken.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_internal_port_counts_nothing_per_client() {
-    let ws_port = free_port().await;
-    let config = parse(&[
-        "--ws-port",
-        &ws_port.to_string(),
-        "--internal-ws-port",
-        "0",
-        "--max-sessions-per-ip",
-        "1",
-        "--per-ip-upgrades",
-        "1/1h",
-        "--per-ip-bytes",
-        "1KB/1h",
-    ]);
-    let handle = server::run(config).await.expect("server starts");
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&[
+            "--ws-port",
+            &ws_port.to_string(),
+            "--internal-ws-port",
+            "0",
+            "--max-sessions-per-ip",
+            "1",
+            "--per-ip-upgrades",
+            "1/1h",
+            "--per-ip-bytes",
+            "1KB/1h",
+        ])
+    })
+    .await;
     let internal = format!(
         "ws://{}/notarize-proxy",
         handle.internal_ws_local_addr().unwrap()
@@ -176,7 +173,7 @@ async fn the_internal_port_counts_nothing_per_client() {
 /// a notary that comes up and refuses every public client.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_limits_store_fails_the_start() {
-    let ws_port = free_port().await;
+    let ws_port = common::free_port().await;
     let config = parse(&[
         "--host",
         "0.0.0.0",
@@ -196,15 +193,10 @@ async fn an_unreachable_limits_store_fails_the_start() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn healthcheck_is_ok_on_both_listeners() {
-    let ws_port = free_port().await;
-    let handle = server::run(parse(&[
-        "--ws-port",
-        &ws_port.to_string(),
-        "--internal-ws-port",
-        "0",
-    ]))
-    .await
-    .expect("server starts");
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&["--ws-port", &ws_port.to_string(), "--internal-ws-port", "0"])
+    })
+    .await;
     let client = reqwest::Client::new();
     for addr in [
         handle.ws_local_addr().unwrap(),
@@ -233,9 +225,9 @@ struct Ports {
 impl Ports {
     async fn free() -> Self {
         Self {
-            mpc: free_port().await,
-            public: free_port().await,
-            internal: free_port().await,
+            mpc: common::free_port().await,
+            public: common::free_port().await,
+            internal: common::free_port().await,
         }
     }
 
@@ -244,42 +236,82 @@ impl Ports {
     }
 }
 
-/// The real binary, on `ports`, with the memory store; returns once its
-/// public health check answers 200.
-async fn spawn_notary(ports: &Ports) -> Spawned {
-    let notary = Spawned(
-        Command::new(env!("CARGO_BIN_EXE_notary"))
-            .args([
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &ports.mpc.to_string(),
-                "--ws-port",
-                &ports.public.to_string(),
-                "--internal-ws-port",
-                &ports.internal.to_string(),
-                "--limits-store",
-                "memory",
-                "--signing-key",
-                TEST_KEY,
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("the notary binary starts"),
-    );
+/// The real binary, with the memory store, on three ports reserved up
+/// front; returns once its public health check answers 200. A start that
+/// lost a port race exits at once instead, and is retried on fresh ports,
+/// up to [`common::TRIES`] times; an exit for any other reason fails the
+/// test with the process's stderr.
+async fn spawn_notary() -> (Spawned, Ports) {
+    for _ in 0..common::TRIES {
+        let ports = Ports::free().await;
+        let mut notary = spawn_on(&ports);
+        match until_up(&mut notary, ports.public).await {
+            Ok(()) => return (notary, ports),
+            Err(stderr) if common::is_addr_in_use(&stderr) => continue,
+            Err(stderr) => {
+                panic!("the notary exited before answering its health check:\n{stderr}")
+            }
+        }
+    }
+    panic!("no free ports in {} tries", common::TRIES)
+}
+
+/// The real binary, on `ports`, with the memory store, its stderr kept.
+fn spawn_on(ports: &Ports) -> Spawned {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_notary"))
+        .args([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &ports.mpc.to_string(),
+            "--ws-port",
+            &ports.public.to_string(),
+            "--internal-ws-port",
+            &ports.internal.to_string(),
+            "--limits-store",
+            "memory",
+            "--signing-key",
+            TEST_KEY,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the notary binary starts");
+    // Drained as it is written: a full pipe would block the notary's logs,
+    // and with them the notary.
+    let mut pipe = child.stderr.take().expect("stderr is piped");
+    let stderr = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    });
+    Spawned {
+        child,
+        stderr: Some(stderr),
+    }
+}
+
+/// Wait for `notary`'s public health check on `port` to answer 200, or for
+/// the process to exit first -- an `Err` carrying its stderr.
+async fn until_up(notary: &mut Spawned, port: u16) -> Result<(), String> {
     let up = async {
         loop {
-            if health(ports.public).await == Some(200) {
-                return;
+            if health(port).await == Some(200) {
+                return Ok(());
+            }
+            if notary.child.try_wait().unwrap().is_some() {
+                return Err(notary.stderr());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     };
-    tokio::time::timeout(Duration::from_secs(20), up)
-        .await
-        .expect("the notary never answered its health check");
-    notary
+    match tokio::time::timeout(Duration::from_secs(20), up).await {
+        Ok(result) => result,
+        Err(_) => panic!(
+            "the notary never answered its health check:\n{}",
+            notary.stderr()
+        ),
+    }
 }
 
 /// The health check's status on `port`, or `None` while nothing answers.
@@ -336,7 +368,7 @@ async fn ws_session(url: &str, client: Option<&str>) -> Socket {
 async fn exit_status(notary: &mut Spawned, within: Duration) -> std::process::ExitStatus {
     let exited = async {
         loop {
-            if let Some(status) = notary.0.try_wait().unwrap() {
+            if let Some(status) = notary.child.try_wait().unwrap() {
                 return status;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -361,8 +393,7 @@ enum Last {
 /// listener, the other two are closed first, and `last` alone must keep
 /// the process alive: each listener's sessions are counted on their own.
 async fn sigterm_drains_then_exits_zero(last: Last) {
-    let ports = Ports::free().await;
-    let mut notary = spawn_notary(&ports).await;
+    let (mut notary, ports) = spawn_notary().await;
 
     // One session on every listener, each past the point where it counts:
     // the browser's first frame on both HTTP ports, the prover's first byte
@@ -381,7 +412,7 @@ async fn sigterm_drains_then_exits_zero(last: Last) {
     notary.signal(libc::SIGTERM);
     until_draining(ports.public).await;
     assert!(
-        notary.0.try_wait().unwrap().is_none(),
+        notary.child.try_wait().unwrap().is_none(),
         "the notary exited with sessions still in flight"
     );
 
@@ -421,7 +452,7 @@ async fn sigterm_drains_then_exits_zero(last: Last) {
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
-        notary.0.try_wait().unwrap().is_none(),
+        notary.child.try_wait().unwrap().is_none(),
         "the notary exited with a {last:?} session still in flight"
     );
 
@@ -450,15 +481,14 @@ async fn sigterm_waits_for_the_mpc_session_then_exits_zero() {
 /// is cut off. Any session will do; the internal port's needs no client.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_sigterm_exits_zero_without_waiting() {
-    let ports = Ports::free().await;
-    let mut notary = spawn_notary(&ports).await;
+    let (mut notary, ports) = spawn_notary().await;
     let mut holder = ws_session(&ports.ws(ports.internal), None).await;
 
     notary.signal(libc::SIGTERM);
     until_draining(ports.public).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        notary.0.try_wait().unwrap().is_none(),
+        notary.child.try_wait().unwrap().is_none(),
         "one SIGTERM must wait for the session in flight"
     );
 
@@ -472,22 +502,43 @@ async fn a_second_sigterm_exits_zero_without_waiting() {
 }
 
 /// The spawned notary, killed if the test fails before it exits.
-struct Spawned(Child);
+struct Spawned {
+    child: Child,
+    /// Everything the process writes to stderr, collected until it exits;
+    /// taken by [`Spawned::stderr`].
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
 
 impl Spawned {
     fn signal(&self, signal: libc::c_int) {
-        let pid = libc::pid_t::try_from(self.0.id()).expect("a pid");
+        let pid = libc::pid_t::try_from(self.child.id()).expect("a pid");
         // SAFETY: kill(2) on a pid this test spawned and still owns.
         let rc = unsafe { libc::kill(pid, signal) };
         assert_eq!(rc, 0, "kill: {}", std::io::Error::last_os_error());
+    }
+
+    /// Kill the process if it is still running, reap it, and return all it
+    /// wrote to stderr.
+    fn stderr(&mut self) -> String {
+        self.reap();
+        let bytes = self
+            .stderr
+            .take()
+            .and_then(|drained| drained.join().ok())
+            .unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn reap(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
 impl Drop for Spawned {
     fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
+        self.reap();
     }
 }
