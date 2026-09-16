@@ -84,6 +84,37 @@ fn every_limit_has_a_default() {
     assert_eq!(config.per_ip_bytes, "100MB/1m,600MB/30m,1GB/1h");
 }
 
+/// `--client-ip-header` takes either header and defaults to
+/// `x-forwarded-for`; anything else is a startup error naming both.
+#[test]
+fn the_client_ip_header_is_one_of_two_and_defaults_to_x_forwarded_for() {
+    assert_eq!(
+        parse(&[]).unwrap().client_ip_header,
+        ClientIpHeader::XForwardedFor
+    );
+    for (value, expected) in [
+        ("x-forwarded-for", ClientIpHeader::XForwardedFor),
+        ("cf-connecting-ip", ClientIpHeader::CfConnectingIp),
+    ] {
+        assert_eq!(
+            parse(&["--client-ip-header", value])
+                .unwrap()
+                .client_ip_header,
+            expected,
+            "{value:?}"
+        );
+    }
+
+    let error = parse(&["--client-ip-header", "true-client-ip"])
+        .expect_err("an unknown header must not start the notary")
+        .to_string();
+    assert!(error.contains("--client-ip-header"), "{error}");
+    assert!(
+        error.contains("x-forwarded-for") && error.contains("cf-connecting-ip"),
+        "{error}"
+    );
+}
+
 #[test]
 fn mpc_max_sessions_takes_a_raw_count_or_a_core_multiplier() {
     let raw = parse(&["--mpc-max-sessions", "16"]).unwrap();
@@ -490,6 +521,60 @@ async fn an_unattributable_request_is_refused_at_the_upgrade() {
         .await
         .expect("the same upgrade with the header is admitted");
     assert_eq!(response.status(), 101);
+
+    handle.shutdown();
+}
+
+/// With `--client-ip-header cf-connecting-ip` the client is `CF-Connecting-IP`
+/// and nothing else: an upgrade carrying only `X-Forwarded-For` is refused
+/// with 400, one carrying the Cloudflare header goes through, and the
+/// per-client cap counts that header's value.
+#[tokio::test(flavor = "multi_thread")]
+async fn cf_connecting_ip_mode_keys_on_the_cloudflare_header() {
+    let ws_port = free_port().await;
+    let config = parse(&[
+        "--ws-port",
+        &ws_port.to_string(),
+        "--client-ip-header",
+        "cf-connecting-ip",
+        "--max-sessions-per-ip",
+        "1",
+        // Off, so the cap is the only thing that can close a session.
+        "--per-ip-upgrades",
+        "",
+    ])
+    .unwrap();
+    let handle = server::run(config).await.expect("server starts");
+    let url = format!(
+        "ws://{}/notarize-proxy",
+        handle.ws_local_addr().expect("ws server enabled")
+    );
+
+    let refused = session_from(&url, "203.0.113.7")
+        .await
+        .expect_err("X-Forwarded-For names no client in cf-connecting-ip mode");
+    let tungstenite::Error::Http(response) = refused else {
+        panic!("expected an HTTP refusal, got: {refused}");
+    };
+    assert_eq!(response.status(), 400);
+
+    let mut first = session_with(&url, "cf-connecting-ip", "203.0.113.7")
+        .await
+        .expect("the Cloudflare header names the client");
+    assert!(holds(&mut first, Duration::from_millis(200)).await);
+
+    // The key is the header's value: another value is another client, with
+    // a budget of its own; the same value is this client, at its cap.
+    let mut other = session_with(&url, "cf-connecting-ip", "198.51.100.4")
+        .await
+        .expect("a different client must not share the budget");
+    assert!(holds(&mut other, Duration::from_millis(200)).await);
+    let mut same = session_with(&url, "cf-connecting-ip", "203.0.113.7")
+        .await
+        .expect("the upgrade itself is not refused");
+    let (code, reason) = close_reason(&mut same).await;
+    assert_eq!(code, 1013, "reason: {reason}");
+    assert!(reason.contains("this client"), "{reason}");
 
     handle.shutdown();
 }
