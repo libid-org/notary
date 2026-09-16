@@ -8,6 +8,10 @@
 //! `AddrInUse`. That loss is retried on a fresh port; every other error is
 //! the test's.
 
+// Each test binary pulls in this module and uses a different subset of it;
+// what one binary leaves unused is not dead code, it is another's.
+#![allow(dead_code)]
+
 use notary::{
     server,
     NotaryServerConfig,
