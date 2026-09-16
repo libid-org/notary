@@ -2254,6 +2254,7 @@ mod tests {
                 NotaryState,
                 Result,
                 Tier,
+                WindowLimits,
             },
             ONE_SESSION_AT_A_TIME,
         };
@@ -2434,6 +2435,107 @@ mod tests {
 
             notary_task.abort();
             target_task.await.unwrap();
+        }
+
+        /// `--per-ip-bytes` is charged with what a session really relayed:
+        /// one full session -- a TLS handshake alone is more than a
+        /// kilobyte -- fills a 1 KB window, and the client's next upgrade is
+        /// refused with 429.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_bytes_window_is_charged_when_a_session_ends() {
+            let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
+            let prover_config = ProverConfig::builder(SERVER_DOMAIN)
+                .mode(ProverMode::Proxy)
+                .root_certs(vec![CA_CERT_DER.to_vec()])
+                .build()
+                .unwrap();
+
+            let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_addr = target_listener.local_addr().unwrap();
+            let target_task = tokio::spawn(async move {
+                let (socket, _) = target_listener.accept().await.unwrap();
+                tlsn_server_fixture::bind(socket.compat()).await.unwrap();
+            });
+
+            let mut state = NotaryState::for_tests(test_signer().await);
+            state.per_ip_bytes = WindowLimits::parse("1KB/1h").unwrap();
+            state.proxy_root_store = Arc::new(prover_config.root_store.clone());
+            state.proxy_server_addr = Some(target_addr);
+            let notary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let notary_addr = notary_listener.local_addr().unwrap();
+            let notary_task = tokio::spawn(async move {
+                axum::serve(
+                    notary_listener,
+                    router(Tier::Public, state)
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            });
+
+            let (browser_io, pump) = browser(notary_addr).await;
+            let mut prover = SdkProver::new(prover_config).unwrap();
+            let session = async {
+                prover.setup(browser_io.compat()).await.unwrap();
+                let response = prover
+                    .send_request_proxy(
+                        HttpRequest::get(format!(
+                            "https://{SERVER_DOMAIN}/bytes?size=16"
+                        ))
+                        .header("Host", SERVER_DOMAIN)
+                        .header("Connection", "close"),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status, 200);
+                let transcript = prover.transcript().unwrap();
+                prover
+                    .reveal(
+                        Reveal::new()
+                            .sent(0..transcript.sent.len())
+                            .recv(0..transcript.recv.len())
+                            .server_identity(true),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let mut io = prover.finish().await.unwrap().compat();
+                let _: AttestationWire = read_msg(&mut io).await.unwrap();
+            };
+            tokio::time::timeout(Duration::from_secs(30), session)
+                .await
+                .expect("local ProxyMode session timed out");
+            let seen = pump.await.unwrap();
+            assert!(
+                seen.close.is_none(),
+                "the session did not end cleanly: {:?}",
+                seen.close
+            );
+            target_task.await.unwrap();
+
+            // The charge lands as the handler returns, a moment after the
+            // browser saw its close frame.
+            let refused = async {
+                loop {
+                    match connect_async(format!("ws://{notary_addr}/notarize-proxy"))
+                        .await
+                    {
+                        Err(error) => return error,
+                        Ok((socket, _)) => drop(socket),
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let refused = tokio::time::timeout(Duration::from_secs(5), refused)
+                .await
+                .expect("the bytes window never refused an upgrade");
+            let tokio_tungstenite::tungstenite::Error::Http(response) = refused else {
+                panic!("expected an HTTP refusal, got: {refused}");
+            };
+            assert_eq!(response.status(), 429);
+            assert!(response.headers().contains_key("retry-after"));
+
+            notary_task.abort();
         }
 
         /// The notary's half of an MPC-TLS session against the test fixture:

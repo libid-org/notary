@@ -86,6 +86,9 @@ tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "550220
 tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.30"
+# The drain test sends the real binary a SIGTERM. Already in the graph
+# through tokio.
+libc = "0.2"
 
 # libid-org/tlsn#3 (merged) moved that branch onto libid-org/mpz 4db9454 and the
 # typed KOS `InstanceId` from libid-org/mpz#1; this pin is the merge commit on
