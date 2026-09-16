@@ -62,7 +62,20 @@ fn every_limit_has_a_default() {
     assert_eq!(config.setup_deadline(), Duration::from_secs(15));
     assert_eq!(config.max_sessions_per_ip, 4);
     assert_eq!(config.trusted_proxies, "");
-    assert_eq!(config.exempt_networks, "");
+    assert_eq!(config.limits_store, "");
+    // `parse` passes `--port 0`; unset is off.
+    assert_eq!(config.port, Some(0));
+    assert_eq!(
+        NotaryServerConfig::try_parse_from(["notary", "--signing-key", TEST_KEY])
+            .unwrap()
+            .port,
+        None
+    );
+    assert_eq!(config.ws_port, 7048);
+    assert_eq!(config.internal_ws_port, None);
+    assert_eq!(config.internal_max_sessions, 1024);
+    assert_eq!(config.per_ip_upgrades, "10/1m,60/30m,100/1h");
+    assert_eq!(config.per_ip_bytes, "100MB/1m,600MB/30m,1GB/1h");
 }
 
 /// A per-client cap with nothing to key on is a cap on the whole service, and
@@ -105,8 +118,26 @@ fn a_per_ip_cap_without_trusted_proxies_refuses_to_start() {
             .unwrap_or_else(|e| panic!("{allowed:?} must start: {e}"));
     }
 
-    // The cap off needs no proxy setting at all.
+    // Every per-client limit off needs no proxy setting at all; any one of
+    // them on does.
     let uncapped = NotaryServerConfig::try_parse_from([
+        "notary",
+        "--port",
+        "0",
+        "--signing-key",
+        TEST_KEY,
+        "--host",
+        "0.0.0.0",
+        "--max-sessions-per-ip",
+        "0",
+        "--per-ip-upgrades",
+        "",
+        "--per-ip-bytes",
+        "",
+    ])
+    .unwrap();
+    assert!(uncapped.trusted_proxies().unwrap().is_empty());
+    let windows_only = NotaryServerConfig::try_parse_from([
         "notary",
         "--port",
         "0",
@@ -118,7 +149,7 @@ fn a_per_ip_cap_without_trusted_proxies_refuses_to_start() {
         "0",
     ])
     .unwrap();
-    assert!(uncapped.trusted_proxies().unwrap().is_empty());
+    assert!(windows_only.trusted_proxies().is_err());
 
     // The default bind is loopback, so the whole suite above it still starts.
     assert!(parse(&[]).unwrap().trusted_proxies().unwrap().is_empty());
@@ -391,94 +422,6 @@ async fn the_per_ip_cap_counts_the_forwarded_client_not_the_proxy() {
 /// Our own pods dial the Service directly, and are not capped. Without this
 /// the protocol would rate-limit itself: one backend pod is one address, and
 /// every user it serves would queue behind the same handful of slots.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_direct_connection_from_an_exempt_network_is_never_capped() {
-    let ws_port = free_port().await;
-    let config = parse(&[
-        "--ws-port",
-        &ws_port.to_string(),
-        "--max-sessions",
-        "64",
-        "--max-sessions-per-ip",
-        "1",
-        // Nothing proxies this notary, and loopback is "our own network" --
-        // the shape the cluster has, with the ALB absent instead of trusted.
-        "--trusted-proxies",
-        "direct",
-        "--exempt-networks",
-        "127.0.0.0/8",
-    ])
-    .unwrap();
-    let handle = server::run(config).await.expect("server starts");
-    let url = format!(
-        "ws://{}/notarize-proxy",
-        handle.ws_local_addr().expect("ws server enabled")
-    );
-
-    // Four sessions from one address, against a cap of one. None is refused,
-    // and none needs a header to be let through.
-    let mut internal = Vec::new();
-    for i in 0..4 {
-        let (mut socket, _) = connect_async(&url)
-            .await
-            .unwrap_or_else(|e| panic!("internal session {i} was refused: {e}"));
-        socket
-            .send(Message::Binary(b"\x16\x03\x01".to_vec().into()))
-            .await
-            .expect("first bytes");
-        internal.push(socket);
-    }
-
-    // Nothing was closed for exceeding a cap.
-    for (i, socket) in internal.iter_mut().enumerate() {
-        if let Ok(Some(Ok(Message::Close(Some(frame))))) =
-            tokio::time::timeout(Duration::from_millis(300), socket.next()).await
-        {
-            assert_ne!(
-                u16::from(frame.code),
-                1013,
-                "internal session {i} was capped: {}",
-                frame.reason
-            );
-        }
-    }
-
-    handle.shutdown();
-}
-
-/// A load balancer inside the exempt set would exempt the whole internet.
-#[test]
-fn exempt_networks_may_not_contain_a_trusted_proxy() {
-    let config = parse(&[
-        "--trusted-proxies",
-        "10.60.200.0/24",
-        "--exempt-networks",
-        "10.60.0.0/16",
-    ])
-    .unwrap();
-    let proxies = config.trusted_proxies().unwrap();
-    let error = config
-        .exempt_networks(&proxies)
-        .expect_err("an exempt load balancer must not start");
-    assert!(error.contains("--exempt-networks"), "{error}");
-    assert!(error.contains("--trusted-proxies"), "{error}");
-
-    // The real pair does not overlap: pods are in the private /20s, the ALB in
-    // the public /24s.
-    let config = parse(&[
-        "--trusted-proxies",
-        "10.60.200.0/24,10.60.201.0/24",
-        "--exempt-networks",
-        "10.60.0.0/20,10.60.16.0/20",
-    ])
-    .unwrap();
-    let proxies = config.trusted_proxies().unwrap();
-    assert_eq!(config.exempt_networks(&proxies).unwrap().len(), 2);
-}
-
-/// Behind a trusted proxy the header is the only evidence of who is calling.
-/// Missing, or arriving twice, it is refused at the upgrade -- never treated
-/// as "the proxy is the client", which would key every browser together.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unattributable_request_is_refused_at_the_upgrade() {
     let ws_port = free_port().await;

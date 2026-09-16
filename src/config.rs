@@ -5,6 +5,7 @@ use clap::Parser;
 use crate::{
     client_ip::parse_networks,
     limits::Concurrency,
+    store::WindowLimits,
 };
 
 /// Configuration for the notary server.
@@ -15,15 +16,25 @@ pub struct NotaryServerConfig {
     #[arg(long, env = "NOTARY_HOST", default_value = "127.0.0.1")]
     pub host: String,
 
-    /// TCP wire-protocol port for Rust backend provers. `0` binds an ephemeral
-    /// port.
-    #[arg(long, env = "NOTARY_PORT", default_value = "7047")]
-    pub port: u16,
+    /// The internal MPC-TLS wire port, for Rust provers inside the cluster.
+    /// Off unless set: this port has no per-client limits, because our own
+    /// services are the protocol, not users of it, so it must never be
+    /// reachable from outside. Publish it through the cluster Service only.
+    /// The conventional value is 7047; `0` binds an ephemeral port.
+    #[arg(long, env = "NOTARY_PORT")]
+    pub port: Option<u16>,
 
-    /// HTTP/WebSocket port (browser / tlsn-js / tlsn_wasm clients). `0`
-    /// disables the HTTP server entirely.
-    #[arg(long, env = "NOTARY_WS_PORT", default_value = "7048")]
+    /// The public HTTP/WebSocket port: browser ProxyMode, behind the load
+    /// balancer, with every per-client limit in force. `0` disables it.
+    #[arg(long, env = "NOTARY_WS_PORT", default_value_t = 7048)]
     pub ws_port: u16,
+
+    /// The internal HTTP/WebSocket port: ProxyMode for our own services, with
+    /// no per-client limits and no `X-Forwarded-For` handling. Off unless
+    /// set, for the same reason as `--port`. The conventional value is 7049;
+    /// `0` binds an ephemeral port.
+    #[arg(long, env = "NOTARY_INTERNAL_WS_PORT")]
+    pub internal_ws_port: Option<u16>,
 
     /// Notary signing key: a hex-encoded secp256k1 private key, or
     /// `kms:<key-id-or-alias>` for an AWS KMS key.
@@ -39,6 +50,11 @@ pub struct NotaryServerConfig {
     /// `--connection-deadline-secs` bounds how long one slot stays taken.
     #[arg(long, env = "NOTARY_MAX_SESSIONS", default_value_t = 1024)]
     pub max_sessions: usize,
+
+    /// Max concurrent ProxyMode sessions on the internal port. Its own pool,
+    /// so public load can never queue our own services behind it.
+    #[arg(long, env = "NOTARY_INTERNAL_MAX_SESSIONS", default_value_t = 1024)]
+    pub internal_max_sessions: usize,
 
     /// Bytes one ProxyMode session may relay in total, both directions
     /// combined. The default is 10 MB, meaning 10,000,000 bytes. Counted on
@@ -92,15 +108,12 @@ pub struct NotaryServerConfig {
     )]
     pub setup_deadline_secs: u64,
 
-    /// Max concurrent ProxyMode sessions from one client. `0` disables the
-    /// per-client cap entirely.
+    /// Max concurrent public ProxyMode sessions from one client. `0` disables
+    /// the per-client cap.
     ///
     /// Concurrency, not request rate, because that is what a session costs:
     /// one relay task, its transcript, and up to `--proxy-max-bytes`, held
-    /// until it ends. A request-rate limit counts the upgrade and is then
-    /// blind for the whole `--connection-deadline-secs`, so a client within
-    /// any rate can still accumulate sessions until the pod runs out of
-    /// memory. One browser ceremony opens two sessions at once, so the
+    /// until it ends. One browser ceremony opens two sessions at once, so the
     /// default leaves a user one ceremony of headroom -- and a shared office
     /// address two users.
     ///
@@ -109,33 +122,58 @@ pub struct NotaryServerConfig {
     #[arg(long, env = "NOTARY_MAX_SESSIONS_PER_IP", default_value_t = 4)]
     pub max_sessions_per_ip: usize,
 
+    /// Sessions one client may START per window on the public port, as
+    /// `<count>/<window>` entries: `10/1m,60/30m,100/1h`. Every window must
+    /// have room. Empty disables it.
+    ///
+    /// The concurrency cap bounds what a client holds now; this bounds how
+    /// much of the pool's time it consumes by finishing one session and
+    /// starting the next. Counted at the upgrade, in the shared store, so it
+    /// holds across replicas.
+    #[arg(
+        long,
+        env = "NOTARY_PER_IP_UPGRADES",
+        default_value = "10/1m,60/30m,100/1h"
+    )]
+    pub per_ip_upgrades: String,
+
+    /// Bytes one client may relay per window on the public port, both
+    /// directions, as `<size>/<window>` entries: `100MB/1m,600MB/30m,1GB/1h`.
+    /// Charged when a session ends; a client whose windows are full is
+    /// refused at its next upgrade. Empty disables it.
+    #[arg(
+        long,
+        env = "NOTARY_PER_IP_BYTES",
+        default_value = "100MB/1m,600MB/30m,1GB/1h"
+    )]
+    pub per_ip_bytes: String,
+
     /// Addresses whose `X-Forwarded-For` is believed: the proxies in front of
-    /// this notary, as a comma-separated list of CIDRs or addresses. The
+    /// the public port, as a comma-separated list of CIDRs or addresses. The
     /// literal `direct` says nothing proxies this notary.
     ///
     /// Behind a load balancer every request arrives from it, so without this
-    /// a per-client cap is a global cap -- and it fails quietly, because the
-    /// notary looks merely busy. Set the load balancer's own subnets, not the
-    /// whole VPC: anything inside the trusted set can name its own client.
+    /// every client shares the balancer's address as its key and the
+    /// per-client limits refuse everyone at once. Set the load balancer's own
+    /// subnets, not the whole VPC: anything inside the trusted set can name
+    /// its own client.
     ///
     /// Spelled out rather than inferred, because an empty setting is also
-    /// what a missing environment variable looks like. With a per-client cap
-    /// on a non-loopback address, an empty setting refuses to start.
+    /// what a missing environment variable looks like. With a per-client
+    /// limit on a non-loopback address, an empty setting refuses to start.
     #[arg(long, env = "NOTARY_TRUSTED_PROXIES", default_value = "")]
     pub trusted_proxies: String,
 
-    /// Networks whose DIRECT connections are exempt from the per-client cap:
-    /// this cluster's pod subnets, as a comma-separated list of CIDRs.
+    /// Where the public port's per-client counts live: a Postgres URL
+    /// (`postgres://user:pass@host/db`), or the literal `memory` for a
+    /// single replica.
     ///
-    /// Our own services are part of the protocol, not users of it, and a cap
-    /// on them is a cap on the protocol against itself. Exemption is decided
-    /// on the socket peer alone, so a request that came through a proxy can
-    /// never claim it by naming a private address in a header.
-    ///
-    /// Must not overlap `--trusted-proxies`: a load balancer inside the exempt
-    /// set would exempt everything it forwards, which is the whole internet.
-    #[arg(long, env = "NOTARY_EXEMPT_NETWORKS", default_value = "")]
-    pub exempt_networks: String,
+    /// The load balancer spreads one client's connections across every
+    /// replica, so a count kept in one process is a limit multiplied by the
+    /// replica count. `memory` says that is understood. With a per-client
+    /// limit on a non-loopback address, an empty setting refuses to start.
+    #[arg(long, env = "NOTARY_LIMITS_STORE", default_value = "")]
+    pub limits_store: String,
 }
 
 impl NotaryServerConfig {
@@ -152,55 +190,111 @@ impl NotaryServerConfig {
     /// `--trusted-proxies` as networks, checked against the rest of the
     /// configuration.
     ///
-    /// The error is a startup failure by design. A per-client cap with no
-    /// trusted proxy behind a load balancer serves `--max-sessions-per-ip`
-    /// browsers worldwide and refuses everyone else, which is indistinguishable
-    /// from real load; refusing to start is the only version of that an
-    /// operator notices.
+    /// The error is a startup failure by design. With a load balancer in
+    /// front and nothing trusted, every client is keyed on the balancer's
+    /// address and the per-client limits refuse everyone together; refusing
+    /// to start is the only version of that an operator notices before users
+    /// do.
     pub fn trusted_proxies(&self) -> Result<Vec<ipnet::IpNet>, String> {
         let proxies = parse_networks(&self.trusted_proxies)?;
-        let bound_locally = self
-            .host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
-        if self.max_sessions_per_ip > 0
+        if self.public_limits_in_force()
             && proxies.is_empty()
             && self.trusted_proxies.trim() != "direct"
-            && !bound_locally
+            && !self.bound_locally()
         {
-            return Err(format!(
-                "--max-sessions-per-ip is {} but --trusted-proxies is empty: \
-                 behind a load balancer every request would share one key and \
-                 the cap would apply to the whole service. Set the balancer's \
-                 subnets, or \"direct\" if nothing proxies this notary, or \
-                 0 to disable the cap",
-                self.max_sessions_per_ip
-            ));
+            return Err(
+                "per-client limits are on but --trusted-proxies is empty: behind a \
+                 load balancer every client would share its address and the limits \
+                 would refuse everyone at once. Set the balancer's subnets, or \
+                 \"direct\" if nothing proxies this notary"
+                    .into(),
+            );
         }
         Ok(proxies)
     }
 
-    /// `--exempt-networks` as networks, checked against the proxies.
+    /// `--per-ip-upgrades` parsed.
+    pub fn per_ip_upgrades(&self) -> Result<WindowLimits, String> {
+        WindowLimits::parse(&self.per_ip_upgrades)
+            .map_err(|e| format!("--per-ip-upgrades {e}"))
+    }
+
+    /// `--per-ip-bytes` parsed.
+    pub fn per_ip_bytes(&self) -> Result<WindowLimits, String> {
+        WindowLimits::parse(&self.per_ip_bytes).map_err(|e| format!("--per-ip-bytes {e}"))
+    }
+
+    /// `--limits-store`, checked against the rest of the configuration.
     ///
-    /// A load balancer inside the exempt set would exempt everything it
-    /// forwards, so the overlap is a startup error rather than a limit that
-    /// silently applies to nobody.
-    pub fn exempt_networks(
-        &self,
-        proxies: &[ipnet::IpNet],
-    ) -> Result<Vec<ipnet::IpNet>, String> {
-        let exempt = parse_networks(&self.exempt_networks)?;
-        for proxy in proxies {
-            if let Some(net) = exempt
-                .iter()
-                .find(|net| net.contains(&proxy.addr()) || proxy.contains(&net.addr()))
-            {
-                return Err(format!(
-                    "--exempt-networks {net} overlaps --trusted-proxies {proxy}: \
-                     every request the proxy forwards would be exempt"
-                ));
+    /// A limit counted in one process is silently multiplied by the replica
+    /// count, so on a non-loopback bind the choice has to be explicit:
+    /// `memory` for a single replica, or a Postgres URL.
+    pub fn limits_store(&self) -> Result<LimitsStoreSpec, String> {
+        let spec = self.limits_store.trim();
+        if spec.is_empty() {
+            if self.public_limits_in_force() && !self.bound_locally() {
+                return Err(
+                    "per-client limits are on but --limits-store is empty: counted in \
+                     one process, every limit is multiplied by the replica count. Set \
+                     a Postgres URL, or \"memory\" for a single replica"
+                        .into(),
+                );
             }
+            return Ok(LimitsStoreSpec::Memory);
         }
-        Ok(exempt)
+        if spec == "memory" {
+            return Ok(LimitsStoreSpec::Memory);
+        }
+        if spec.starts_with("postgres://") || spec.starts_with("postgresql://") {
+            return Ok(LimitsStoreSpec::Postgres(spec.to_string()));
+        }
+        Err(format!(
+            "--limits-store: expected \"memory\" or a postgres:// URL, got '{}'",
+            redact(spec)
+        ))
+    }
+
+    /// Whether any per-client limit applies on the public port.
+    fn public_limits_in_force(&self) -> bool {
+        self.ws_port != 0
+            && (self.max_sessions_per_ip > 0
+                || !self.per_ip_upgrades.trim().is_empty()
+                || !self.per_ip_bytes.trim().is_empty())
+    }
+
+    fn bound_locally(&self) -> bool {
+        self.host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    }
+}
+
+/// Where the shared counts live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LimitsStoreSpec {
+    /// In this process only. Correct for one replica; a multiplier otherwise.
+    Memory,
+    /// A Postgres URL.
+    Postgres(String),
+}
+
+impl std::fmt::Display for LimitsStoreSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory => f.write_str("memory"),
+            Self::Postgres(url) => write!(f, "postgres ({})", redact(url)),
+        }
+    }
+}
+
+/// A URL with any password replaced, for logs and errors.
+fn redact(url: &str) -> String {
+    match url.split_once("://").and_then(|(scheme, rest)| {
+        let (creds, host) = rest.split_once('@')?;
+        let user = creds.split_once(':').map_or(creds, |(u, _)| u);
+        Some(format!("{scheme}://{user}:***@{host}"))
+    }) {
+        Some(redacted) => redacted,
+        None => url.to_string(),
     }
 }

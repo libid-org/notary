@@ -29,9 +29,11 @@ const MAX_HOPS: usize = 64;
 
 /// The identity a per-client limit counts against.
 ///
-/// IPv6 is keyed by its /64 prefix. A single residential allocation is a /64
-/// at best and often a /56, so keying the full address would let one
-/// subscriber hold as many slots as they cared to enumerate.
+/// IPv6 is keyed by its /48 prefix. A residential allocation is a /56 and a
+/// site's is a /48, so keying anything finer lets one subscriber mint a new
+/// identity per /64 -- 256 of them from a /56 -- and hold that many times the
+/// cap. Keying at /48 means neighbours under one provider block share a
+/// budget; that is the price of the cap meaning anything at all.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ClientKey(IpAddr);
 
@@ -42,7 +44,7 @@ impl ClientKey {
             IpAddr::V4(v4) => Self(IpAddr::V4(v4)),
             IpAddr::V6(v6) => {
                 let mut octets = v6.octets();
-                octets[8..].fill(0);
+                octets[6..].fill(0);
                 Self(IpAddr::V6(Ipv6Addr::from(octets)))
             }
         }
@@ -52,44 +54,6 @@ impl ClientKey {
 impl std::fmt::Display for ClientKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
-    }
-}
-
-/// Who is calling, and whether the per-client limits apply to them.
-///
-/// The distinction is the path, not the address. Anything that arrived through
-/// the load balancer is public traffic, whatever address it claims; anything
-/// that dialled the Service directly from a network configured as ours is one
-/// of our own workloads, and capping those would be capping the protocol
-/// against itself.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Client {
-    /// Reached this notary directly from an exempt network. Not capped.
-    Internal(ClientKey),
-    /// Came through a trusted proxy, or directly from anywhere else. Capped.
-    Public(ClientKey),
-}
-
-impl Client {
-    /// The identity to count and to log, capped or not.
-    pub fn key(self) -> ClientKey {
-        match self {
-            Self::Internal(key) | Self::Public(key) => key,
-        }
-    }
-
-    /// Whether the per-client session cap applies.
-    pub fn is_capped(self) -> bool {
-        matches!(self, Self::Public(_))
-    }
-}
-
-impl std::fmt::Display for Client {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Internal(key) => write!(f, "{key} (internal)"),
-            Self::Public(key) => write!(f, "{key}"),
-        }
     }
 }
 
@@ -103,6 +67,14 @@ impl std::fmt::Display for Client {
 pub enum Unattributed {
     /// The request came through a trusted proxy that forwarded no client.
     Missing,
+    /// The request carries `X-Forwarded-For` but did not come from a trusted
+    /// proxy. Either a client wrote the header itself, or a balancer this
+    /// notary was not told about is forwarding to it. Both are refused: the
+    /// first has no honest reading, and the second is a stale
+    /// `--trusted-proxies` -- which this makes loud on the first request,
+    /// instead of quietly keying every user behind the new hop to one
+    /// address.
+    Unexpected,
     /// More than one `X-Forwarded-For` field line arrived.
     ///
     /// RFC 9110 lets a recipient join repeated field lines with commas, and
@@ -121,6 +93,7 @@ impl std::fmt::Display for Unattributed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reason = match self {
             Self::Missing => "no X-Forwarded-For from a trusted proxy",
+            Self::Unexpected => "X-Forwarded-For from an untrusted peer",
             Self::Repeated => "more than one X-Forwarded-For header",
             Self::Malformed => "malformed X-Forwarded-For",
         };
@@ -130,33 +103,34 @@ impl std::fmt::Display for Unattributed {
 
 /// Who `peer` is calling for, given what the proxies in front said.
 ///
-/// `trusted` is the set of addresses whose `X-Forwarded-For` is believed;
-/// `exempt` is the set whose direct connections are our own workloads. An
-/// empty `trusted` means there is no proxy: the peer is the client.
+/// `trusted` is the set of addresses whose `X-Forwarded-For` is believed. A
+/// peer inside it is a proxy, and the client is found in the header. A peer
+/// outside it is the client itself, and must not be carrying the header at
+/// all: with a balancer in front, a direct connection with `X-Forwarded-For`
+/// is either forged or from a hop this notary was not configured to trust,
+/// and both are refused rather than guessed at.
 ///
-/// `exempt` is checked first and only against the peer, so a request that came
-/// through a load balancer can never claim exemption -- the header it carries
-/// is written by whoever is calling, and a private address in it means
-/// nothing.
+/// An empty `trusted` means nothing proxies this notary: every peer is the
+/// client, and any `X-Forwarded-For` it sends is ignored, because there is
+/// no proxy for it to have come from.
 pub fn resolve(
     peer: SocketAddr,
     headers: &HeaderMap,
     trusted: &[IpNet],
-    exempt: &[IpNet],
-) -> Result<Client, Unattributed> {
-    if contains(exempt, peer.ip()) {
-        return Ok(Client::Internal(ClientKey::from_ip(peer.ip())));
-    }
+) -> Result<ClientKey, Unattributed> {
+    let mut lines = headers.get_all(FORWARDED_FOR).iter();
+    let line = lines.next();
+    let repeated = lines.next().is_some();
+
     if !contains(trusted, peer.ip()) {
-        // Reached directly from somewhere that is neither a proxy nor ours --
-        // a public client on a notary with no balancer, or development.
-        // Whatever the request claims about forwarding, this is the client.
-        return Ok(Client::Public(ClientKey::from_ip(peer.ip())));
+        if line.is_some() && !trusted.is_empty() {
+            return Err(Unattributed::Unexpected);
+        }
+        return Ok(ClientKey::from_ip(peer.ip()));
     }
 
-    let mut lines = headers.get_all(FORWARDED_FOR).iter();
-    let line = lines.next().ok_or(Unattributed::Missing)?;
-    if lines.next().is_some() {
+    let line = line.ok_or(Unattributed::Missing)?;
+    if repeated {
         return Err(Unattributed::Repeated);
     }
     let line = line.to_str().map_err(|_| Unattributed::Malformed)?;
@@ -182,7 +156,7 @@ pub fn resolve(
         // Every hop is a proxy of ours. The leftmost is then the closest this
         // can get to the client, and it is as trustworthy as the chain.
         .unwrap_or(&chain[0]);
-    Ok(Client::Public(ClientKey::from_ip(*client)))
+    Ok(ClientKey::from_ip(*client))
 }
 
 fn contains(nets: &[IpNet], ip: IpAddr) -> bool {
@@ -255,7 +229,6 @@ mod tests {
     use super::{
         parse_networks,
         resolve,
-        Client,
         ClientKey,
         Unattributed,
         FORWARDED_FOR,
@@ -264,11 +237,6 @@ mod tests {
     /// The testnet ALB's subnets: `cidrsubnet(vpc_cidr, 8, i + 200)`.
     fn alb() -> Vec<ipnet::IpNet> {
         parse_networks("10.60.200.0/24,10.60.201.0/24").unwrap()
-    }
-
-    /// The testnet pod subnets: `cidrsubnet(vpc_cidr, 4, i)`.
-    fn pods() -> Vec<ipnet::IpNet> {
-        parse_networks("10.60.0.0/20,10.60.16.0/20").unwrap()
     }
 
     fn none() -> Vec<ipnet::IpNet> {
@@ -293,8 +261,8 @@ mod tests {
     #[test]
     fn the_alb_names_the_client() {
         assert_eq!(
-            resolve(peer("10.60.200.31"), &xff("203.0.113.7"), &alb(), &pods()),
-            Ok(Client::Public(key("203.0.113.7")))
+            resolve(peer("10.60.200.31"), &xff("203.0.113.7"), &alb()),
+            Ok(key("203.0.113.7"))
         );
     }
 
@@ -303,51 +271,54 @@ mod tests {
     #[test]
     fn a_forged_prefix_is_ignored() {
         assert_eq!(
-            resolve(
-                peer("10.60.200.31"),
-                &xff("9.9.9.9, 203.0.113.7"),
-                &alb(),
-                &pods()
-            ),
-            Ok(Client::Public(key("203.0.113.7")))
+            resolve(peer("10.60.200.31"), &xff("9.9.9.9, 203.0.113.7"), &alb()),
+            Ok(key("203.0.113.7"))
         );
     }
 
-    /// Our own pods dial the Service directly. They are not capped, and the
-    /// header they send -- if any -- is not read.
+    /// A private address in the header buys nothing: the entry the walk lands
+    /// on is the one the balancer wrote.
     #[test]
-    fn an_exempt_network_is_internal_and_uncapped() {
-        let client =
-            resolve(peer("10.60.5.90"), &xff("203.0.113.7"), &alb(), &pods()).unwrap();
-        assert_eq!(client, Client::Internal(key("10.60.5.90")));
-        assert!(!client.is_capped());
+    fn a_proxied_request_is_keyed_on_what_the_balancer_wrote() {
+        assert_eq!(
+            resolve(
+                peer("10.60.200.31"),
+                &xff("10.60.5.90, 203.0.113.7"),
+                &alb()
+            ),
+            Ok(key("203.0.113.7"))
+        );
     }
 
-    /// Exemption is about the path. A public client cannot claim it by putting
-    /// a private address in the header, because the entry the walk lands on is
-    /// the one the balancer wrote.
+    /// With no balancer configured, every peer is the client and any header
+    /// it sends is ignored -- there is no proxy for it to have come from.
     #[test]
-    fn a_proxied_request_can_never_claim_exemption() {
-        let client = resolve(
-            peer("10.60.200.31"),
-            &xff("10.60.5.90, 203.0.113.7"),
-            &alb(),
-            &pods(),
-        )
-        .unwrap();
-        assert_eq!(client, Client::Public(key("203.0.113.7")));
-        assert!(client.is_capped());
+    fn with_no_proxies_the_peer_is_the_client() {
+        assert_eq!(
+            resolve(peer("203.0.113.7"), &xff("9.9.9.9"), &none()),
+            Ok(key("203.0.113.7"))
+        );
+        assert_eq!(
+            resolve(peer("203.0.113.7"), &HeaderMap::new(), &none()),
+            Ok(key("203.0.113.7"))
+        );
     }
 
-    /// Reached directly from somewhere that is neither a proxy nor ours: a
-    /// public client on a notary with no balancer. Capped on its own address,
-    /// and its header is still not read.
+    /// With a balancer configured, a direct connection carrying
+    /// `X-Forwarded-For` is refused: it is either a forgery or a hop the
+    /// notary was not told about, and refusing makes a stale trusted list
+    /// loud on the first request rather than a silent collapse onto one key.
     #[test]
-    fn a_direct_public_client_is_capped_on_its_peer() {
-        let client =
-            resolve(peer("203.0.113.7"), &xff("9.9.9.9"), &none(), &pods()).unwrap();
-        assert_eq!(client, Client::Public(key("203.0.113.7")));
-        assert!(client.is_capped());
+    fn a_forwarded_request_from_an_untrusted_peer_is_refused() {
+        assert_eq!(
+            resolve(peer("10.60.202.14"), &xff("203.0.113.7"), &alb()),
+            Err(Unattributed::Unexpected)
+        );
+        // Without the header it is simply a direct client.
+        assert_eq!(
+            resolve(peer("10.60.202.14"), &HeaderMap::new(), &alb()),
+            Ok(key("10.60.202.14"))
+        );
     }
 
     /// Two hops of our own -- an ALB behind another proxy in the trusted set.
@@ -359,9 +330,8 @@ mod tests {
                 peer("10.60.200.31"),
                 &xff("203.0.113.7, 10.60.201.4"),
                 &alb(),
-                &none()
             ),
-            Ok(Client::Public(key("203.0.113.7")))
+            Ok(key("203.0.113.7"))
         );
     }
 
@@ -374,9 +344,8 @@ mod tests {
                 peer("10.60.200.31"),
                 &xff("10.60.200.9, 10.60.201.4"),
                 &alb(),
-                &none()
             ),
-            Ok(Client::Public(key("10.60.200.9")))
+            Ok(key("10.60.200.9"))
         );
     }
 
@@ -386,14 +355,14 @@ mod tests {
     #[test]
     fn a_trusted_peer_without_a_usable_header_is_refused() {
         assert_eq!(
-            resolve(peer("10.60.200.31"), &HeaderMap::new(), &alb(), &pods()),
+            resolve(peer("10.60.200.31"), &HeaderMap::new(), &alb()),
             Err(Unattributed::Missing)
         );
 
         let mut repeated = xff("203.0.113.7");
         repeated.append(FORWARDED_FOR, HeaderValue::from_static("9.9.9.9"));
         assert_eq!(
-            resolve(peer("10.60.200.31"), &repeated, &alb(), &pods()),
+            resolve(peer("10.60.200.31"), &repeated, &alb()),
             Err(Unattributed::Repeated)
         );
     }
@@ -411,7 +380,7 @@ mod tests {
             "203.0.113.7, 999.1.1.1",
         ] {
             assert_eq!(
-                resolve(peer("10.60.200.31"), &xff(bad), &alb(), &none()),
+                resolve(peer("10.60.200.31"), &xff(bad), &alb()),
                 Err(Unattributed::Malformed),
                 "{bad:?}"
             );
@@ -422,7 +391,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         assert_eq!(
-            resolve(peer("10.60.200.31"), &xff(&long), &alb(), &none()),
+            resolve(peer("10.60.200.31"), &xff(&long), &alb()),
             Err(Unattributed::Malformed)
         );
     }
@@ -437,18 +406,20 @@ mod tests {
             ("2001:db8::1", "2001:db8::"),
         ] {
             assert_eq!(
-                resolve(peer("10.60.200.31"), &xff(entry), &alb(), &none()),
-                Ok(Client::Public(key(expected))),
+                resolve(peer("10.60.200.31"), &xff(entry), &alb()),
+                Ok(key(expected)),
                 "{entry:?}"
             );
         }
     }
 
-    /// One IPv6 subscriber is one key, however many addresses they enumerate.
+    /// One IPv6 subscriber is one key, however many /64s they enumerate: a
+    /// /56 collapses to its /48, and only a different /48 is a different key.
     #[test]
-    fn ipv6_collapses_to_its_64_prefix() {
-        assert_eq!(key("2001:db8:0:1::1"), key("2001:db8:0:1:ffff::9"));
-        assert_ne!(key("2001:db8:0:1::1"), key("2001:db8:0:2::1"));
+    fn ipv6_collapses_to_its_48_prefix() {
+        assert_eq!(key("2001:db8:0:1::1"), key("2001:db8:0:ff:ffff::9"));
+        assert_eq!(key("2001:db8:0:1::1"), key("2001:db8::1"));
+        assert_ne!(key("2001:db8:0:1::1"), key("2001:db8:1::1"));
     }
 
     #[test]

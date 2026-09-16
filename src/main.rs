@@ -21,7 +21,11 @@ fn main() -> anyhow::Result<()> {
         .build()?
         .block_on(async {
             let handle = server::run(config).await?;
-            info!("Notary server listening on {}", handle.local_addr());
+            info!(
+                mpc = ?handle.local_addr(),
+                ws = ?handle.ws_local_addr(),
+                "Notary server up"
+            );
             tokio::signal::ctrl_c().await?;
             handle.shutdown();
             Ok(())

@@ -53,7 +53,7 @@ fn probe_connections_leave_no_live_tasks() {
             TEST_KEY,
         ]);
         let handle = server::run(config).await.expect("server starts");
-        let addr = handle.local_addr();
+        let addr = handle.local_addr().expect("mpc port enabled");
 
         // The probe pattern: connect, then go away before speaking the
         // protocol. Each cycle spawns one handler task, whose verifier must

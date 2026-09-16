@@ -113,7 +113,7 @@ use tracing::{
 use crate::{
     client_ip::{
         self,
-        Client,
+        ClientKey,
     },
     config::NotaryServerConfig,
     error::{
@@ -131,14 +131,15 @@ use crate::{
 
 /// Handle for controlling the running notary server.
 pub struct NotaryServerHandle {
-    local_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     ws_local_addr: Option<SocketAddr>,
     shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl NotaryServerHandle {
-    /// Returns the address the TCP wire listener is bound to.
-    pub fn local_addr(&self) -> SocketAddr {
+    /// Returns the address the internal MPC-TLS listener is bound to, if
+    /// enabled.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
         self.local_addr
     }
 
@@ -219,9 +220,6 @@ struct NotaryState {
     /// Addresses whose `X-Forwarded-For` names the client. Empty means the
     /// socket peer is the client.
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
-    /// Networks whose direct connections are our own workloads, exempt from
-    /// the per-client cap.
-    exempt_networks: Arc<Vec<ipnet::IpNet>>,
     /// Bytes one ProxyMode session may relay, both directions combined.
     proxy_max_bytes: usize,
     proxy_root_store: Arc<tlsn::webpki::RootCertStore>,
@@ -255,7 +253,6 @@ impl NotaryState {
             max_sessions_per_ip: 4,
             client_sessions: ClientSessions::new(),
             trusted_proxies: Arc::new(Vec::new()),
-            exempt_networks: Arc::new(Vec::new()),
             proxy_max_bytes: 10_000_000,
             proxy_root_store: Arc::new(libid_tlsn::root_store()),
             proxy_server_addr: None,
@@ -281,9 +278,6 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     // is a global cap that looks like ordinary load.
     let trusted_proxies = config
         .trusted_proxies()
-        .map_err(|detail| Error::NotaryServer { detail })?;
-    let exempt_networks = config
-        .exempt_networks(&trusted_proxies)
         .map_err(|detail| Error::NotaryServer { detail })?;
 
     // SIGNING_KEY accepts `kms:<key-id-or-alias>` or a hex key.
@@ -315,7 +309,6 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         setup_deadline_secs = config.setup_deadline_secs,
         max_sessions_per_ip = config.max_sessions_per_ip,
         trusted_proxies = %config.trusted_proxies,
-        exempt_networks = %config.exempt_networks,
         "resource limits in force"
     );
     let state = NotaryState {
@@ -324,7 +317,6 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         max_sessions_per_ip: config.max_sessions_per_ip,
         client_sessions: ClientSessions::new(),
         trusted_proxies: Arc::new(trusted_proxies),
-        exempt_networks: Arc::new(exempt_networks),
         proxy_max_bytes: config.proxy_max_bytes,
         proxy_root_store: Arc::new(libid_tlsn::root_store()),
         proxy_server_addr: None,
@@ -337,11 +329,17 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     // Broadcast shutdown to the TCP and WebSocket servers.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // ── TCP listener (Rust client) ────────────────────────────────────
-    let tcp_listener =
-        TcpListener::bind(format!("{}:{}", config.host, config.port)).await?;
-    let local_addr = tcp_listener.local_addr()?;
-    info!("Notary TCP listening on {}", local_addr);
+    // ── Internal MPC-TLS listener (Rust provers in the cluster) ───────
+    // Off unless configured: it has no per-client limits.
+    let tcp_listener = match config.port {
+        Some(port) => Some(TcpListener::bind(format!("{}:{port}", config.host)).await?),
+        None => None,
+    };
+    let local_addr = tcp_listener.as_ref().and_then(|l| l.local_addr().ok());
+    match local_addr {
+        Some(addr) => info!("Notary MPC-TLS listening on {addr} (internal)"),
+        None => info!("Notary MPC-TLS port off (--port not set)"),
+    }
 
     // ── WebSocket HTTP server (browser / tlsn-js) ─────────────────────
     let ws_listener = if config.ws_port == 0 {
@@ -357,33 +355,35 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
 
     let tcp_state = state.clone();
     let mut tcp_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                result = tcp_listener.accept() => {
-                    match result {
-                        Ok((stream, peer)) => {
-                            info!("TCP connection from {}", peer);
-                            let s = tcp_state.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_tcp_prover(stream, &s).await {
-                                    error!("TCP handler error for {}: {}", peer, e);
-                                }
-                            });
+    if let Some(tcp_listener) = tcp_listener {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = tcp_listener.accept() => {
+                        match result {
+                            Ok((stream, peer)) => {
+                                info!("TCP connection from {}", peer);
+                                let s = tcp_state.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_tcp_prover(stream, &s).await {
+                                        error!("TCP handler error for {}: {}", peer, e);
+                                    }
+                                });
+                            }
+                            Err(e) => error!("TCP accept failed: {}", e),
                         }
-                        Err(e) => error!("TCP accept failed: {}", e),
+                    }
+                    _ = tcp_shutdown.changed() => {
+                        info!("Notary TCP shutting down");
+                        // Provers still waiting for a slot fail now with a clear
+                        // error; the ones holding a slot keep it to the end.
+                        tcp_state.mpc_sessions.close();
+                        break;
                     }
                 }
-                _ = tcp_shutdown.changed() => {
-                    info!("Notary TCP shutting down");
-                    // Provers still waiting for a slot fail now with a clear
-                    // error; the ones holding a slot keep it to the end.
-                    tcp_state.mpc_sessions.close();
-                    break;
-                }
             }
-        }
-    });
+        });
+    }
 
     if let Some(ws_listener) = ws_listener {
         let ws_state = state.clone();
@@ -517,12 +517,7 @@ async fn notarize_proxy_ws_handler(
     // fallback to the socket peer: behind a load balancer that peer is the
     // balancer, so falling back would quietly turn the per-client cap into a
     // cap on the whole service.
-    let client = match client_ip::resolve(
-        peer,
-        &headers,
-        &state.trusted_proxies,
-        &state.exempt_networks,
-    ) {
+    let client = match client_ip::resolve(peer, &headers, &state.trusted_proxies) {
         Ok(client) => client,
         Err(reason) => {
             info!(%peer, %reason, "ProxyMode: upgrade refused, client unidentified");
@@ -588,7 +583,7 @@ async fn first_relayed_bytes(
 async fn handle_ws_proxy_notarize(
     socket: WebSocket,
     peer: SocketAddr,
-    client: Client,
+    client: ClientKey,
     state: NotaryState,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -623,12 +618,12 @@ async fn handle_ws_proxy_notarize(
     // This client's own slot first: one client at its cap must not spend a
     // slot from the shared pool to find that out. Held for the session
     // lifetime, like the pool permit below.
-    let _client_slot = if state.max_sessions_per_ip == 0 || !client.is_capped() {
+    let _client_slot = if state.max_sessions_per_ip == 0 {
         None
     } else {
         match state
             .client_sessions
-            .try_take(client.key(), state.max_sessions_per_ip)
+            .try_take(client, state.max_sessions_per_ip)
         {
             Some(slot) => Some(slot),
             None => {
