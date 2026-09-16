@@ -153,7 +153,7 @@ impl Lab {
         self.spawn_on_store(label, &self.pg_url, extra).await
     }
 
-    /// The real binary on `store`, with `extra` flags: three free ports,
+    /// The real binary on `store`, with `extra` flags: two free ports,
     /// retried when the bind-then-drop race is lost, up to the public
     /// health check answering 200. Any other exit fails the test with the
     /// process's output.
@@ -187,8 +187,7 @@ impl Lab {
                 &ports.mpc.to_string(),
                 "--ws-port",
                 &ports.public.to_string(),
-                "--internal-ws-port",
-                &ports.internal.to_string(),
+                "--internal-proxy-route",
                 "--limits-store",
                 store,
                 "--proxy-upstream",
@@ -261,13 +260,12 @@ impl Drop for Fixture {
     }
 }
 
-/// The three listeners of a spawned notary, on ports reserved up front:
-/// an ephemeral port is only logged, so it could not be learned back.
+/// The two listeners of a spawned notary, on ports reserved up front: an
+/// ephemeral port is only logged, so it could not be learned back.
 #[derive(Clone)]
 struct Ports {
     mpc: u16,
     public: u16,
-    internal: u16,
 }
 
 impl Ports {
@@ -275,7 +273,6 @@ impl Ports {
         Self {
             mpc: common::free_port().await,
             public: common::free_port().await,
-            internal: common::free_port().await,
         }
     }
 }
@@ -294,8 +291,12 @@ impl Notary {
         format!("ws://127.0.0.1:{}/notarize-proxy", self.ports.public)
     }
 
+    /// The internal route, on the public port.
     fn internal(&self) -> String {
-        format!("ws://127.0.0.1:{}/notarize-proxy", self.ports.internal)
+        format!(
+            "ws://127.0.0.1:{}/internal/notarize-proxy",
+            self.ports.public
+        )
     }
 
     fn signal(&self, signal: libc::c_int) {
@@ -996,12 +997,13 @@ async fn the_global_pool_refuses_with_503() {
     assert_eq!(refused.retry_after, None);
 }
 
-/// Every public limit at its minimum, and the internal port ignores them
+/// Every public limit at its minimum, and the internal route ignores them
 /// all: three held sessions and a whole ceremony, with no client header,
 /// and the store's tables are exactly as they were. A public ceremony
-/// afterwards shows the store would have recorded one.
+/// afterwards shows the store would have recorded one. The same route
+/// reached through a proxy -- `X-Forwarded-For` set -- is 403.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_internal_port_ignores_every_limit() {
+async fn the_internal_route_ignores_every_limit() {
     let Some(lab) = Lab::open().await else { return };
     let notary = lab
         .spawn(
@@ -1028,7 +1030,7 @@ async fn the_internal_port_ignores_every_limit() {
     let _three = admitted(&notary.internal(), &[]).await;
     let outcome = run_ceremony(&notary.internal(), &[])
         .await
-        .expect("the internal port admits");
+        .expect("the internal route admits");
     assert_signed(outcome.attested());
 
     let after = (
@@ -1038,6 +1040,15 @@ async fn the_internal_port_ignores_every_limit() {
     assert_eq!(after, before, "internal traffic touched the store");
 
     let client = fresh_client();
+    let proxied = refused(
+        &notary.internal(),
+        &xff(&client),
+        "the internal route admitted a request that came through a proxy",
+    )
+    .await;
+    assert_eq!(proxied.status, 403, "{proxied:?}");
+    assert_eq!(proxied.body, "internal route is not served through a proxy");
+
     run_ceremony(&notary.public(), &xff(&client))
         .await
         .expect("one public ceremony fits every minimum")

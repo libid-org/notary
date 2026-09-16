@@ -79,7 +79,7 @@ fn every_limit_has_a_default() {
         None
     );
     assert_eq!(config.ws_port, 7048);
-    assert_eq!(config.internal_ws_port, None);
+    assert!(!config.internal_proxy_route);
     assert_eq!(config.internal_max_sessions, 1024);
     assert_eq!(config.per_ip_upgrades, "10/1m,60/30m,100/1h");
     assert_eq!(config.per_ip_bytes, "100MB/1m,600MB/30m,1GB/1h");
