@@ -4279,7 +4279,6 @@ dependencies = [
  "clap",
  "futures-util",
  "hex",
- "ipnet",
  "libc",
  "libid-ceremony",
  "libid-crypto",

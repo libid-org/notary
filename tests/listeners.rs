@@ -182,8 +182,6 @@ async fn an_unreachable_limits_store_fails_the_start() {
         "0.0.0.0",
         "--ws-port",
         &ws_port.to_string(),
-        "--trusted-proxies",
-        "direct",
         "--limits-store",
         "postgres://127.0.0.1:1/x",
     ]);
@@ -316,9 +314,16 @@ async fn until_draining(port: u16) {
 }
 
 /// A ProxyMode session past its first frame on `url`: the drain must wait
-/// for it.
-async fn ws_session(url: &str) -> Socket {
-    let (mut socket, _) = connect_async(url).await.expect("upgrade");
+/// for it. `client` is named in `X-Forwarded-For`, which the public port
+/// requires and the internal port never reads.
+async fn ws_session(url: &str, client: Option<&str>) -> Socket {
+    let mut request = url.into_client_request().unwrap();
+    if let Some(client) = client {
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", HeaderValue::from_str(client).unwrap());
+    }
+    let (mut socket, _) = connect_async(request).await.expect("upgrade");
     socket
         .send(Message::Binary(b"\x16\x03\x01".to_vec().into()))
         .await
@@ -362,8 +367,8 @@ async fn sigterm_drains_then_exits_zero(last: Last) {
     // One session on every listener, each past the point where it counts:
     // the browser's first frame on both HTTP ports, the prover's first byte
     // on the MPC port.
-    let mut public = Some(ws_session(&ports.ws(ports.public)).await);
-    let mut internal = Some(ws_session(&ports.ws(ports.internal)).await);
+    let mut public = Some(ws_session(&ports.ws(ports.public), Some("203.0.113.7")).await);
+    let mut internal = Some(ws_session(&ports.ws(ports.internal), None).await);
     let mut mpc = tokio::net::TcpStream::connect(("127.0.0.1", ports.mpc))
         .await
         .expect("MPC connect");
@@ -381,8 +386,13 @@ async fn sigterm_drains_then_exits_zero(last: Last) {
     );
 
     // Nothing new is taken while draining -- and the listener is still
-    // open to say so, because a closed port reads as a crash.
-    let refused = connect_async(ports.ws(ports.public))
+    // open to say so, because a closed port reads as a crash. The client is
+    // named, so the draining check is the only thing that can refuse.
+    let mut request = ports.ws(ports.public).into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+    let refused = connect_async(request)
         .await
         .expect_err("a new session was accepted while draining");
     let tungstenite::Error::Http(response) = refused else {
@@ -442,7 +452,7 @@ async fn sigterm_waits_for_the_mpc_session_then_exits_zero() {
 async fn a_second_sigterm_exits_zero_without_waiting() {
     let ports = Ports::free().await;
     let mut notary = spawn_notary(&ports).await;
-    let mut holder = ws_session(&ports.ws(ports.public)).await;
+    let mut holder = ws_session(&ports.ws(ports.public), Some("203.0.113.7")).await;
 
     notary.signal(libc::SIGTERM);
     until_draining(ports.public).await;
