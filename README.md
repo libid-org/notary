@@ -33,8 +33,8 @@ deployment that wants them says so. The MPC-TLS port is published through
 the cluster Service only — never through the load balancer, never on a
 public address; 7047 is a convention, not a default, and `0` binds an
 ephemeral port. The internal route shares the public port, so it is the
-load balancer that keeps it off the internet: the Ingress must answer 403
-for `/internal/*` (see Deployment notes). The notary refuses the route
+load balancer that keeps it off the internet: the Ingress must refuse
+`/internal/*` with a fixed response (see Deployment notes). The notary refuses the route
 itself, also with 403, whenever a request carries `X-Forwarded-For` or
 `CF-Connecting-IP` — a balancer always adds one — but that is defence in
 depth, not the control. Each internal endpoint has its own session pool
@@ -67,7 +67,7 @@ Flags or environment variables:
 | `--host` | `NOTARY_HOST` | `127.0.0.1` | Bind address |
 | `--port` | `NOTARY_PORT` | off unless set | Internal MPC-TLS wire port; conventionally `7047`, `0` binds an ephemeral port |
 | `--ws-port` | `NOTARY_WS_PORT` | `7048` | Public HTTP/WS port (`0` disables) |
-| `--internal-proxy-route` | `NOTARY_INTERNAL_PROXY_ROUTE` | off unless set | Mount `WS /internal/notarize-proxy` on the public port, ProxyMode for our own in-cluster services with no per-client limits. `true`/`false`. The load balancer must answer `403` for `/internal/*` |
+| `--internal-proxy-route` | `NOTARY_INTERNAL_PROXY_ROUTE` | off unless set | Mount `WS /internal/notarize-proxy` on the public port, ProxyMode for our own in-cluster services with no per-client limits. `true`/`false`. The load balancer must refuse `/internal/*` with a fixed response |
 | `--signing-key` | `SIGNING_KEY` | — | Hex secp256k1 key, or `kms:<key-id-or-alias>` for AWS KMS |
 | `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent browser ProxyMode sessions on the public port; past it the upgrade is refused with 503 |
 | `--internal-max-sessions` | `NOTARY_INTERNAL_MAX_SESSIONS` | `1024` | Concurrent ProxyMode sessions on the internal route; its own pool |
@@ -225,9 +225,10 @@ amd64 only.
   connect.
 - `NOTARY_INTERNAL_PROXY_ROUTE=true` if any in-cluster service uses
   ProxyMode; without it `/internal/notarize-proxy` is a 404. The route is
-  on the public port, so the Ingress must return 403 for `/internal/*` —
-  an `alb.ingress.kubernetes.io/actions.*` fixed-response action on that
-  path, ordered before the default backend. The notary's own 403 (any
+  on the public port, so the Ingress must refuse `/internal/*` with a
+  fixed response — `alb.ingress.kubernetes.io/actions.*` on that path,
+  ordered before the default backend; 404 hides the route, as o2's
+  `deny-v1-internal` does. The notary's own 403 (any
   request carrying `X-Forwarded-For` or `CF-Connecting-IP`) is the
   backstop, not the control: verify the Ingress rule from outside before
   turning the route on.
