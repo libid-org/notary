@@ -82,8 +82,19 @@ const BEGIN_READ_COMMITTED: &str = "BEGIN ISOLATION LEVEL READ COMMITTED";
 /// catalog's unique index instead of one of them winning.
 const SCHEMA_LOCK: i64 = 0x6e6f_7461_7279_5f6c; // "notary_l"
 
+/// When a window row ends, as the sweep's index and its predicate both
+/// spell it. `timestamptz + interval` is only STABLE -- it reads the
+/// session time zone -- so it cannot be indexed; the same sum on the
+/// UTC-naive timestamp is IMMUTABLE, and for a whole number of seconds
+/// means the same instant.
+macro_rules! window_end {
+    () => {
+        "((window_start AT TIME ZONE 'UTC') + make_interval(secs => window_secs))"
+    };
+}
+
 /// Created at connect time, in this order, and never migrated: a column that
-/// has to change gets a new table.
+/// has to change gets a new table. An index may go: nothing reads one.
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS notary_leases (
         lease_id uuid PRIMARY KEY,
@@ -100,9 +111,24 @@ const SCHEMA: &[&str] = &[
         units bigint NOT NULL DEFAULT 0,
         PRIMARY KEY (client_key, dimension, window_secs, window_start)
     )",
-    "CREATE INDEX IF NOT EXISTS notary_windows_window_start
-        ON notary_windows (window_start)",
+    // Superseded: the sweep's predicate is on the window's end, which a
+    // start-only index cannot serve, and nothing else queried it.
+    "DROP INDEX IF EXISTS notary_windows_window_start",
+    concat!(
+        "CREATE INDEX IF NOT EXISTS notary_windows_ends_at ON notary_windows (",
+        window_end!(),
+        ")"
+    ),
 ];
+
+/// The sweep's half for windows: every row whose window has ended. The
+/// predicate is the indexed expression verbatim, so the planner can use
+/// `notary_windows_ends_at` rather than scan the table.
+const SWEEP_WINDOWS: &str = concat!(
+    "DELETE FROM notary_windows WHERE ",
+    window_end!(),
+    " < (now() AT TIME ZONE 'UTC')"
+);
 
 // The start of the window `$3` seconds long that the database's `now()`
 // falls in: fixed windows, so a count is one upsert on a key every replica
@@ -359,13 +385,10 @@ impl LimitStore for PostgresStore {
             .execute(&self.pool)
             .await?
             .rows_affected();
-        let windows = sqlx::query(
-            "DELETE FROM notary_windows
-             WHERE window_start + make_interval(secs => window_secs) < now()",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        let windows = sqlx::query(SWEEP_WINDOWS)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
         Ok(leases + windows)
     }
 
@@ -588,6 +611,38 @@ mod tests {
             store.try_lease(&stuck, 1, long).await?.is_some(),
             "once released"
         );
+        Ok(())
+    }
+
+    /// The sweep's window predicate is served by `notary_windows_ends_at`:
+    /// with sequential scans priced out, the planner reaches for it, which
+    /// it can only do if the expression is indexable and matches the index
+    /// verbatim. The old start-only index is gone.
+    #[tokio::test]
+    async fn the_sweep_predicate_is_indexed() -> Result<(), StoreError> {
+        let Some(store) = store().await? else {
+            return Ok(());
+        };
+        drop(store);
+        let url = url().expect("a store means a url");
+        let mut conn = PgConnection::connect(&url).await?;
+        sqlx::query("SET enable_seqscan = off")
+            .execute(&mut conn)
+            .await?;
+        let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {SWEEP_WINDOWS}"))
+            .fetch_all(&mut conn)
+            .await?;
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("Index Scan on notary_windows_ends_at")
+                || plan.contains("Index Scan using notary_windows_ends_at"),
+            "{plan}"
+        );
+        let old: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('notary_windows_window_start')::text")
+                .fetch_one(&mut conn)
+                .await?;
+        assert_eq!(old, None, "the start-only index was not dropped");
         Ok(())
     }
 
