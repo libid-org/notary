@@ -83,6 +83,47 @@ fn every_limit_has_a_default() {
     assert_eq!(config.internal_max_sessions, 1024);
     assert_eq!(config.per_ip_upgrades, "10/1m,60/30m,100/1h");
     assert_eq!(config.per_ip_bytes, "100MB/1m,600MB/30m,1GB/1h");
+    assert_eq!(config.proxy_upstream, None);
+    assert_eq!(config.proxy_upstream().unwrap(), None);
+}
+
+/// `--proxy-upstream` is a test hook: it parses as a socket address on a
+/// loopback bind, and refuses to start the notary on any other bind, so a
+/// notary the network can reach never attests a fixture as the real host.
+#[test]
+fn the_proxy_upstream_hook_only_starts_on_a_loopback_bind() {
+    let config = parse(&["--proxy-upstream", "127.0.0.1:4433"]).unwrap();
+    assert_eq!(
+        config.proxy_upstream().unwrap(),
+        Some("127.0.0.1:4433".parse().unwrap())
+    );
+    assert_eq!(
+        parse(&["--proxy-upstream", " "]).unwrap().proxy_upstream(),
+        Ok(None)
+    );
+
+    let error = parse(&["--proxy-upstream", "fixture:4433"])
+        .unwrap()
+        .proxy_upstream()
+        .expect_err("a hostname is not an address");
+    assert!(error.contains("--proxy-upstream"), "{error}");
+
+    for host in ["0.0.0.0", "::", "10.0.0.5"] {
+        let error = NotaryServerConfig::try_parse_from([
+            "notary",
+            "--signing-key",
+            TEST_KEY,
+            "--host",
+            host,
+            "--proxy-upstream",
+            "127.0.0.1:4433",
+        ])
+        .unwrap()
+        .proxy_upstream()
+        .expect_err("the hook must not start on a non-loopback bind");
+        assert!(error.contains("--proxy-upstream"), "{error}");
+        assert!(error.contains(host), "{error}");
+    }
 }
 
 /// `--client-ip-header` takes either header and defaults to

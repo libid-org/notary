@@ -190,6 +190,16 @@ pub struct NotaryServerConfig {
     /// limit on a non-loopback address, an empty setting refuses to start.
     #[arg(long, env = "NOTARY_LIMITS_STORE", default_value = "")]
     pub limits_store: String,
+
+    /// TEST HOOK. Where every ProxyMode session dials, as `<ip>:<port>`,
+    /// instead of `<server name>:443`. It exists so a test suite can run the
+    /// real binary against a local TLS fixture; the server name a session
+    /// authenticates is unchanged, so the fixture has to hold a certificate
+    /// for it. Refused on any non-loopback `--host`: a notary reachable
+    /// from off the machine dials the server it authenticates and nothing
+    /// else.
+    #[arg(long, env = "NOTARY_PROXY_UPSTREAM")]
+    pub proxy_upstream: Option<String>,
 }
 
 impl NotaryServerConfig {
@@ -242,6 +252,29 @@ impl NotaryServerConfig {
             "--limits-store: expected \"memory\" or a postgres:// URL, got '{}'",
             redact(spec)
         ))
+    }
+
+    /// `--proxy-upstream`, checked against the bind address: the hook is
+    /// for a test suite on this machine, so a non-loopback bind refuses to
+    /// start rather than serve attestations of a fixture to the network.
+    pub fn proxy_upstream(&self) -> Result<Option<std::net::SocketAddr>, String> {
+        let Some(spec) = self
+            .proxy_upstream
+            .as_deref()
+            .map(str::trim)
+            .filter(|spec| !spec.is_empty())
+        else {
+            return Ok(None);
+        };
+        if !self.bound_locally() {
+            return Err(format!(
+                "--proxy-upstream is a test hook and needs a loopback --host, got '{}'",
+                self.host
+            ));
+        }
+        spec.parse().map(Some).map_err(|e| {
+            format!("--proxy-upstream: expected <ip>:<port>, got '{spec}': {e}")
+        })
     }
 
     /// Whether any per-client limit applies on the public port.
