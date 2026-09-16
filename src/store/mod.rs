@@ -24,16 +24,22 @@
 
 use std::{
     fmt,
+    sync::Arc,
     time::Duration,
 };
 
 use async_trait::async_trait;
 
-use crate::client_ip::ClientKey;
+use crate::{
+    client_ip::ClientKey,
+    config::LimitsStoreSpec,
+};
 
 mod memory;
+mod postgres;
 
 pub use memory::MemoryStore;
+pub use postgres::PostgresStore;
 
 /// At most `limit` units per `window`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,6 +243,16 @@ pub trait LimitStore: Send + Sync + 'static {
 
     /// One line for the startup log.
     fn describe(&self) -> String;
+}
+
+/// The store `spec` names, ready to use. A Postgres store connects and
+/// creates its tables here, so a database that cannot be reached is a
+/// startup error rather than a limit that fails closed on every request.
+pub async fn connect(spec: &LimitsStoreSpec) -> Result<Arc<dyn LimitStore>, StoreError> {
+    Ok(match spec {
+        LimitsStoreSpec::Memory => Arc::new(MemoryStore::new()),
+        LimitsStoreSpec::Postgres(url) => Arc::new(PostgresStore::connect(url).await?),
+    })
 }
 
 /// A URL with any password replaced, for logs and errors.
