@@ -77,6 +77,7 @@ Flags or environment variables:
 | `--client-ip-header` | `NOTARY_CLIENT_IP_HEADER` | `x-forwarded-for` | Which header names the client on the public port: `x-forwarded-for` (the rightmost entry; notary directly behind the ALB) or `cf-connecting-ip` (Cloudflare proxied record only). A public upgrade without it is refused with 400 |
 | `--limits-store` | `NOTARY_LIMITS_STORE` | — | Where the per-client counts live: a `postgres://` URL, or `memory` for a single replica |
 | `--proxy-upstream` | `NOTARY_PROXY_UPSTREAM` | — | Tests only; loopback binds only. `<ip>:<port>` every ProxyMode session dials instead of `<server name>:443`, so the real binary can be run against a local TLS fixture; refuses to start on a non-loopback `--host` |
+| `--proxy-upstream-ca` | `NOTARY_PROXY_UPSTREAM_CA` | — | Tests only; with `--proxy-upstream`. A CA certificate file (DER or PEM) added to the roots the upstream's certificate is verified against |
 
 Windows are `<limit>/<window>` lists: a limit is a count, or bytes with a
 `KB`/`MB`/`GB` suffix (powers of ten); a window is `<n>s`, `<n>m` or `<n>h`.
