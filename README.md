@@ -50,6 +50,7 @@ Flags or environment variables:
 | `--max-sessions-per-ip` | `NOTARY_MAX_SESSIONS_PER_IP` | `4` | Concurrent ProxyMode sessions one client may hold; past it the session is closed with code 1013. `0` disables |
 | `--trusted-proxies` | `NOTARY_TRUSTED_PROXIES` | — | Addresses whose `X-Forwarded-For` names the client, as CIDRs; `direct` if nothing proxies this notary |
 | `--exempt-networks` | `NOTARY_EXEMPT_NETWORKS` | — | Networks whose direct connections skip the per-client cap: this cluster's pod subnets |
+| `--limits-store` | `NOTARY_LIMITS_STORE` | — | Where the per-client counts live: a `postgres://` URL, or `memory` for a single replica |
 
 With a KMS key the private material never enters the process: every signature
 is a `kms:Sign` call.
@@ -97,6 +98,25 @@ private subnets:
 NOTARY_TRUSTED_PROXIES=10.60.200.0/24,10.60.201.0/24
 NOTARY_EXEMPT_NETWORKS=10.60.0.0/20,10.60.16.0/20
 ```
+
+### Where the counts live
+
+The per-client counts — sessions held now, sessions started and bytes relayed
+per window — are kept in `--limits-store`, which takes one of two forms:
+
+- A Postgres URL, `postgres://user:pass@host/db`. The tables are created at
+  startup if they are missing; nothing else is needed. Every replica counts
+  in the same place, on the database's clock, and a database that cannot be
+  reached is a startup error. While it is unreachable at runtime the public
+  port refuses: a limit that fails open under a store outage is a limit an
+  attacker can switch off.
+- The literal `memory`: counts kept in this process. Correct for exactly one
+  replica. Behind a load balancer every replica keeps its own copy, so a
+  client gets each limit once per replica, and nothing in the logs says so.
+
+With a per-client limit on a non-loopback bind, an empty setting is a startup
+error for the same reason `--trusted-proxies` is: the failure it hides looks
+like ordinary load.
 
 ## Docker
 
