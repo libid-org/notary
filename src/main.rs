@@ -27,27 +27,73 @@ fn main() -> anyhow::Result<()> {
                 internal_ws = ?handle.internal_ws_local_addr(),
                 "Notary server up"
             );
-            let signal = stop_signal().await?;
+            let mut signals = StopSignals::new()?;
+            let signal = signals.next().await;
             info!(signal, "stop requested; draining");
-            handle.drain().await;
+            // A second signal while draining is an operator who will not
+            // wait: stop now, and still exit 0 -- nothing failed.
+            tokio::select! {
+                () = handle.drain() => {}
+                signal = signals.next() => {
+                    info!(signal, "second signal: exiting without waiting");
+                }
+            }
             Ok(())
         })
 }
 
-/// Resolves on Ctrl-C or, on Unix, SIGTERM -- what the orchestrator sends a
-/// pod before its grace period starts -- with the signal's name.
-async fn stop_signal() -> std::io::Result<&'static str> {
+/// Ctrl-C and, on Unix, SIGTERM -- what the orchestrator sends a pod before
+/// its grace period starts. One registration, kept for the life of the
+/// process, so a second signal is heard while the first is being honoured.
+struct StopSignals {
     #[cfg(unix)]
-    {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result.map(|()| "SIGINT"),
-            _ = sigterm.recv() => Ok("SIGTERM"),
+    sigint: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    sigterm: tokio::signal::unix::Signal,
+}
+
+impl StopSignals {
+    fn new() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{
+                signal,
+                SignalKind,
+            };
+            Ok(Self {
+                sigint: signal(SignalKind::interrupt())?,
+                sigterm: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
         }
     }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await.map(|()| "ctrl-c")
+
+    /// The next stop signal, by name.
+    async fn next(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                () = received(&mut self.sigint) => "SIGINT",
+                () = received(&mut self.sigterm) => "SIGTERM",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "ctrl-c"
+        }
+    }
+}
+
+/// One delivery of `signal`. A stream that can deliver no more is not a
+/// signal: it pends, so the other stream still decides.
+#[cfg(unix)]
+async fn received(signal: &mut tokio::signal::unix::Signal) {
+    match signal.recv().await {
+        Some(()) => {}
+        None => std::future::pending().await,
     }
 }
