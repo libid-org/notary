@@ -24,6 +24,7 @@ fn main() -> anyhow::Result<()> {
             info!(
                 mpc = ?handle.local_addr(),
                 ws = ?handle.ws_local_addr(),
+                internal_ws = ?handle.internal_ws_local_addr(),
                 "Notary server up"
             );
             tokio::signal::ctrl_c().await?;
