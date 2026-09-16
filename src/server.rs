@@ -111,6 +111,10 @@ use tracing::{
 };
 
 use crate::{
+    client_ip::{
+        self,
+        Client,
+    },
     config::NotaryServerConfig,
     error::{
         Error,
@@ -119,6 +123,7 @@ use crate::{
     limits::{
         available_cores,
         CappedIo,
+        ClientSessions,
         DataCap,
         PeekedIo,
     },
@@ -207,6 +212,16 @@ struct NotaryState {
     signer: Arc<ManagedSigner>,
     /// ProxyMode slots: an upgrade that finds none is refused with 503.
     proxy_sessions: Arc<Semaphore>,
+    /// ProxyMode slots each client may hold at once; `0` disables the cap.
+    max_sessions_per_ip: usize,
+    /// Sessions per client, for the cap above.
+    client_sessions: Arc<ClientSessions>,
+    /// Addresses whose `X-Forwarded-For` names the client. Empty means the
+    /// socket peer is the client.
+    trusted_proxies: Arc<Vec<ipnet::IpNet>>,
+    /// Networks whose direct connections are our own workloads, exempt from
+    /// the per-client cap.
+    exempt_networks: Arc<Vec<ipnet::IpNet>>,
     /// Bytes one ProxyMode session may relay, both directions combined.
     proxy_max_bytes: usize,
     proxy_root_store: Arc<tlsn::webpki::RootCertStore>,
@@ -237,6 +252,10 @@ impl NotaryState {
             public_key_hex: hex::encode(signer.compressed_public_key()),
             signer: Arc::new(signer),
             proxy_sessions: Arc::new(Semaphore::new(1024)),
+            max_sessions_per_ip: 4,
+            client_sessions: ClientSessions::new(),
+            trusted_proxies: Arc::new(Vec::new()),
+            exempt_networks: Arc::new(Vec::new()),
             proxy_max_bytes: 10_000_000,
             proxy_root_store: Arc::new(libid_tlsn::root_store()),
             proxy_server_addr: None,
@@ -258,6 +277,15 @@ struct InfoResponse {
 
 /// Start the notary server (TCP + optional browser TLSNotary WebSocket).
 pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
+    // Before anything else, because a per-client cap with nothing to key on
+    // is a global cap that looks like ordinary load.
+    let trusted_proxies = config
+        .trusted_proxies()
+        .map_err(|detail| Error::NotaryServer { detail })?;
+    let exempt_networks = config
+        .exempt_networks(&trusted_proxies)
+        .map_err(|detail| Error::NotaryServer { detail })?;
+
     // SIGNING_KEY accepts `kms:<key-id-or-alias>` or a hex key.
     let signer = SignerSource::from_spec(&config.signing_key)?
         .build_managed(None)
@@ -285,11 +313,18 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         mpc_max_recv_data = libid_tlsn::MAX_RECV_DATA,
         connection_deadline_secs = config.connection_deadline_secs,
         setup_deadline_secs = config.setup_deadline_secs,
+        max_sessions_per_ip = config.max_sessions_per_ip,
+        trusted_proxies = %config.trusted_proxies,
+        exempt_networks = %config.exempt_networks,
         "resource limits in force"
     );
     let state = NotaryState {
         signer: Arc::new(signer),
         proxy_sessions: Arc::new(Semaphore::new(config.max_sessions)),
+        max_sessions_per_ip: config.max_sessions_per_ip,
+        client_sessions: ClientSessions::new(),
+        trusted_proxies: Arc::new(trusted_proxies),
+        exempt_networks: Arc::new(exempt_networks),
         proxy_max_bytes: config.proxy_max_bytes,
         proxy_root_store: Arc::new(libid_tlsn::root_store()),
         proxy_server_addr: None,
@@ -475,8 +510,26 @@ fn attestation_frame(attestation: &AttestationWire) -> Result<Vec<u8>> {
 async fn notarize_proxy_ws_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     State(state): State<NotaryState>,
 ) -> impl IntoResponse {
+    // Who this session counts against. A refusal here is a refusal, never a
+    // fallback to the socket peer: behind a load balancer that peer is the
+    // balancer, so falling back would quietly turn the per-client cap into a
+    // cap on the whole service.
+    let client = match client_ip::resolve(
+        peer,
+        &headers,
+        &state.trusted_proxies,
+        &state.exempt_networks,
+    ) {
+        Ok(client) => client,
+        Err(reason) => {
+            info!(%peer, %reason, "ProxyMode: upgrade refused, client unidentified");
+            return (StatusCode::BAD_REQUEST, reason.to_string()).into_response();
+        }
+    };
+
     // Refuse rather than queue: a browser retries a refused upgrade cheaply,
     // and nothing has been spent on this session yet.
     //
@@ -490,7 +543,7 @@ async fn notarize_proxy_ws_handler(
         info!(%peer, "ProxyMode: all session slots busy; upgrade refused with 503");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_proxy_notarize(socket, peer, state))
+    ws.on_upgrade(move |socket| handle_ws_proxy_notarize(socket, peer, client, state))
         .into_response()
 }
 
@@ -535,6 +588,7 @@ async fn first_relayed_bytes(
 async fn handle_ws_proxy_notarize(
     socket: WebSocket,
     peer: SocketAddr,
+    client: Client,
     state: NotaryState,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -565,6 +619,34 @@ async fn handle_ws_proxy_notarize(
                 return;
             }
         };
+
+    // This client's own slot first: one client at its cap must not spend a
+    // slot from the shared pool to find that out. Held for the session
+    // lifetime, like the pool permit below.
+    let _client_slot = if state.max_sessions_per_ip == 0 || !client.is_capped() {
+        None
+    } else {
+        match state
+            .client_sessions
+            .try_take(client.key(), state.max_sessions_per_ip)
+        {
+            Some(slot) => Some(slot),
+            None => {
+                info!(
+                    %peer, %client,
+                    "ProxyMode: client already running {} sessions; refused with 1013",
+                    state.max_sessions_per_ip
+                );
+                let _ = ws_tx
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CLOSE_TRY_AGAIN_LATER,
+                        reason: "too many sessions from this client; retry".into(),
+                    })))
+                    .await;
+                return;
+            }
+        }
+    };
 
     // Held for the session lifetime; dropping it returns the slot.
     let Ok(_permit) = Arc::clone(&state.proxy_sessions).try_acquire_owned() else {
