@@ -40,8 +40,8 @@ pub struct NotaryServerConfig {
     /// session pool (`--internal-max-sessions`), and the limits store never
     /// consulted. Off unless set; without it the route does not exist (404).
     ///
-    /// The route MUST be blocked at the load balancer -- a fixed-response 403
-    /// for `/internal/*` -- because nothing on it limits a caller. As defence
+    /// The route MUST be blocked at the load balancer -- a fixed response,
+    /// 404, for `/internal/*` -- because nothing on it limits a caller. As defence
     /// in depth the notary answers 403 itself whenever the request carries
     /// `X-Forwarded-For` or `CF-Connecting-IP`, since the balancer always adds
     /// one; that backstop is not the control.
