@@ -32,6 +32,10 @@ use tokio_tungstenite::{
 /// anvil #0 — public test key.
 const TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
+type Socket = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
 /// Parse the CLI as `main` does, on top of the arguments a bare start needs.
 fn parse(extra: &[&str]) -> Result<NotaryServerConfig, clap::Error> {
     let mut args = vec![
@@ -326,15 +330,7 @@ async fn until_refused(url: &str) -> tungstenite::Error {
 /// Open a ProxyMode session claiming to come from `client`, as the load
 /// balancer would say it: the notary trusts loopback as its proxy, so the
 /// header this sets is the one the walk lands on.
-async fn session_from(
-    url: &str,
-    client: &str,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    tungstenite::Error,
-> {
+async fn session_from(url: &str, client: &str) -> Result<Socket, tungstenite::Error> {
     let mut request = url.into_client_request().unwrap();
     request
         .headers_mut()
@@ -349,11 +345,7 @@ async fn session_from(
 }
 
 /// The close code and reason the notary ended a session with.
-async fn close_reason(
-    socket: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) -> (u16, String) {
+async fn close_reason(socket: &mut Socket) -> (u16, String) {
     let next = tokio::time::timeout(Duration::from_secs(5), socket.next())
         .await
         .expect("the notary never answered");
@@ -365,9 +357,23 @@ async fn close_reason(
     }
 }
 
+/// The session is still running `wait` later: the notary may talk on the
+/// socket -- its session does -- but has not closed it.
+async fn holds(socket: &mut Socket, wait: Duration) -> bool {
+    let closed = async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    };
+    tokio::time::timeout(wait, closed).await.is_err()
+}
+
 /// A client gets `--max-sessions-per-ip` sessions at once and no more, counted
 /// against the address the load balancer forwarded -- not against the balancer,
-/// which every browser shares.
+/// which every browser shares -- and gets one back when a session ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_per_ip_cap_counts_the_forwarded_client_not_the_proxy() {
     let ws_port = free_port().await;
@@ -380,6 +386,9 @@ async fn the_per_ip_cap_counts_the_forwarded_client_not_the_proxy() {
         "2",
         "--trusted-proxies",
         "127.0.0.0/8",
+        // Off, so the retries below are refused by the cap or by nothing.
+        "--per-ip-upgrades",
+        "",
     ])
     .unwrap();
     let handle = server::run(config).await.expect("server starts");
@@ -388,7 +397,7 @@ async fn the_per_ip_cap_counts_the_forwarded_client_not_the_proxy() {
         handle.ws_local_addr().expect("ws server enabled")
     );
 
-    let _first = session_from(&url, "203.0.113.7")
+    let first = session_from(&url, "203.0.113.7")
         .await
         .expect("first session");
     let _second = session_from(&url, "203.0.113.7")
@@ -416,6 +425,22 @@ async fn the_per_ip_cap_counts_the_forwarded_client_not_the_proxy() {
     let _other = session_from(&url, "198.51.100.4")
         .await
         .expect("a different client must not share the budget");
+
+    // A session that ends gives its lease back: the moment the first is
+    // gone, the same client is under its cap and a new session holds.
+    drop(first);
+    let reopened = async {
+        loop {
+            let mut socket = session_from(&url, "203.0.113.7").await.expect("upgrade");
+            if holds(&mut socket, Duration::from_millis(200)).await {
+                return socket;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let _reopened = tokio::time::timeout(Duration::from_secs(5), reopened)
+        .await
+        .expect("the lease was not released when its session ended");
 
     handle.shutdown();
 }

@@ -51,8 +51,8 @@ HTTP / WebSocket on the public port and on the internal HTTP port:
 | `WS /notarize-proxy` | ProxyMode session, then one WebSocket binary message containing the length-prefixed section 9.1 attestation |
 
 The live WebSocket carries the TLSNotary session and its final attestation.
-Whether the internal HTTP port also serves `/info` is unverified; it serves
-`/healthcheck` and `/notarize-proxy`.
+The internal HTTP port serves the same router: `/info`, `/healthcheck` and
+`/notarize-proxy`.
 
 ## Configuration
 
@@ -218,16 +218,25 @@ amd64 only.
   published through the cluster Service alone: they have no limits.
 - `NOTARY_TRUSTED_PROXIES` = the ALB's subnets, not the VPC. Anything inside
   the set can name its own client.
-- `NOTARY_LIMITS_STORE` = a Postgres URL at more than one replica; `memory`
-  multiplies every per-client limit by the replica count.
+- `NOTARY_LIMITS_STORE` is required on any non-loopback bind: `memory` at
+  exactly one replica, a Postgres URL beyond that. `memory` multiplies every
+  per-client limit by the replica count.
 - `terminationGracePeriodSeconds` must exceed `--setup-deadline-secs` +
   `--connection-deadline-secs` (defaults `15` + `300` = `315`): SIGTERM
   drains the sessions in flight, that sum is the longest one can take, and
   a shorter grace period kills them mid-attestation. A second SIGTERM ends
   the drain at once, still with exit 0.
-- The ALB health check targets `GET /healthcheck` on the public port. It
-  returns `503` from SIGTERM until the process exits, which is how the
-  balancer learns to stop sending work to a draining pod.
+- Point the ALB health check at `GET /healthcheck` on the public port: set
+  `alb.ingress.kubernetes.io/healthcheck-path: /healthcheck` and drop
+  `alb.ingress.kubernetes.io/success-codes: "404"`, which only existed
+  because `/` has no route. It returns `503` from SIGTERM until the process
+  exits, which is how the balancer learns to stop sending work to a
+  draining pod.
+- An idle pod exits within a few tens of milliseconds of SIGTERM: the drain
+  has nothing to wait for. A `preStop` sleep of at least the ALB
+  health-check interval × unhealthy threshold is what gives the balancer
+  time to see the `503` before the listeners close; without it the pod is
+  gone before the balancer has stopped routing to it.
 
 ## Browser wasm bundle
 
