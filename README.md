@@ -15,22 +15,44 @@ What differs is only what the prover reveals. Every contract authenticates the
 signature through the on-chain `NotaryService`; the notary's signature alone
 registers nothing, and its public key is served at `/info`.
 
+## Listeners
+
+Three ports, and the port a connection arrives on is its policy. No CIDR
+list, no header, nothing a caller can influence: a connection on an internal
+port has no code path that limits it, and one on the public port has no code
+path that exempts it.
+
+| Port | Flag | Env | Default | Who | Policy |
+|---|---|---|---|---|---|
+| **7047** | `--port` | `NOTARY_PORT` | off unless set | Rust provers inside the cluster, MPC-TLS over TCP | Internal: no per-client limits |
+| **7048** | `--ws-port` | `NOTARY_WS_PORT` | `7048` | Browsers, ProxyMode over WebSocket, behind the load balancer | Public: every per-client limit in force |
+| **7049** | `--internal-ws-port` | `NOTARY_INTERNAL_WS_PORT` | off unless set | Our own services, ProxyMode over WebSocket | Internal: no per-client limits, no `X-Forwarded-For` handling |
+
+The internal ports are off unless set because they have no limits: a
+deployment that wants them says so, and publishes them through the cluster
+Service only — never through the load balancer, never on a public address.
+7047 and 7049 are conventions, not defaults; `0` binds an ephemeral port.
+Each internal listener has its own session pool (`--mpc-max-sessions`,
+`--internal-max-sessions`), so public load can never queue our own services
+behind it.
+
 ## Endpoints
 
-TCP wire protocol on `NOTARY_PORT` (default **7047**) — length-prefixed JSON
-after MPC-TLS, for Rust backend provers.
+TCP wire protocol on the MPC-TLS port — length-prefixed JSON after MPC-TLS,
+for Rust backend provers. A server-side prover needs no route: it opens the
+TCP listener itself, and the same record is written back down that socket.
 
-HTTP / WebSocket on `NOTARY_WS_PORT` (default **7048**) — browser TLSNotary:
+HTTP / WebSocket on the public port and on the internal HTTP port:
 
 | Route | What it does |
 |---|---|
 | `GET /info` | `{version, publicKey}` — compressed SEC1 notary public key, hex |
+| `GET /healthcheck` | `200` while serving; `503` from SIGTERM until the process exits, so the balancer stops sending work while in-flight sessions finish. Point health checks here, not at `/` |
 | `WS /notarize-proxy` | ProxyMode session, then one WebSocket binary message containing the length-prefixed section 9.1 attestation |
 
-A server-side MPC-TLS prover needs no route: it opens the TCP listener itself,
-and the same record is written back down that socket.
-
 The live WebSocket carries the TLSNotary session and its final attestation.
+Whether the internal HTTP port also serves `/info` is unverified; it serves
+`/healthcheck` and `/notarize-proxy`.
 
 ## Configuration
 
@@ -39,18 +61,27 @@ Flags or environment variables:
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--host` | `NOTARY_HOST` | `127.0.0.1` | Bind address |
-| `--port` | `NOTARY_PORT` | `7047` | TCP wire port |
-| `--ws-port` | `NOTARY_WS_PORT` | `7048` | HTTP/WS port (`0` disables) |
+| `--port` | `NOTARY_PORT` | off unless set | Internal MPC-TLS wire port; conventionally `7047`, `0` binds an ephemeral port |
+| `--ws-port` | `NOTARY_WS_PORT` | `7048` | Public HTTP/WS port (`0` disables) |
+| `--internal-ws-port` | `NOTARY_INTERNAL_WS_PORT` | off unless set | Internal HTTP/WS port; conventionally `7049`, `0` binds an ephemeral port |
 | `--signing-key` | `SIGNING_KEY` | — | Hex secp256k1 key, or `kms:<key-id-or-alias>` for AWS KMS |
-| `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent ProxyMode sessions; past it the upgrade is refused with 503 |
+| `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent browser ProxyMode sessions on the public port; past it the upgrade is refused with 503 |
+| `--internal-max-sessions` | `NOTARY_INTERNAL_MAX_SESSIONS` | `1024` | Concurrent ProxyMode sessions on the internal HTTP port; its own pool |
 | `--proxy-max-bytes` | `NOTARY_PROXY_MAX_BYTES` | `10000000` | Bytes one ProxyMode session may relay, both directions combined (10 MB); crossing it aborts the session, close code 1008 `PROXY_DATA_CAP_EXCEEDED`, nothing attested |
 | `--mpc-max-sessions` | `NOTARY_MPC_MAX_SESSIONS` | `4x` | Concurrent MPC-TLS sessions: a count (`16`) or per-core multiplier (`4x`), resolved at startup; provers past it wait, never refused |
 | `--connection-deadline-secs` | `NOTARY_CONNECTION_DEADLINE_SECS` | `300` | Lifetime of one session on either transport, queue time included; past it the connection is dropped |
 | `--setup-deadline-secs` | `NOTARY_SETUP_DEADLINE_SECS` | `15` | How long a connection may sit before starting its session; until it does it holds no session slot |
-| `--max-sessions-per-ip` | `NOTARY_MAX_SESSIONS_PER_IP` | `4` | Concurrent ProxyMode sessions one client may hold; past it the session is closed with code 1013. `0` disables |
+| `--max-sessions-per-ip` | `NOTARY_MAX_SESSIONS_PER_IP` | `4` | Concurrent public ProxyMode sessions one client may hold; past it the session is closed with code 1013. One browser ceremony opens two, so the default leaves one ceremony of headroom. `0` disables |
+| `--per-ip-upgrades` | `NOTARY_PER_IP_UPGRADES` | `10/1m,60/30m,100/1h` | Sessions one client may start per window on the public port, `<count>/<window>`; every window must have room. Empty disables |
+| `--per-ip-bytes` | `NOTARY_PER_IP_BYTES` | `100MB/1m,600MB/30m,1GB/1h` | Bytes one client may relay per window on the public port, `<size>/<window>`, both directions; charged when a session ends, refused at the next upgrade. Empty disables |
 | `--trusted-proxies` | `NOTARY_TRUSTED_PROXIES` | — | Addresses whose `X-Forwarded-For` names the client, as CIDRs; `direct` if nothing proxies this notary |
-| `--exempt-networks` | `NOTARY_EXEMPT_NETWORKS` | — | Networks whose direct connections skip the per-client cap: this cluster's pod subnets |
 | `--limits-store` | `NOTARY_LIMITS_STORE` | — | Where the per-client counts live: a `postgres://` URL, or `memory` for a single replica |
+
+Windows are `<limit>/<window>` lists: a limit is a count, or bytes with a
+`KB`/`MB`/`GB` suffix (powers of ten); a window is `<n>s`, `<n>m` or `<n>h`.
+The concurrency cap bounds what a client holds now; the windows bound how
+much of the pool's time it consumes by finishing one session and starting the
+next. Every per-client limit applies to the public port only.
 
 With a KMS key the private material never enters the process: every signature
 is a `kms:Sign` call.
@@ -67,8 +98,8 @@ session limits bound sessions rather than connection attempts.
 
 ### Who a session counts against
 
-The per-client cap needs to know who is calling, and behind a load balancer
-every request arrives from the balancer. Three settings decide it:
+The per-client limits need to know who is calling, and behind a load balancer
+every request arrives from the balancer. On the public port:
 
 - `--trusted-proxies` — the balancer's own subnets. Only from these addresses
   is `X-Forwarded-For` read, and then right to left, stopping at the first
@@ -78,25 +109,27 @@ every request arrives from the balancer. Three settings decide it:
   sends the header twice, is refused with 400 rather than counted against the
   balancer — which would quietly make the per-client cap a cap on the whole
   service.
-- `--exempt-networks` — this cluster's pod subnets. A direct connection from
-  one of them is our own workload and is never capped. Exemption is decided on
-  the socket peer alone, so a request that came through the balancer can never
-  claim it by naming a private address in a header. The two lists may not
-  overlap: a balancer inside the exempt set would exempt the whole internet.
-- Anything else reaching the notary directly is a public client keyed on its
-  own address.
+- Anything else reaching the public port directly is a public client keyed on
+  its own address — and it must not carry `X-Forwarded-For` at all. A direct
+  connection with the header is either forged or from a hop this notary was
+  not told to trust; both are refused with 400, so a stale trusted list is
+  loud on the first request instead of quietly keying every user behind the
+  new hop to one address.
+- IPv6 clients are keyed by their /48. A residential allocation is a /56, so
+  keying finer would let one subscriber mint 256 identities.
 
-With a per-client cap on a non-loopback bind, an empty `--trusted-proxies` is a
-startup error. Say `direct` to mean it: an empty setting is also what a missing
-environment variable looks like, and the failure it causes looks exactly like
-ordinary load.
+Our own workloads are not exempted by address: they use the internal ports,
+which have no per-client limits at all (see Listeners).
 
-For the testnet cluster the values are the ALB's public subnets and the pods'
-private subnets:
+With a per-client limit on a non-loopback bind, an empty `--trusted-proxies` is
+a startup error. Say `direct` to mean it: an empty setting is also what a
+missing environment variable looks like, and the failure it causes looks
+exactly like ordinary load.
+
+For the testnet cluster the value is the ALB's public subnets:
 
 ```
 NOTARY_TRUSTED_PROXIES=10.60.200.0/24,10.60.201.0/24
-NOTARY_EXEMPT_NETWORKS=10.60.0.0/20,10.60.16.0/20
 ```
 
 ### Where the counts live
@@ -124,14 +157,24 @@ Released images are published to GitHub Container Registry:
 
 ```sh
 docker run --rm \
-  -p 7047:7047 -p 7048:7048 \
+  -p 7048:7048 \
   -e NOTARY_HOST=0.0.0.0 \
+  -e NOTARY_TRUSTED_PROXIES=direct \
+  -e NOTARY_LIMITS_STORE=memory \
   -e SIGNING_KEY=<hex-or-kms:…> \
   ghcr.io/libid-org/notary:latest
 ```
 
-The image runs as uid 10001, not root, and its `HEALTHCHECK` connects to
-`NOTARY_PORT` on loopback.
+That is the public port only. A Rust prover needs the MPC-TLS port, which is
+off unless asked for: add `-e NOTARY_PORT=7047 -p 7047:7047`. Likewise
+`NOTARY_INTERNAL_WS_PORT=7049` for the internal HTTP port. The image
+`EXPOSE`s all three; exposing is documentation, not a listener.
+
+The image runs as uid 10001, not root. Its `HEALTHCHECK` GETs `/healthcheck`
+on `NOTARY_WS_PORT` over loopback and passes on `200` only, so a draining
+container reads as unhealthy. The probe is `nc`, because the image has no
+curl or wget. With `NOTARY_WS_PORT=0` there is nothing to probe and the check
+fails; override it if you run the internal ports alone.
 
 ### Tags
 
@@ -162,6 +205,25 @@ and `linux/arm64`, so one reference runs on GitHub's `ubuntu-latest` and
 `ubuntu-24.04-arm` runners, on x86 and Graviton nodes, and on Apple Silicon —
 no `--platform` flag, no emulation. Tags published up to `0.3.0-rc.3` are
 amd64 only.
+
+## Deployment notes
+
+- `NOTARY_PORT` must now be set explicitly (`7047`). A deployment that omits
+  it has no MPC-TLS listener, and every Rust prover in the cluster fails to
+  connect. Same for `NOTARY_INTERNAL_WS_PORT` (`7049`) if any in-cluster
+  service uses ProxyMode.
+- Only the public port goes behind the load balancer. 7047 and 7049 are
+  published through the cluster Service alone: they have no limits.
+- `NOTARY_TRUSTED_PROXIES` = the ALB's subnets, not the VPC. Anything inside
+  the set can name its own client.
+- `NOTARY_LIMITS_STORE` = a Postgres URL at more than one replica; `memory`
+  multiplies every per-client limit by the replica count.
+- `terminationGracePeriodSeconds` must exceed `--connection-deadline-secs`
+  (default `300`): SIGTERM drains in-flight sessions, and a shorter grace
+  period kills them mid-attestation.
+- The ALB health check targets `GET /healthcheck` on the public port. It
+  returns `503` from SIGTERM until the process exits, which is how the
+  balancer learns to stop sending work to a draining pod.
 
 ## Browser wasm bundle
 
