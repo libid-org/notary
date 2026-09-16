@@ -5,7 +5,10 @@ use clap::Parser;
 use crate::{
     client_ip::parse_networks,
     limits::Concurrency,
-    store::WindowLimits,
+    store::{
+        redact,
+        WindowLimits,
+    },
 };
 
 /// Configuration for the notary server.
@@ -284,17 +287,5 @@ impl std::fmt::Display for LimitsStoreSpec {
             Self::Memory => f.write_str("memory"),
             Self::Postgres(url) => write!(f, "postgres ({})", redact(url)),
         }
-    }
-}
-
-/// A URL with any password replaced, for logs and errors.
-fn redact(url: &str) -> String {
-    match url.split_once("://").and_then(|(scheme, rest)| {
-        let (creds, host) = rest.split_once('@')?;
-        let user = creds.split_once(':').map_or(creds, |(u, _)| u);
-        Some(format!("{scheme}://{user}:***@{host}"))
-    }) {
-        Some(redacted) => redacted,
-        None => url.to_string(),
     }
 }
