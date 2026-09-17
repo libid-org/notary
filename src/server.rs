@@ -41,7 +41,6 @@ use std::{
     sync::{
         atomic::{
             AtomicBool,
-            AtomicUsize,
             Ordering,
         },
         Arc,
@@ -58,10 +57,10 @@ use tokio::{
     net::TcpListener,
     sync::{
         watch,
-        Notify,
         Semaphore,
     },
 };
+use tokio_util::task::TaskTracker;
 use tracing::{
     debug,
     error,
@@ -111,7 +110,9 @@ pub struct NotaryServerHandle {
     ws_local_addr: Option<SocketAddr>,
     phase: watch::Sender<Phase>,
     draining: Arc<AtomicBool>,
-    in_flight: Arc<InFlight>,
+    /// One token per connection, from admission to the handler's return, so
+    /// a drain knows when it is done.
+    in_flight: TaskTracker,
     /// How long a drain waits for the sessions in flight: the setup
     /// deadline plus the connection deadline, because a connection counts
     /// from its handler's first moment and is bounded by both in turn.
@@ -151,66 +152,21 @@ impl NotaryServerHandle {
     pub async fn drain(self) {
         self.draining.store(true, Ordering::SeqCst);
         let _ = self.phase.send(Phase::Draining);
-        let open = self.in_flight.count();
+        self.in_flight.close();
+        let open = self.in_flight.len();
         info!(
             sessions = open,
             deadline_secs = self.drain_deadline.as_secs(),
             "draining: no new sessions; waiting for the ones in flight"
         );
-        match tokio::time::timeout(self.drain_deadline, self.in_flight.idle()).await {
+        match tokio::time::timeout(self.drain_deadline, self.in_flight.wait()).await {
             Ok(()) => info!("drained: every session finished"),
             Err(_) => warn!(
-                sessions = self.in_flight.count(),
+                sessions = self.in_flight.len(),
                 "drain deadline reached with sessions still running; stopping anyway"
             ),
         }
         let _ = self.phase.send(Phase::Stopped);
-    }
-}
-
-/// The sessions running right now, on every listener, so a drain knows when
-/// it is done. A connection counts from the moment its handler starts to the
-/// moment it returns: the setup deadline bounds the first stretch and the
-/// connection deadline the second, so their sum bounds the drain.
-#[derive(Debug, Default)]
-struct InFlight {
-    count: AtomicUsize,
-    idle: Notify,
-}
-
-impl InFlight {
-    /// Count one more connection until the guard drops.
-    fn enter(self: &Arc<Self>) -> InFlightGuard {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        InFlightGuard(Arc::clone(self))
-    }
-
-    fn count(&self) -> usize {
-        self.count.load(Ordering::SeqCst)
-    }
-
-    /// Resolves once nothing is in flight. Registers for the wake-up before
-    /// reading the count, so a guard dropped in between is not missed.
-    async fn idle(&self) {
-        loop {
-            let notified = self.idle.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.count() == 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-struct InFlightGuard(Arc<InFlight>);
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if self.0.count.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.0.idle.notify_waiters();
-        }
     }
 }
 
@@ -290,7 +246,9 @@ struct NotaryState {
     /// so, and no upgrade is accepted.
     draining: Arc<AtomicBool>,
     /// The connections a drain waits for.
-    in_flight: Arc<InFlight>,
+    /// One token per connection, from admission to the handler's return, so
+    /// a drain knows when it is done.
+    in_flight: TaskTracker,
 }
 
 #[cfg(test)]
@@ -315,7 +273,7 @@ impl NotaryState {
             connection_deadline: Duration::from_secs(300),
             setup_deadline: Duration::from_secs(15),
             draining: Arc::new(AtomicBool::new(false)),
-            in_flight: Arc::new(InFlight::default()),
+            in_flight: TaskTracker::new(),
         }
     }
 }
@@ -419,7 +377,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         setup_deadline: config.setup_deadline(),
         public_key_hex,
         draining: Arc::new(AtomicBool::new(false)),
-        in_flight: Arc::new(InFlight::default()),
+        in_flight: TaskTracker::new(),
     };
 
     // Broadcast the phase to the listeners and the sweeper.
@@ -476,7 +434,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
                             Ok((stream, peer)) => {
                                 info!("TCP connection from {}", peer);
                                 let s = tcp_state.clone();
-                                let in_flight = s.in_flight.enter();
+                                let in_flight = s.in_flight.token();
                                 tokio::spawn(async move {
                                     let _in_flight = in_flight;
                                     if let Err(e) = s.handle_tcp_prover(stream).await {
@@ -531,7 +489,9 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         ws_local_addr,
         phase: phase_tx,
         draining: Arc::clone(&state.draining),
-        in_flight: Arc::clone(&state.in_flight),
+        in_flight: state.in_flight.clone(),
+        // A token lives from admission to the handler's return: the setup
+        // deadline bounds the first stretch, the connection deadline the second.
         drain_deadline: state.setup_deadline + state.connection_deadline,
     })
 }

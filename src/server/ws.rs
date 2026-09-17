@@ -61,6 +61,7 @@ use tracing::{
     info,
     warn,
 };
+use tungstenite::protocol::frame::coding::CloseCode;
 
 use super::{
     attestation::attestation_frame,
@@ -153,7 +154,7 @@ impl NotaryState {
         // In flight from here, before the draining check: admission is two
         // store round trips, and an upgrade inside them when the drain starts
         // must be waited for, not raced. Every refusal below drops the guard.
-        let in_flight = self.in_flight.enter();
+        let in_flight = self.in_flight.token();
 
         // Nothing new once the process is stopping; the sessions already
         // running finish, and the balancer has been told by the health check.
@@ -289,7 +290,7 @@ impl NotaryState {
                 );
                 let _ = ws_tx
                     .send(Message::Close(Some(CloseFrame {
-                        code: CLOSE_POLICY_VIOLATION,
+                        code: CloseCode::Policy.into(),
                         reason: "no session data within the setup deadline".into(),
                     })))
                     .await;
@@ -329,7 +330,7 @@ impl NotaryState {
                             );
                             let _ = ws_tx
                                 .send(Message::Close(Some(CloseFrame {
-                                    code: CLOSE_TRY_AGAIN_LATER,
+                                    code: CloseCode::Again.into(),
                                     reason: "too many sessions from this client; retry"
                                         .into(),
                                 })))
@@ -340,7 +341,7 @@ impl NotaryState {
                             warn!(%peer, %client, %error, "ProxyMode: session refused, limits store unavailable");
                             let _ = ws_tx
                                 .send(Message::Close(Some(CloseFrame {
-                                    code: CLOSE_TRY_AGAIN_LATER,
+                                    code: CloseCode::Again.into(),
                                     reason: "limits store unavailable".into(),
                                 })))
                                 .await;
@@ -358,7 +359,7 @@ impl NotaryState {
             info!(%peer, "ProxyMode: all session slots busy; session refused with 1013");
             let _ = ws_tx
                 .send(Message::Close(Some(CloseFrame {
-                    code: CLOSE_TRY_AGAIN_LATER,
+                    code: CloseCode::Again.into(),
                     reason: "notary is at capacity; retry".into(),
                 })))
                 .await;
@@ -430,14 +431,15 @@ impl NotaryState {
 
         let protocol = async {
             let result = match self.run_proxy_verifier_session(io_b, &relayed).await {
-                Ok(attestation) => attestation_frame(&attestation).and_then(|frame| {
-                    end_tx.send(SessionEnd::Attested(frame)).map_err(|_| {
+                Ok(attestation) => match attestation_frame(&attestation).await {
+                    Ok(frame) => end_tx.send(SessionEnd::Attested(frame)).map_err(|_| {
                         Error::NotaryServer {
                             detail: "browser disconnected before attestation handoff"
                                 .into(),
                         }
-                    })
-                }),
+                    }),
+                    Err(error) => Err(error),
+                },
                 Err(Error::ProxyDataCapExceeded {
                     authority,
                     used,
@@ -447,7 +449,7 @@ impl NotaryState {
                     // a bare drop would look like any other failure. Fits the
                     // 123-byte reason budget with room to spare.
                     let _ = end_tx.send(SessionEnd::Aborted(CloseFrame {
-                        code: CLOSE_POLICY_VIOLATION,
+                        code: CloseCode::Policy.into(),
                         reason: format!(
                             "PROXY_DATA_CAP_EXCEEDED: relayed {used} bytes, cap {limit}"
                         )
@@ -724,15 +726,6 @@ enum SessionEnd {
     /// No attestation; the frame tells the browser what cut it off.
     Aborted(CloseFrame),
 }
-
-/// WebSocket close code 1008, "policy violation": the session broke a rule of
-/// this endpoint, and the reason names which one.
-const CLOSE_POLICY_VIOLATION: u16 = 1008;
-
-/// WebSocket close code 1013, "try again later": the notary is at capacity.
-/// It differs from the 503 on the upgrade only in when it happens -- the slots
-/// filled between this browser's upgrade and its first bytes.
-const CLOSE_TRY_AGAIN_LATER: u16 = 1013;
 
 /// The browser's first relayed bytes, or `None` if it went away before sending
 /// any.
@@ -1453,7 +1446,7 @@ mod tests {
             let gate = Gate::new();
             let mut state = NotaryState::for_tests(test_signer().await);
             state.limits = Arc::new(ParkedStore(Arc::clone(&gate)));
-            let in_flight = Arc::clone(&state.in_flight);
+            let in_flight = state.in_flight.clone();
             let (notary_addr, notary_task) = serve(state).await;
 
             let upgrade = tokio::spawn(async move {
@@ -1465,7 +1458,7 @@ mod tests {
                 .await
                 .expect("admission never asked the store");
             assert_eq!(
-                in_flight.count(),
+                in_flight.len(),
                 1,
                 "an upgrade inside admission is in flight"
             );
@@ -1476,7 +1469,7 @@ mod tests {
             let (socket, _) = upgrade.await.unwrap();
             drop(socket);
             let idle = async {
-                while in_flight.count() != 0 {
+                while !in_flight.is_empty() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             };

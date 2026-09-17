@@ -33,10 +33,10 @@
 use std::net::{
     IpAddr,
     Ipv4Addr,
-    Ipv6Addr,
 };
 
 use axum::http::HeaderMap;
+use ipnet::Ipv6Net;
 
 use crate::config::ClientIpHeader;
 
@@ -70,11 +70,11 @@ impl ClientKey {
     pub fn from_ip(ip: IpAddr) -> Self {
         match ip.to_canonical() {
             IpAddr::V4(v4) => Self(IpAddr::V4(v4)),
-            IpAddr::V6(v6) => {
-                let mut octets = v6.octets();
-                octets[6..].fill(0);
-                Self(IpAddr::V6(Ipv6Addr::from(octets)))
-            }
+            IpAddr::V6(v6) => Self(IpAddr::V6(
+                Ipv6Net::new(v6, 48)
+                    .expect("48 is a valid IPv6 prefix length")
+                    .network(),
+            )),
         }
     }
 }
