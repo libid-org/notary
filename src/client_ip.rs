@@ -30,12 +30,10 @@
 //! route never call this: our own services are the protocol, not users of
 //! it.
 
-use std::net::{
-    IpAddr,
-    Ipv4Addr,
-};
+use std::net::IpAddr;
 
 use axum::http::HeaderMap;
+use forwarded_header_value::Identifier;
 use ipnet::Ipv6Net;
 
 use crate::config::ClientIpHeader;
@@ -123,71 +121,59 @@ impl std::fmt::Display for Unattributed {
     }
 }
 
-/// The client `headers` name, read as `source` says.
-///
-/// `x-forwarded-for` takes the last entry of the one `X-Forwarded-For` line;
-/// `cf-connecting-ip` takes the one `CF-Connecting-IP` line whole. In either
-/// mode the header must be present exactly once, and only the entry named is
-/// parsed: what a caller wrote left of the balancer's entry is not read, so
-/// it is not validated either.
-pub fn resolve(
-    headers: &HeaderMap,
-    source: ClientIpHeader,
-) -> Result<ClientKey, Unattributed> {
-    let name = match source {
-        ClientIpHeader::XForwardedFor => FORWARDED_FOR,
-        ClientIpHeader::CfConnectingIp => CF_CONNECTING_IP,
-    };
-    let mut lines = headers.get_all(name).iter();
-    let line = lines.next().ok_or(Unattributed::Missing)?;
-    if lines.next().is_some() {
-        return Err(Unattributed::Repeated);
-    }
-    let line = line.to_str().map_err(|_| Unattributed::Malformed)?;
+/// How a public request is attributed to a client: which header names it,
+/// and which entry of that header is the balancer's word.
+pub trait ClientSource {
+    /// The header that names the client.
+    fn header(&self) -> &'static str;
 
-    let entry = match source {
-        ClientIpHeader::XForwardedFor => {
-            // The balancer appended last, so the last entry is its word and
-            // the ones before it are the caller's: not read, only counted,
-            // so that a chain past `MAX_HOPS` is refused.
-            let mut entries = line.rsplit(',');
-            let last = entries.next().unwrap_or("");
-            if entries.count() >= MAX_HOPS {
-                return Err(Unattributed::Malformed);
-            }
-            last
+    /// The entry of `line` the balancer wrote.
+    fn entry<'a>(&self, line: &'a str) -> Result<&'a str, Unattributed>;
+
+    /// The client behind `headers`. The header must be present exactly once,
+    /// and only the entry named is parsed: what a caller wrote left of the
+    /// balancer's entry is not read, so it is not validated either.
+    fn resolve(&self, headers: &HeaderMap) -> Result<ClientKey, Unattributed> {
+        let mut lines = headers.get_all(self.header()).iter();
+        let line = lines.next().ok_or(Unattributed::Missing)?;
+        if lines.next().is_some() {
+            return Err(Unattributed::Repeated);
         }
-        ClientIpHeader::CfConnectingIp => line,
-    };
-    let ip = parse_entry(entry).ok_or(Unattributed::Malformed)?;
-    Ok(ClientKey::from_ip(ip))
+        let line = line.to_str().map_err(|_| Unattributed::Malformed)?;
+        let ip = self
+            .entry(line)?
+            .parse::<Identifier>()
+            .ok()
+            .and_then(|identifier| identifier.ip())
+            .ok_or(Unattributed::Malformed)?;
+        Ok(ClientKey::from_ip(ip))
+    }
 }
 
-/// One header entry as an address.
-///
-/// Accepts what proxies actually write: a bare address, a bracketed IPv6 with
-/// or without a port, and IPv4 with a port. A bare IPv6 is parsed before any
-/// port is considered, so `2001:db8::1` is never mistaken for a host and port
-/// and truncated at its last colon.
-fn parse_entry(entry: &str) -> Option<IpAddr> {
-    let entry = entry.trim();
-    if entry.is_empty() {
-        return None;
+impl ClientSource for ClientIpHeader {
+    fn header(&self) -> &'static str {
+        match self {
+            Self::XForwardedFor => FORWARDED_FOR,
+            Self::CfConnectingIp => CF_CONNECTING_IP,
+        }
     }
-    if let Some(rest) = entry.strip_prefix('[') {
-        let (addr, _port) = rest.split_once(']')?;
-        return addr.parse().ok();
+
+    fn entry<'a>(&self, line: &'a str) -> Result<&'a str, Unattributed> {
+        match self {
+            Self::XForwardedFor => {
+                // The balancer appended last, so the last entry is its word and
+                // the ones before it are the caller's: not read, only counted,
+                // so that a chain past `MAX_HOPS` is refused.
+                let mut entries = line.rsplit(',');
+                let last = entries.next().unwrap_or("");
+                if entries.count() >= MAX_HOPS {
+                    return Err(Unattributed::Malformed);
+                }
+                Ok(last)
+            }
+            Self::CfConnectingIp => Ok(line),
+        }
     }
-    if let Ok(ip) = entry.parse::<IpAddr>() {
-        return Some(ip);
-    }
-    // Only an IPv4 address can carry a bare `:port`; one colon, and what is
-    // left of it must parse as IPv4.
-    let (addr, _port) = entry.split_once(':')?;
-    if addr.contains(':') {
-        return None;
-    }
-    addr.parse::<Ipv4Addr>().ok().map(IpAddr::V4)
 }
 
 #[cfg(test)]
@@ -198,9 +184,9 @@ mod tests {
     };
 
     use super::{
-        resolve,
         ClientIpHeader,
         ClientKey,
+        ClientSource,
         Unattributed,
         CF_CONNECTING_IP,
         FORWARDED_FOR,
@@ -226,7 +212,7 @@ mod tests {
     #[test]
     fn a_single_entry_is_the_client() {
         assert_eq!(
-            resolve(&xff("203.0.113.7"), ClientIpHeader::XForwardedFor),
+            ClientIpHeader::XForwardedFor.resolve(&xff("203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
     }
@@ -236,10 +222,8 @@ mod tests {
     #[test]
     fn the_rightmost_entry_wins_over_a_forged_prefix() {
         assert_eq!(
-            resolve(
-                &xff("9.9.9.9, 10.60.5.90, 203.0.113.7"),
-                ClientIpHeader::XForwardedFor
-            ),
+            ClientIpHeader::XForwardedFor
+                .resolve(&xff("9.9.9.9, 10.60.5.90, 203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
     }
@@ -250,14 +234,11 @@ mod tests {
     #[test]
     fn a_malformed_entry_left_of_the_last_is_ignored() {
         assert_eq!(
-            resolve(
-                &xff("not-an-ip, 203.0.113.7"),
-                ClientIpHeader::XForwardedFor
-            ),
+            ClientIpHeader::XForwardedFor.resolve(&xff("not-an-ip, 203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
         assert_eq!(
-            resolve(&xff(", 203.0.113.7"), ClientIpHeader::XForwardedFor),
+            ClientIpHeader::XForwardedFor.resolve(&xff(", 203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
     }
@@ -266,11 +247,11 @@ mod tests {
     #[test]
     fn a_missing_header_is_refused() {
         assert_eq!(
-            resolve(&HeaderMap::new(), ClientIpHeader::XForwardedFor),
+            ClientIpHeader::XForwardedFor.resolve(&HeaderMap::new()),
             Err(Unattributed::Missing)
         );
         assert_eq!(
-            resolve(&HeaderMap::new(), ClientIpHeader::CfConnectingIp),
+            ClientIpHeader::CfConnectingIp.resolve(&HeaderMap::new()),
             Err(Unattributed::Missing)
         );
     }
@@ -282,14 +263,14 @@ mod tests {
         let mut repeated = xff("203.0.113.7");
         repeated.append(FORWARDED_FOR, HeaderValue::from_static("9.9.9.9"));
         assert_eq!(
-            resolve(&repeated, ClientIpHeader::XForwardedFor),
+            ClientIpHeader::XForwardedFor.resolve(&repeated),
             Err(Unattributed::Repeated)
         );
 
         let mut repeated = cf("203.0.113.7");
         repeated.append(CF_CONNECTING_IP, HeaderValue::from_static("9.9.9.9"));
         assert_eq!(
-            resolve(&repeated, ClientIpHeader::CfConnectingIp),
+            ClientIpHeader::CfConnectingIp.resolve(&repeated),
             Err(Unattributed::Repeated)
         );
     }
@@ -307,7 +288,7 @@ mod tests {
             "203.0.113.7, 999.1.1.1",
         ] {
             assert_eq!(
-                resolve(&xff(bad), ClientIpHeader::XForwardedFor),
+                ClientIpHeader::XForwardedFor.resolve(&xff(bad)),
                 Err(Unattributed::Malformed),
                 "{bad:?}"
             );
@@ -318,13 +299,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         assert_eq!(
-            resolve(&xff(&long), ClientIpHeader::XForwardedFor),
+            ClientIpHeader::XForwardedFor.resolve(&xff(&long)),
             Err(Unattributed::Malformed)
         );
 
         for bad in ["not-an-ip", "", "9.9.9.9, 203.0.113.7"] {
             assert_eq!(
-                resolve(&cf(bad), ClientIpHeader::CfConnectingIp),
+                ClientIpHeader::CfConnectingIp.resolve(&cf(bad)),
                 Err(Unattributed::Malformed),
                 "{bad:?}"
             );
@@ -342,12 +323,12 @@ mod tests {
             ("2001:db8::1", "2001:db8::"),
         ] {
             assert_eq!(
-                resolve(&xff(entry), ClientIpHeader::XForwardedFor),
+                ClientIpHeader::XForwardedFor.resolve(&xff(entry)),
                 Ok(key(expected)),
                 "{entry:?}"
             );
             assert_eq!(
-                resolve(&cf(entry), ClientIpHeader::CfConnectingIp),
+                ClientIpHeader::CfConnectingIp.resolve(&cf(entry)),
                 Ok(key(expected)),
                 "{entry:?}"
             );
@@ -362,20 +343,20 @@ mod tests {
         let mut both = cf("203.0.113.7");
         both.insert(FORWARDED_FOR, HeaderValue::from_static("9.9.9.9"));
         assert_eq!(
-            resolve(&both, ClientIpHeader::CfConnectingIp),
+            ClientIpHeader::CfConnectingIp.resolve(&both),
             Ok(key("203.0.113.7"))
         );
         assert_eq!(
-            resolve(&both, ClientIpHeader::XForwardedFor),
+            ClientIpHeader::XForwardedFor.resolve(&both),
             Ok(key("9.9.9.9"))
         );
 
         assert_eq!(
-            resolve(&xff("9.9.9.9"), ClientIpHeader::CfConnectingIp),
+            ClientIpHeader::CfConnectingIp.resolve(&xff("9.9.9.9")),
             Err(Unattributed::Missing)
         );
         assert_eq!(
-            resolve(&cf("203.0.113.7"), ClientIpHeader::XForwardedFor),
+            ClientIpHeader::XForwardedFor.resolve(&cf("203.0.113.7")),
             Err(Unattributed::Missing)
         );
     }
@@ -398,14 +379,11 @@ mod tests {
         assert_ne!(key("::ffff:203.0.113.7"), key("::"));
 
         assert_eq!(
-            resolve(
-                &xff("9.9.9.9, ::ffff:203.0.113.7"),
-                ClientIpHeader::XForwardedFor
-            ),
+            ClientIpHeader::XForwardedFor.resolve(&xff("9.9.9.9, ::ffff:203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
         assert_eq!(
-            resolve(&cf("::ffff:203.0.113.7"), ClientIpHeader::CfConnectingIp),
+            ClientIpHeader::CfConnectingIp.resolve(&cf("::ffff:203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
     }
