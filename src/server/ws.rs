@@ -87,7 +87,7 @@ use crate::{
         self,
         Dimension,
         LeaseId,
-        LimitStore,
+        Store,
         WindowLimits,
     },
 };
@@ -762,7 +762,7 @@ struct Accounting {
 /// The client a public session ran as, the lease it held, and the bytes it
 /// relayed, with the store and the windows they are charged to.
 struct Bill {
-    store: Arc<dyn LimitStore>,
+    store: Store,
     client: ClientKey,
     lease: Option<LeaseId>,
     relayed: Arc<DataCap>,
@@ -780,7 +780,7 @@ impl Accounting {
     ) -> Self {
         Self {
             bill: Some(Bill {
-                store: Arc::clone(&state.limits),
+                store: state.limits.clone(),
                 client,
                 lease,
                 relayed: Arc::clone(relayed),
@@ -1188,17 +1188,20 @@ mod tests {
             },
             AttestationWire,
             ClientKey,
-            LimitStore,
             NotaryState,
+            Store,
             Tier,
             WindowLimits,
         };
-        use crate::server::{
-            routes::router,
-            tests::{
-                test_signer,
-                ONE_SESSION_AT_A_TIME,
+        use crate::{
+            server::{
+                routes::router,
+                tests::{
+                    test_signer,
+                    ONE_SESSION_AT_A_TIME,
+                },
             },
+            store::LimitStore,
         };
 
         /// What the browser saw of one ProxyMode WebSocket: every binary
@@ -1410,7 +1413,7 @@ mod tests {
         async fn an_upgrade_counts_as_in_flight_while_admission_runs() {
             let gate = Gate::new();
             let mut state = NotaryState::for_tests(test_signer().await);
-            state.limits = Arc::new(ParkedStore(Arc::clone(&gate)));
+            state.limits = Store::from(ParkedStore(Arc::clone(&gate)));
             let in_flight = state.in_flight.clone();
             let (notary_addr, notary_task) = serve(state).await;
 
@@ -1619,7 +1622,7 @@ mod tests {
         async fn the_bytes_window_is_charged_when_a_session_ends() {
             let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
             let mut state = NotaryState::for_tests(test_signer().await);
-            state.per_ip_bytes = WindowLimits::parse("1KB/1h").unwrap();
+            state.per_ip_bytes = "1KB/1h".parse::<WindowLimits>().unwrap();
             state.per_ip_upgrades = WindowLimits::default();
             let (notary_addr, seen, notary_task) =
                 complete_session(Tier::Public, state).await;
@@ -1773,9 +1776,9 @@ mod tests {
         async fn a_store_that_cannot_answer_refuses_the_upgrade() {
             for (upgrades, bytes) in [("1/1h", ""), ("", "1KB/1h")] {
                 let mut state = NotaryState::for_tests(test_signer().await);
-                state.limits = Arc::new(DownStore);
-                state.per_ip_upgrades = WindowLimits::parse(upgrades).unwrap();
-                state.per_ip_bytes = WindowLimits::parse(bytes).unwrap();
+                state.limits = Store::from(DownStore);
+                state.per_ip_upgrades = upgrades.parse::<WindowLimits>().unwrap();
+                state.per_ip_bytes = bytes.parse::<WindowLimits>().unwrap();
                 let (notary_addr, notary_task) = serve(state).await;
 
                 let refused = upgrade_request(notary_addr).await;
@@ -1793,7 +1796,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn a_store_that_cannot_answer_refuses_the_session_with_1013() {
             let mut state = NotaryState::for_tests(test_signer().await);
-            state.limits = Arc::new(DownStore);
+            state.limits = Store::from(DownStore);
             state.per_ip_upgrades = WindowLimits::default();
             state.per_ip_bytes = WindowLimits::default();
             let (notary_addr, notary_task) = serve(state).await;
@@ -1831,7 +1834,7 @@ mod tests {
         async fn the_internal_route_never_touches_the_store() {
             let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
             let mut state = NotaryState::for_tests(test_signer().await);
-            state.limits = Arc::new(PanickingStore);
+            state.limits = Store::from(PanickingStore);
             let (_, seen, notary_task) = complete_session(Tier::Internal, state).await;
             assert!(
                 seen.close.is_none(),

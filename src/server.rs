@@ -79,8 +79,7 @@ use crate::{
     },
     limits::available_cores,
     store::{
-        self,
-        LimitStore,
+        Store,
         WindowLimits,
     },
 };
@@ -214,7 +213,7 @@ struct NotaryState {
     max_sessions_per_ip: usize,
     /// Where the public route's per-client counts live. Never consulted for
     /// the internal route.
-    limits: Arc<dyn LimitStore>,
+    limits: Store,
     /// Sessions one public client may start per window.
     per_ip_upgrades: WindowLimits,
     /// Bytes one public client may relay per window.
@@ -262,9 +261,9 @@ impl NotaryState {
             proxy_sessions: Arc::new(Semaphore::new(1024)),
             internal_proxy_sessions: Arc::new(Semaphore::new(1024)),
             max_sessions_per_ip: 4,
-            limits: Arc::new(store::MemoryStore::new()),
-            per_ip_upgrades: WindowLimits::parse("10/1m,60/30m,100/1h").unwrap(),
-            per_ip_bytes: WindowLimits::parse("100MB/1m,600MB/30m,1GB/1h").unwrap(),
+            limits: Store::memory(),
+            per_ip_upgrades: "10/1m,60/30m,100/1h".parse::<WindowLimits>().unwrap(),
+            per_ip_bytes: "100MB/1m,600MB/30m,1GB/1h".parse::<WindowLimits>().unwrap(),
             client_ip_header: ClientIpHeader::XForwardedFor,
             proxy_max_bytes: 10_000_000,
             proxy_root_store: Arc::new(libid_tlsn::root_store()),
@@ -293,12 +292,8 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
                 .into(),
         });
     }
-    let per_ip_upgrades = config
-        .per_ip_upgrades()
-        .map_err(|detail| Error::NotaryServer { detail })?;
-    let per_ip_bytes = config
-        .per_ip_bytes()
-        .map_err(|detail| Error::NotaryServer { detail })?;
+    let per_ip_upgrades = config.per_ip_upgrades.clone();
+    let per_ip_bytes = config.per_ip_bytes.clone();
     let limits_store = config
         .limits_store()
         .map_err(|detail| Error::NotaryServer { detail })?;
@@ -319,7 +314,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     // A store that cannot be reached is a startup error, not a limit that
     // refuses every client once the process is up.
     let limits =
-        store::connect(&limits_store)
+        Store::connect(&limits_store)
             .await
             .map_err(|e| Error::NotaryServer {
                 detail: e.to_string(),
@@ -468,7 +463,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
 
     // Expired leases and dead windows go on their own; the sweep only keeps
     // the store from growing. Every replica runs one, which is safe.
-    let sweep_store = Arc::clone(&state.limits);
+    let sweep_store = state.limits.clone();
     let mut sweep_phase = phase_rx;
     tokio::spawn(async move {
         loop {

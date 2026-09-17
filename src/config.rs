@@ -9,7 +9,7 @@ use tlsn::webpki::CertificateDer;
 use crate::{
     limits::Concurrency,
     store::{
-        redact,
+        PostgresUrl,
         WindowLimits,
     },
 };
@@ -146,7 +146,7 @@ pub struct NotaryServerConfig {
         env = "NOTARY_PER_IP_UPGRADES",
         default_value = "10/1m,60/30m,100/1h"
     )]
-    pub per_ip_upgrades: String,
+    pub per_ip_upgrades: WindowLimits,
 
     /// Bytes one client may relay per window on the public port, both
     /// directions, as `<size>/<window>` entries: `100MB/1m,600MB/30m,1GB/1h`.
@@ -157,7 +157,7 @@ pub struct NotaryServerConfig {
         env = "NOTARY_PER_IP_BYTES",
         default_value = "100MB/1m,600MB/30m,1GB/1h"
     )]
-    pub per_ip_bytes: String,
+    pub per_ip_bytes: WindowLimits,
 
     /// Which header names the client on the public port. Every per-client
     /// limit counts against it, and a public upgrade without it is refused
@@ -229,17 +229,6 @@ impl NotaryServerConfig {
         std::time::Duration::from_secs(self.setup_deadline_secs)
     }
 
-    /// `--per-ip-upgrades` parsed.
-    pub fn per_ip_upgrades(&self) -> Result<WindowLimits, String> {
-        WindowLimits::parse(&self.per_ip_upgrades)
-            .map_err(|e| format!("--per-ip-upgrades {e}"))
-    }
-
-    /// `--per-ip-bytes` parsed.
-    pub fn per_ip_bytes(&self) -> Result<WindowLimits, String> {
-        WindowLimits::parse(&self.per_ip_bytes).map_err(|e| format!("--per-ip-bytes {e}"))
-    }
-
     /// `--limits-store`, checked against the rest of the configuration.
     ///
     /// A limit counted in one process is silently multiplied by the replica
@@ -262,11 +251,11 @@ impl NotaryServerConfig {
             return Ok(LimitsStoreSpec::Memory);
         }
         if spec.starts_with("postgres://") || spec.starts_with("postgresql://") {
-            return Ok(LimitsStoreSpec::Postgres(spec.to_string()));
+            return Ok(LimitsStoreSpec::Postgres(PostgresUrl::new(spec)));
         }
         Err(format!(
             "--limits-store: expected \"memory\" or a postgres:// URL, got '{}'",
-            redact(spec)
+            PostgresUrl::new(spec)
         ))
     }
 
@@ -318,8 +307,8 @@ impl NotaryServerConfig {
     fn public_limits_in_force(&self) -> bool {
         self.ws_port != 0
             && (self.max_sessions_per_ip > 0
-                || !self.per_ip_upgrades.trim().is_empty()
-                || !self.per_ip_bytes.trim().is_empty())
+                || !self.per_ip_upgrades.is_empty()
+                || !self.per_ip_bytes.is_empty())
     }
 
     fn bound_locally(&self) -> bool {
@@ -369,14 +358,14 @@ pub enum LimitsStoreSpec {
     /// In this process only. Correct for one replica; a multiplier otherwise.
     Memory,
     /// A Postgres URL.
-    Postgres(String),
+    Postgres(PostgresUrl),
 }
 
 impl std::fmt::Display for LimitsStoreSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Memory => f.write_str("memory"),
-            Self::Postgres(url) => write!(f, "postgres ({})", redact(url)),
+            Self::Postgres(url) => write!(f, "postgres ({url})"),
         }
     }
 }

@@ -41,11 +41,10 @@ use sqlx::{
 };
 
 use super::{
-    distinct_windows,
-    redact,
     Dimension,
     LeaseId,
     LimitStore,
+    PostgresUrl,
     StoreError,
     WindowLimits,
 };
@@ -166,7 +165,7 @@ impl PostgresStore {
     /// included, by `ACQUIRE_TIMEOUT`, which is right for a request and
     /// short for a cold start. The pool itself connects on first use.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
-        let description = format!("postgres ({})", redact(url));
+        let description = format!("postgres ({})", PostgresUrl::new(url));
         let connect = async {
             let options = PgConnectOptions::from_str(url)?.options(SESSION_OPTIONS);
             let mut conn = PgConnection::connect_with(&options).await?;
@@ -318,7 +317,7 @@ impl LimitStore for PostgresStore {
         units: u64,
         limits: &WindowLimits,
     ) -> Result<bool, StoreError> {
-        let windows = distinct_windows(limits);
+        let windows = limits.distinct();
         if windows.is_empty() {
             return Ok(true);
         }
@@ -348,7 +347,7 @@ impl LimitStore for PostgresStore {
         limits: &WindowLimits,
     ) -> Result<bool, StoreError> {
         let client = client.to_string();
-        for w in distinct_windows(limits) {
+        for w in limits.distinct() {
             let used = used(&self.pool, &client, dimension, w.window).await?;
             if used.saturating_add(units) > w.limit {
                 return Ok(false);
@@ -364,7 +363,7 @@ impl LimitStore for PostgresStore {
         units: u64,
         limits: &WindowLimits,
     ) -> Result<(), StoreError> {
-        let windows = distinct_windows(limits);
+        let windows = limits.distinct();
         if windows.is_empty() {
             return Ok(());
         }
@@ -462,7 +461,7 @@ mod tests {
         store: Arc<PostgresStore>,
     ) -> Result<usize, StoreError> {
         let client = fresh_client();
-        let limits = Arc::new(WindowLimits::parse("4/1h").unwrap());
+        let limits = Arc::new("4/1h".parse::<WindowLimits>().unwrap());
         let racers: Vec<_> = (0..20)
             .map(|_| {
                 let (store, limits) = (store.clone(), limits.clone());
