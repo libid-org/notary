@@ -209,23 +209,16 @@ impl NotaryState {
         // Refuse rather than queue: a browser retries a refused upgrade cheaply,
         // and nothing has been spent on this session yet.
         //
-        // No slot is reserved here. The check is advisory -- it turns a saturated
-        // notary away at the cheapest point, before the upgrade -- and the slot
-        // itself is taken when the browser sends its first relayed bytes. A socket
-        // that upgrades and then stays silent would otherwise hold a slot for the
-        // whole connection deadline: a denial of service costing one 150-byte
-        // request per slot.
+        // No slot is reserved here; it is taken on the browser's first relayed
+        // bytes, so an upgraded socket that stays silent holds nothing.
         if self.proxy_sessions.available_permits() == 0 {
             info!(%peer, "ProxyMode: all session slots busy; upgrade refused with 503");
             return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
 
-        // The windows, in the shared store. An upgrade is counted here, before
-        // anything is spent on it; the bytes window only has to have room, since
-        // the bytes are charged when the session ends. A store that cannot
-        // answer is a refusal: a limit that fails open under a store outage is a
-        // limit an attacker can switch off. An empty window is no limit, and
-        // asks the store nothing.
+        // Upgrades are counted now, bytes when the session ends. A store that
+        // cannot answer is a refusal: a limit that fails open under a store
+        // outage is a limit an attacker can switch off.
         let store_down = |error: store::StoreError| {
             warn!(%peer, %client, %error, "ProxyMode: upgrade refused, limits store unavailable");
             (StatusCode::SERVICE_UNAVAILABLE, "limits store unavailable").into_response()
@@ -396,11 +389,9 @@ impl NotaryState {
                     }
                 }
             }
-            // The browser is gone, by close frame or by dropped socket. Tell the
-            // session so: it reads EOF, fails, and the connection's session slot
-            // comes back now. Dropping the write half alone would not do that --
-            // the read half in the outbound pump keeps the pipe open -- and the
-            // session would sit on its slot until the connection deadline.
+            // The browser is gone: shut the pipe so the session reads EOF and
+            // frees its slot now. Dropping the write half alone would not -- the
+            // outbound pump's read half keeps the pipe open to the deadline.
             let _ = pipe_writer.shutdown().await;
         }));
         let outbound_task = AbortOnDrop::new(tokio::spawn(async move {
@@ -686,29 +677,14 @@ impl NotaryState {
             .into_inner();
         drop(io);
 
-        // What the prover chose to reveal is not read here and not judged here.
-        // Which ranges a profile expects belongs to the Platform Verifier
-        // (REQ-COMMON-51), and this used to name them -- one endpoint's shape
-        // written into the notary, which is the profile-specific decision
-        // REQ-COMMON-33 forbids it from making.
+        // The host is attested, not restricted: the record carries the
+        // cert-verified name as `authorityId`, and the contract that reads it
+        // pins the authority its profile expects.
         let server_name = server_name.ok_or_else(|| Error::NotaryServer {
             detail: "prover did not reveal server name".into(),
         })?;
         let ServerName::Dns(ref dns_name) = server_name;
         let domain = dns_name.as_str().to_string();
-
-        // Which host answered is attested, not restricted. The record carries the
-        // cert-verified server name as `authorityId`, and each Platform Verifier
-        // compares that against the authority its own profile pins -- so an
-        // attestation naming an attacker's server is refused on chain, by the
-        // contract that knows which host the session was supposed to reach.
-        //
-        // Pinning one hostname here would add nothing to that and would cost
-        // something real: GitHub alone needs two authorities (`github.com` for the
-        // exchange, `api.github.com` for the identity session), so a single
-        // platform identity cannot serve even one platform, let alone a notary
-        // shared by X and GitHub. Limiting who may use a public notary is access
-        // control, and belongs where access control lives.
 
         let partial_transcript = transcript;
         if let Some(ref pt) = partial_transcript {
@@ -723,14 +699,8 @@ impl NotaryState {
             );
         }
 
-        // ── Extract the single hash commit per session ──
-        //
-        // Keep the session's own output rather than flattening it. Which ranges a
-        // profile expects, and what their bytes must contain, is the Platform
-        // Verifier's business (REQ-COMMON-51); the notary answers only for what it
-        // observed. The range-count rules that used to live here encoded one
-        // endpoint's shape into the notary, which is exactly the profile-specific
-        // decision REQ-COMMON-33 forbids it from making.
+        // What the prover revealed is not read or judged here: which ranges a
+        // profile expects is the Platform Verifier's (REQ-COMMON-51).
         let Some(partial) = partial_transcript else {
             return Err(Error::NotaryServer {
                 detail: "session revealed no transcript".into(),
