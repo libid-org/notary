@@ -8,7 +8,6 @@
 
 use std::time::SystemTime;
 
-use libid_ceremony::AttestedData;
 use libid_tlsn::attest::{
     FromObserved,
     ObservedSession,
@@ -16,6 +15,7 @@ use libid_tlsn::attest::{
 use libid_transcript::{
     write_msg,
     AttestationWire,
+    AttestedData,
 };
 use tlsn::transcript::{
     PartialTranscript,
