@@ -24,6 +24,7 @@
 
 use std::{
     fmt,
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -64,9 +65,11 @@ pub struct WindowLimit {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WindowLimits(pub Vec<WindowLimit>);
 
-impl WindowLimits {
+impl FromStr for WindowLimits {
+    type Err = String;
+
     /// Parse a spec; the empty string is "unlimited".
-    pub fn parse(spec: &str) -> Result<Self, String> {
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
         let spec = spec.trim();
         if spec.is_empty() {
             return Ok(Self::default());
@@ -85,7 +88,9 @@ impl WindowLimits {
         out.sort_by_key(|w| w.window);
         Ok(Self(out))
     }
+}
 
+impl WindowLimits {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -93,6 +98,20 @@ impl WindowLimits {
     /// The longest window, which is how long any count has to be kept.
     pub fn longest(&self) -> Option<Duration> {
         self.0.iter().map(|w| w.window).max()
+    }
+
+    /// The windows a store keys on: one per length, the tightest limit
+    /// winning. Two entries of the same length name the same row, and
+    /// counting once per entry would charge every unit twice.
+    pub fn distinct(&self) -> Vec<WindowLimit> {
+        let mut out: Vec<WindowLimit> = Vec::with_capacity(self.0.len());
+        for w in &self.0 {
+            match out.iter_mut().find(|o| o.window == w.window) {
+                Some(o) => o.limit = o.limit.min(w.limit),
+                None => out.push(*w),
+            }
+        }
+        out
     }
 }
 
@@ -236,48 +255,86 @@ pub trait LimitStore: Send + Sync + 'static {
 /// The store `spec` names, ready to use. A Postgres store connects and
 /// creates its tables here, so a database that cannot be reached is a
 /// startup error rather than a limit that fails closed on every request.
-pub async fn connect(spec: &LimitsStoreSpec) -> Result<Arc<dyn LimitStore>, StoreError> {
-    Ok(match spec {
-        LimitsStoreSpec::Memory => Arc::new(MemoryStore::new()),
-        LimitsStoreSpec::Postgres(url) => Arc::new(PostgresStore::connect(url).await?),
-    })
+/// Where the counts live, as `--limits-store` says: this process, or a
+/// Postgres every replica shares. One handle, cloned into every session.
+#[derive(Clone)]
+pub struct Store(Arc<dyn LimitStore>);
+
+impl Store {
+    /// Connect as `spec` says. A store that cannot be reached is an error
+    /// here, at startup, not a limit that refuses every client later.
+    pub async fn connect(spec: &LimitsStoreSpec) -> Result<Self, StoreError> {
+        Ok(match spec {
+            LimitsStoreSpec::Memory => Self::memory(),
+            LimitsStoreSpec::Postgres(url) => {
+                Self(Arc::new(PostgresStore::connect(url.as_str()).await?))
+            }
+        })
+    }
+
+    /// Counts kept in this process only.
+    pub fn memory() -> Self {
+        Self(Arc::new(MemoryStore::new()))
+    }
 }
 
-/// A URL with any password replaced, for logs and errors: the one in the
-/// user info, and a `password=` query parameter, which sqlx honours too.
-pub fn redact(url: &str) -> String {
-    let Ok(mut parsed) = Url::parse(url) else {
-        return url.to_string();
-    };
-    if !parsed.username().is_empty() {
-        let _ = parsed.set_password(Some("***"));
+impl<S: LimitStore> From<S> for Store {
+    fn from(store: S) -> Self {
+        Self(Arc::new(store))
     }
-    if let Some(query) = parsed.query() {
-        let masked = query
-            .split('&')
-            .map(|pair| match pair.split_once('=') {
-                Some(("password", _)) => "password=***",
-                _ => pair,
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-        parsed.set_query(Some(&masked));
-    }
-    parsed.to_string()
 }
 
-/// The windows a store keys on: one per length, the tightest limit winning.
-/// Two entries of the same length name the same row, and counting once per
-/// entry would charge every unit twice.
-fn distinct_windows(limits: &WindowLimits) -> Vec<WindowLimit> {
-    let mut out: Vec<WindowLimit> = Vec::with_capacity(limits.0.len());
-    for w in &limits.0 {
-        match out.iter_mut().find(|o| o.window == w.window) {
-            Some(o) => o.limit = o.limit.min(w.limit),
-            None => out.push(*w),
+impl std::ops::Deref for Store {
+    type Target = dyn LimitStore;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl fmt::Debug for Store {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.describe())
+    }
+}
+
+/// A Postgres URL that prints with its password masked: the one in the user
+/// info, and a `password=` query parameter, which sqlx honours too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostgresUrl(String);
+
+impl PostgresUrl {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self(url.into())
+    }
+
+    /// The URL as given, for connecting. Log `self`, never this.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PostgresUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Ok(mut parsed) = Url::parse(&self.0) else {
+            return f.write_str(&self.0);
+        };
+        if !parsed.username().is_empty() {
+            let _ = parsed.set_password(Some("***"));
         }
+        if let Some(query) = parsed.query() {
+            let masked = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some(("password", _)) => "password=***",
+                    _ => pair,
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            parsed.set_query(Some(&masked));
+        }
+        f.write_str(parsed.as_str())
     }
-    out
 }
 
 #[cfg(test)]
@@ -286,7 +343,7 @@ mod tests {
 
     #[test]
     fn a_window_spec_parses_counts_and_sizes() {
-        let w = WindowLimits::parse("10/1m, 60/30m,100/1h").unwrap();
+        let w = "10/1m, 60/30m,100/1h".parse::<WindowLimits>().unwrap();
         assert_eq!(
             w.0,
             vec![
@@ -304,7 +361,7 @@ mod tests {
                 },
             ]
         );
-        let b = WindowLimits::parse("100MB/1m,1GB/1h").unwrap();
+        let b = "100MB/1m,1GB/1h".parse::<WindowLimits>().unwrap();
         assert_eq!(b.0[0].limit, 100_000_000);
         assert_eq!(b.0[1].limit, 1_000_000_000);
         assert_eq!(b.longest(), Some(Duration::from_secs(3600)));
@@ -312,29 +369,34 @@ mod tests {
 
     #[test]
     fn an_empty_spec_is_unlimited_and_a_bad_one_says_why() {
-        assert!(WindowLimits::parse("").unwrap().is_empty());
-        assert!(WindowLimits::parse("  ").unwrap().is_empty());
-        assert!(WindowLimits::parse("10")
+        assert!("".parse::<WindowLimits>().unwrap().is_empty());
+        assert!("  ".parse::<WindowLimits>().unwrap().is_empty());
+        assert!("10"
+            .parse::<WindowLimits>()
             .unwrap_err()
             .contains("<limit>/<window>"));
-        assert!(WindowLimits::parse("10/1").unwrap_err().contains("unit"));
-        assert!(WindowLimits::parse("0/1m")
+        assert!("10/1".parse::<WindowLimits>().unwrap_err().contains("unit"));
+        assert!("0/1m"
+            .parse::<WindowLimits>()
             .unwrap_err()
             .contains("admits nothing"));
-        assert!(WindowLimits::parse("10/0m").unwrap_err().contains("zero"));
-        assert!(WindowLimits::parse("ten/1m").is_err());
+        assert!("10/0m"
+            .parse::<WindowLimits>()
+            .unwrap_err()
+            .contains("zero"));
+        assert!("ten/1m".parse::<WindowLimits>().is_err());
     }
 
     #[test]
     fn windows_sort_shortest_first() {
-        let w = WindowLimits::parse("100/1h,10/1m").unwrap();
+        let w = "100/1h,10/1m".parse::<WindowLimits>().unwrap();
         assert_eq!(w.0[0].window, Duration::from_secs(60));
     }
 
     #[test]
     fn two_limits_on_one_window_count_as_the_tighter_one() {
-        let w = WindowLimits::parse("10/1m,5/1m,100/1h").unwrap();
-        let d = distinct_windows(&w);
+        let w = "10/1m,5/1m,100/1h".parse::<WindowLimits>().unwrap();
+        let d = w.distinct();
         assert_eq!(d.len(), 2);
         assert_eq!(d[0].limit, 5);
         assert_eq!(d[1].limit, 100);
@@ -343,34 +405,49 @@ mod tests {
     #[test]
     fn a_password_is_redacted_and_the_rest_kept() {
         assert_eq!(
-            redact("postgres://notary:hunter2@db.internal:5432/limits?sslmode=require"),
+            PostgresUrl::new(
+                "postgres://notary:hunter2@db.internal:5432/limits?sslmode=require"
+            )
+            .to_string(),
             "postgres://notary:***@db.internal:5432/limits?sslmode=require"
         );
-        assert_eq!(redact("postgres://db/limits"), "postgres://db/limits");
-        assert_eq!(redact("memory"), "memory");
+        assert_eq!(
+            PostgresUrl::new("postgres://db/limits").to_string(),
+            "postgres://db/limits"
+        );
+        assert_eq!(PostgresUrl::new("memory").to_string(), "memory");
     }
 
     #[test]
     fn a_password_in_the_query_is_redacted_too() {
         assert_eq!(
-            redact("postgres://notary@db/limits?password=hunter2&sslmode=require"),
+            PostgresUrl::new(
+                "postgres://notary@db/limits?password=hunter2&sslmode=require"
+            )
+            .to_string(),
             "postgres://notary:***@db/limits?password=***&sslmode=require"
         );
         assert_eq!(
-            redact("postgres://db:5432/limits?sslmode=require&password=hunter2"),
+            PostgresUrl::new(
+                "postgres://db:5432/limits?sslmode=require&password=hunter2"
+            )
+            .to_string(),
             "postgres://db:5432/limits?sslmode=require&password=***"
         );
         assert_eq!(
-            redact("postgres://db?password=hunter2"),
+            PostgresUrl::new("postgres://db?password=hunter2").to_string(),
             "postgres://db?password=***"
         );
         // Both at once, and a `@` in the query is not a user info marker.
         assert_eq!(
-            redact("postgres://n:hunter2@db/l?password=hunter2&application_name=a@b"),
+            PostgresUrl::new(
+                "postgres://n:hunter2@db/l?password=hunter2&application_name=a@b"
+            )
+            .to_string(),
             "postgres://n:***@db/l?password=***&application_name=a@b"
         );
         assert_eq!(
-            redact("postgres://db/l?not_password=x&passwordx=y"),
+            PostgresUrl::new("postgres://db/l?not_password=x&passwordx=y").to_string(),
             "postgres://db/l?not_password=x&passwordx=y"
         );
     }
@@ -388,7 +465,7 @@ mod tests {
     /// shared database can run this from several checkouts at once.
     pub(super) async fn conformance(store: &dyn LimitStore) -> Result<(), StoreError> {
         let long = Duration::from_secs(60);
-        let hour = WindowLimits::parse("10/1h").unwrap();
+        let hour = "10/1h".parse::<WindowLimits>().unwrap();
 
         // Leases up to the limit, then refused; a release frees exactly one
         // slot: the other lease keeps its own.
@@ -422,8 +499,8 @@ mod tests {
         // A count is refused when any window is full, and then counts in no
         // window: the 2h window still has room afterwards.
         let c = fresh_client();
-        let both = WindowLimits::parse("2/1h,3/2h").unwrap();
-        let two_hours = WindowLimits::parse("3/2h").unwrap();
+        let both = "2/1h,3/2h".parse::<WindowLimits>().unwrap();
+        let two_hours = "3/2h".parse::<WindowLimits>().unwrap();
         assert!(store.count(&c, Dimension::Upgrades, 1, &both).await?);
         assert!(store.count(&c, Dimension::Upgrades, 1, &both).await?);
         assert!(
@@ -442,8 +519,8 @@ mod tests {
         // must not have charged the shorter one. Two used of five in the
         // hour; three more fit only if the refusal counted nothing there.
         let c = fresh_client();
-        let both = WindowLimits::parse("5/1h,2/2h").unwrap();
-        let one_hour = WindowLimits::parse("5/1h").unwrap();
+        let both = "5/1h,2/2h".parse::<WindowLimits>().unwrap();
+        let one_hour = "5/1h".parse::<WindowLimits>().unwrap();
         assert!(store.count(&c, Dimension::Upgrades, 1, &both).await?);
         assert!(store.count(&c, Dimension::Upgrades, 1, &both).await?);
         assert!(
@@ -459,7 +536,7 @@ mod tests {
 
         // Units are counted, not calls, and would_fit counts nothing.
         let c = fresh_client();
-        let bytes = WindowLimits::parse("100/1h").unwrap();
+        let bytes = "100/1h".parse::<WindowLimits>().unwrap();
         assert!(store.count(&c, Dimension::Bytes, 60, &bytes).await?);
         assert!(!store.count(&c, Dimension::Bytes, 50, &bytes).await?);
         assert!(store.would_fit(&c, Dimension::Bytes, 40, &bytes).await?);
@@ -506,7 +583,7 @@ mod tests {
         for _ in 0..3 {
             store.try_lease(&c, 3, short).await?.expect("lease");
         }
-        let second = WindowLimits::parse("10/1s").unwrap();
+        let second = "10/1s".parse::<WindowLimits>().unwrap();
         store.charge(&c, Dimension::Bytes, 1, &second).await?;
         let live = fresh_client();
         store.try_lease(&live, 1, long).await?.expect("long lease");

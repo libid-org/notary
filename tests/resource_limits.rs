@@ -19,6 +19,7 @@ use futures_util::{
 use notary::{
     config::ClientIpHeader,
     limits::Concurrency,
+    store::WindowLimits,
     NotaryServerConfig,
 };
 use tokio_tungstenite::{
@@ -81,8 +82,14 @@ fn every_limit_has_a_default() {
     assert_eq!(config.ws_port, 7048);
     assert!(!config.internal_proxy_route);
     assert_eq!(config.internal_max_sessions, 1024);
-    assert_eq!(config.per_ip_upgrades, "10/1m,60/30m,100/1h");
-    assert_eq!(config.per_ip_bytes, "100MB/1m,600MB/30m,1GB/1h");
+    assert_eq!(
+        config.per_ip_upgrades,
+        "10/1m,60/30m,100/1h".parse::<WindowLimits>().unwrap()
+    );
+    assert_eq!(
+        config.per_ip_bytes,
+        "100MB/1m,600MB/30m,1GB/1h".parse::<WindowLimits>().unwrap()
+    );
     assert_eq!(config.proxy_upstream, None);
     assert_eq!(config.proxy_upstream_ca, None);
     assert!(config.proxy_upstream().unwrap().is_none());

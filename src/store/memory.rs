@@ -19,7 +19,6 @@ use std::{
 use async_trait::async_trait;
 
 use super::{
-    distinct_windows,
     Dimension,
     LeaseId,
     LimitStore,
@@ -115,7 +114,7 @@ impl Inner {
         limits: &WindowLimits,
         now: Duration,
     ) -> bool {
-        distinct_windows(limits).iter().all(|w| {
+        limits.distinct().iter().all(|w| {
             let key = WindowKey::at(*client, dimension, w.window, now);
             let used = self.windows.get(&key).copied().unwrap_or(0);
             used.saturating_add(units) <= w.limit
@@ -131,7 +130,7 @@ impl Inner {
         limits: &WindowLimits,
         now: Duration,
     ) {
-        for w in distinct_windows(limits) {
+        for w in limits.distinct() {
             let key = WindowKey::at(*client, dimension, w.window, now);
             let used = self.windows.entry(key).or_insert(0);
             *used = used.saturating_add(units);
@@ -252,7 +251,7 @@ mod tests {
     #[test]
     fn a_full_window_rolls_over_and_is_then_swept() {
         let (c, d) = (fresh_client(), Dimension::Upgrades);
-        let limits = WindowLimits::parse("2/1m").unwrap();
+        let limits = "2/1m".parse::<WindowLimits>().unwrap();
         let mut inner = Inner::default();
         let t0 = Duration::from_secs(60 * 16_667); // a minute boundary
         inner.add(&c, d, 2, &limits, t0);
@@ -282,7 +281,7 @@ mod tests {
                 &c,
                 Dimension::Bytes,
                 1,
-                &WindowLimits::parse("1/1s").unwrap(),
+                &"1/1s".parse::<WindowLimits>().unwrap(),
             )
             .await?;
         store
@@ -290,7 +289,7 @@ mod tests {
                 &c,
                 Dimension::Bytes,
                 1,
-                &WindowLimits::parse("1/1h").unwrap(),
+                &"1/1h".parse::<WindowLimits>().unwrap(),
             )
             .await?;
         tokio::time::sleep(Duration::from_millis(1100)).await;
