@@ -1,4 +1,10 @@
-//! Ceremony attestation.
+//! The section 9.1 ceremony attestation: the attested data for what a
+//! session observed, and the notary's signature over its keccak256.
+//!
+//! The record carries nothing the notary derived by applying a profile
+//! rule -- no handle, account, client or chain address (REQ-COMMON-61).
+//! Each is derivable from the revealed ranges, and a second signed
+//! representation could disagree with the bytes it was taken from.
 
 use std::time::SystemTime;
 
@@ -18,19 +24,6 @@ use crate::error::{
     Error,
     Result,
 };
-
-// The wire record itself is `libid_transcript::AttestationWire`. It is defined
-// there, beside the `write_msg`/`read_msg` that frame it, because a prover has
-// to read exactly what this writes -- and a copy here would be a second
-// definition of one message, agreeing only for as long as nobody renames a
-// field. What the notary puts in it is still decided here, and it is nothing
-// it derived by applying a profile rule: no handle, no account identifier, no
-// client identifier, no chain address (REQ-COMMON-61). Every one is derivable
-// from the revealed ranges, and a second signed representation can disagree
-// with the bytes it was taken from. That is why this endpoint no longer takes
-// `handle`, `user_id` or `session_addr` -- the Platform Verifier reads them
-// itself, and the notary deciding them would be the profile-specific
-// judgement REQ-COMMON-33 forbids it.
 
 impl NotaryState {
     /// Build the section 9.1 attested data for one completed session, stamped

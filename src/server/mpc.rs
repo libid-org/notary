@@ -1,4 +1,5 @@
-//! Core notary logic (transport-agnostic).
+//! The MPC-TLS path: a TCP prover, its session slot, and the attestation
+//! written back down the socket it opened.
 
 use std::{
     sync::Arc,
@@ -31,14 +32,8 @@ impl NotaryState {
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
     {
-        // Wait for the prover to say something before spending a slot on it. A
-        // slot taken on accept is a slot anyone who can open a TCP socket may
-        // reserve -- no TLS, no protocol, not one byte -- and hold for the whole
-        // connection deadline. Sixteen such sockets took every MPC slot on a
-        // four-core pod, and the real provers behind them queued until their own
-        // deadlines expired. The first byte costs the attacker nothing either, but
-        // it puts them on a clock this side controls: the slot is now held by a
-        // session in progress, which the connection deadline already bounds.
+        // The slot is taken on the first byte, not on accept: an open socket
+        // that sends nothing would otherwise hold it for the connection deadline.
         let socket = await_session_start(socket, self.setup_deadline).await?;
         self.with_mpc_slot(self.handle_notary_session(socket)).await
     }
@@ -113,16 +108,9 @@ impl NotaryState {
         let domain = dns_name.as_str().to_string();
         info!("Domain from SNI: {}", domain);
 
-        // The ceremony record is transport-agnostic and session-agnostic. It is
-        // built from what the session revealed, the server the notary
-        // authenticated, the commitments over the rest, and the notary's own clock
-        // -- an MPC-TLS session produces all four exactly as a ProxyMode one does,
-        // and the keeper's JWKS reading exactly as a platform session does. This
-        // used to dispatch on the server name and answer `www.googleapis.com` with
-        // a Merkle proof of its own shape; that was the notary deciding what a
-        // session was for, which is the profile-specific decision REQ-COMMON-33
-        // forbids it from making. The record names the host; the contract that
-        // reads the record decides whether it wanted that host.
+        // One record whatever host the session reached: whether that host was
+        // wanted is the reading contract's decision, not the notary's
+        // (REQ-COMMON-33).
         let ceremony_attestation = self
             .attest(
                 &result.partial_transcript,
@@ -327,19 +315,11 @@ mod tests {
         fixture_task.await.unwrap();
     }
 
-    /// A client that connects and then goes silent forever must not pin the
-    /// handler past the connection deadline — defense in depth over the
-    /// fail-fast fixes, covering whatever future bug makes a session pend.
+    /// A connection that says nothing fails at the setup deadline, holds no
+    /// session slot while it waits, and never pins the handler past the
+    /// connection deadline, whatever future bug makes a session pend.
     /// Paused time: the runtime auto-advances the clock to the deadline the
     /// moment everything is blocked, so the test finishes in milliseconds.
-    /// A connection that says nothing fails at the setup deadline, and holds
-    /// no session slot while it waits.
-    ///
-    /// Both halves matter. Sixteen sockets that connect and stay silent took
-    /// every MPC slot on a four-core pod when the slot was taken on accept,
-    /// and held each for the 300s connection deadline; real provers queued
-    /// behind them until their own deadlines expired. Opening a socket now
-    /// costs the socket and nothing else.
     #[tokio::test(start_paused = true)]
     async fn silent_connection_hits_the_setup_deadline_and_takes_no_slot() {
         use std::time::Duration;
