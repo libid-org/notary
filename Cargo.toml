@@ -27,16 +27,13 @@ path = "src/main.rs"
 # `path` deps unify. libid-tlsn is git-only (upstream tlsn is not on crates.io)
 # and exposes sibling-crate types, so mixing the crates.io copies with the git
 # copy would put two incompatible versions of the same types in the graph.
-# libid-ceremony is direct because the notary constructs its attested record;
-# libid-tlsn also reaches the same crate through the workspace tag.
 # The upstream `tlsn` git rev is pinned by libid-tlsn and arrives the same way;
 # the direct `tlsn` entry below MUST name the same rev.
 #
-libid-ceremony = { git = "https://github.com/libid-org/libid-rs", tag = "v0.4.0" }
-libid-crypto = { git = "https://github.com/libid-org/libid-rs", tag = "v0.4.0" }
-libid-signer = { git = "https://github.com/libid-org/libid-rs", tag = "v0.4.0" }
-libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.4.0" }
-libid-transcript = { git = "https://github.com/libid-org/libid-rs", tag = "v0.4.0" }
+libid-crypto = { git = "https://github.com/libid-org/libid-rs", tag = "v0.5.0" }
+libid-signer = { git = "https://github.com/libid-org/libid-rs", tag = "v0.5.0" }
+libid-tlsn = { git = "https://github.com/libid-org/libid-rs", tag = "v0.5.0" }
+libid-transcript = { git = "https://github.com/libid-org/libid-rs", tag = "v0.5.0" }
 
 # Upstream TLSNotary. The pin MUST equal libid-tlsn's (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible

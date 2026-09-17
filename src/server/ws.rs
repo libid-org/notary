@@ -41,6 +41,7 @@ use futures_util::{
     SinkExt,
     StreamExt,
 };
+use libid_tlsn::AbortOnDrop;
 use libid_transcript::AttestationWire;
 use tlsn::{
     config::verifier::VerifierConfig,
@@ -832,34 +833,6 @@ impl Bill {
     }
 }
 
-/// Owns a spawned task and aborts it on drop unless the handle was taken back
-/// out with [`AbortOnDrop::into_inner`].
-///
-/// Dropping a bare [`tokio::task::JoinHandle`] DETACHES the task rather than
-/// cancelling it, so every `?` early return below would leave the spawned
-/// driver (or WS pump) running unsupervised — each aborted connection then
-/// retains the task and its buffers. With this guard, cancellation is the
-/// default on every exit path, including panics and the caller dropping the
-/// future; the success path opts out by taking the handle back to join it.
-/// (Same shape as the guard inside `libid-tlsn`'s session functions.)
-struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
-
-impl<T> AbortOnDrop<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
-        Self(Some(handle))
-    }
-
-    /// The wrapped handle, for polling the task without disarming the guard.
-    fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
-        self.0.as_mut().expect("handle present until into_inner")
-    }
-
-    /// Disarm the guard and hand the handle back for joining.
-    fn into_inner(mut self) -> tokio::task::JoinHandle<T> {
-        self.0.take().expect("handle present until into_inner")
-    }
-}
-
 /// Error for a session driver that finished while session setup was still in
 /// flight. The driver only completes once the underlying transport is closed
 /// or dead, so a protocol request submitted to it may never resolve: without
@@ -875,14 +848,6 @@ fn driver_finished_early<T, E: std::fmt::Display>(
         Err(e) => format!("driver task join: {e}"),
     };
     Error::NotaryServer { detail }
-}
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            handle.abort();
-        }
-    }
 }
 
 #[cfg(test)]
