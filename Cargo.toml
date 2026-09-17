@@ -21,6 +21,16 @@ path = "src/lib.rs"
 name = "notary"
 path = "src/main.rs"
 
+[[bin]]
+name = "notary-e2e"
+path = "src/bin/notary-e2e.rs"
+required-features = ["e2e"]
+
+[features]
+# The binary the e2e suite runs: the production configuration plus where
+# ProxyMode dials. Never in a release build; `cargo test --features e2e`.
+e2e = []
+
 [dependencies]
 # ── libid-rs shared crates ──────────────────────────────────────────────────
 # All five ride the same git source, at the same tag, so their intra-workspace

@@ -4,7 +4,6 @@ use clap::{
     Parser,
     ValueEnum,
 };
-use tlsn::webpki::CertificateDer;
 
 use crate::{
     limits::Concurrency,
@@ -198,24 +197,6 @@ pub struct NotaryServerConfig {
     /// limit on a non-loopback address, an empty setting refuses to start.
     #[arg(long, env = "NOTARY_LIMITS_STORE", default_value = "")]
     pub limits_store: String,
-
-    /// TEST HOOK. Where every ProxyMode session dials, as `<ip>:<port>`,
-    /// instead of `<server name>:443`. It exists so a test suite can run the
-    /// real binary against a local TLS fixture; the server name a session
-    /// authenticates is unchanged, so the fixture has to hold a certificate
-    /// for it. Refused on any non-loopback `--host`: a notary reachable
-    /// from off the machine dials the server it authenticates and nothing
-    /// else.
-    #[arg(long, env = "NOTARY_PROXY_UPSTREAM")]
-    pub proxy_upstream: Option<String>,
-
-    /// TEST HOOK, with `--proxy-upstream`: a CA certificate file, DER or
-    /// PEM, added to the roots the upstream's certificate is verified
-    /// against, so a local fixture holding a certificate for the server
-    /// name is accepted. Refused without `--proxy-upstream`, and with it
-    /// on any non-loopback `--host`.
-    #[arg(long, env = "NOTARY_PROXY_UPSTREAM_CA", requires = "proxy_upstream")]
-    pub proxy_upstream_ca: Option<std::path::PathBuf>,
 }
 
 impl NotaryServerConfig {
@@ -259,50 +240,6 @@ impl NotaryServerConfig {
         ))
     }
 
-    /// `--proxy-upstream` and `--proxy-upstream-ca`, checked against the
-    /// bind address: the hook is for a test suite on this machine, so a
-    /// non-loopback bind refuses to start rather than serve attestations
-    /// of a fixture to the network. The CA file is read here.
-    pub fn proxy_upstream(&self) -> Result<Option<ProxyUpstream>, String> {
-        let Some(spec) = self
-            .proxy_upstream
-            .as_deref()
-            .map(str::trim)
-            .filter(|spec| !spec.is_empty())
-        else {
-            if self.proxy_upstream_ca.is_some() {
-                return Err("--proxy-upstream-ca needs --proxy-upstream".into());
-            }
-            return Ok(None);
-        };
-        if !self.bound_locally() {
-            return Err(format!(
-                "--proxy-upstream is a test hook and needs a loopback --host, got '{}'",
-                self.host
-            ));
-        }
-        let addr = spec.parse().map_err(|e| {
-            format!("--proxy-upstream: expected <ip>:<port>, got '{spec}': {e}")
-        })?;
-        let ca = match &self.proxy_upstream_ca {
-            None => None,
-            Some(path) => {
-                let bytes = std::fs::read(path).map_err(|e| {
-                    format!("--proxy-upstream-ca {}: {e}", path.display())
-                })?;
-                let der = if bytes.starts_with(b"-----BEGIN") {
-                    CertificateDer::from_pem_slice(&bytes).map_err(|e| {
-                        format!("--proxy-upstream-ca {}: {e}", path.display())
-                    })?
-                } else {
-                    CertificateDer(bytes)
-                };
-                Some(der)
-            }
-        };
-        Ok(Some(ProxyUpstream { addr, ca }))
-    }
-
     /// Whether any per-client limit applies on the public port.
     fn public_limits_in_force(&self) -> bool {
         self.ws_port != 0
@@ -339,17 +276,6 @@ impl std::fmt::Display for ClientIpHeader {
         };
         f.write_str(name)
     }
-}
-
-/// The test hook `--proxy-upstream` names: where every ProxyMode session
-/// dials, and the root its certificate may chain to besides the public
-/// ones.
-#[derive(Clone, Debug)]
-pub struct ProxyUpstream {
-    /// Dialled instead of `<server name>:443`.
-    pub addr: std::net::SocketAddr,
-    /// `--proxy-upstream-ca`, read.
-    pub ca: Option<CertificateDer>,
 }
 
 /// Where the shared counts live.

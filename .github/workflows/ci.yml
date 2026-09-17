@@ -89,7 +89,7 @@ jobs:
           # the job instead of skipping them. The user is a superuser: one
           # test ALTERs the database's default isolation and resets it.
           NOTARY_TEST_DATABASE_URL: postgres://postgres:notary@localhost:5432/postgres
-        run: cargo test --all
+        run: cargo test --all --features e2e
 
   # ---------------------------------------------------------------------------
   # DCO: every commit carries a Signed-off-by trailer, as CONTRIBUTING.md
