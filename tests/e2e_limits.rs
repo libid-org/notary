@@ -1,5 +1,5 @@
 //! Every limit on the deployed shape: the real binary, the real Postgres
-//! store, real ProxyMode ceremonies over a WebSocket, and two replicas on
+//! store, real ProxyMode sessions over a WebSocket, and two replicas on
 //! one database. The in-process tests beside each handler prove a limit
 //! with a stalled three-byte session; this suite is the proof that the
 //! whole thing holds as deployed.
@@ -7,7 +7,7 @@
 //! Needs `NOTARY_TEST_DATABASE_URL`, and skips itself without it -- except
 //! under CI, where an unset URL is a broken workflow and fails, the same
 //! rule as the Postgres store's own tests. The tests take turns: each
-//! spawns one or two notaries and drives a ceremony that is CPU-heavy in a
+//! spawns one or two notaries and drives a session that is CPU-heavy in a
 //! debug build, and one of them counts whole tables.
 //!
 //! The upstream is a local TLS fixture holding a certificate for
@@ -513,7 +513,7 @@ async fn admitted(url: &str, headers: Headers<'_>) -> Socket {
     socket
 }
 
-/// What a ceremony came to.
+/// What a session came to.
 #[derive(Debug)]
 enum Outcome {
     /// The attestation the notary wrote, and the bytes the WebSocket
@@ -541,7 +541,7 @@ impl Outcome {
 /// duplex the prover drives, the way tlsn_wasm's transport does it, and
 /// every byte over the WebSocket is counted so a caller can size a window
 /// from a measurement.
-async fn ceremony(socket: Socket) -> Outcome {
+async fn session(socket: Socket) -> Outcome {
     let prover_config = ProverConfig::builder(SERVER_DOMAIN)
         .mode(ProverMode::Proxy)
         .root_certs(vec![CA_CERT_DER.to_vec()])
@@ -653,15 +653,15 @@ async fn ceremony(socket: Socket) -> Outcome {
         },
         (_, Some((code, reason))) => Outcome::Closed { code, reason },
         (Ok(Err(error)), None) => {
-            panic!("ceremony failed without a close frame: {error}")
+            panic!("session failed without a close frame: {error}")
         }
-        (Err(_), None) => panic!("ceremony timed out without a close frame"),
+        (Err(_), None) => panic!("session timed out without a close frame"),
     }
 }
 
-/// Upgrade and run a ceremony in one go.
-async fn run_ceremony(url: &str, headers: Headers<'_>) -> Result<Outcome, Refused> {
-    Ok(ceremony(upgrade(url, headers).await?).await)
+/// Upgrade and run a session in one go.
+async fn run_session(url: &str, headers: Headers<'_>) -> Result<Outcome, Refused> {
+    Ok(session(upgrade(url, headers).await?).await)
 }
 
 /// The attestation is the notary's: the record names the fixture's server,
@@ -824,15 +824,15 @@ fn host_port(url: &str) -> (String, u16) {
 
 // ─── The tests ──────────────────────────────────────────────────────────────
 
-/// The baseline: a real ceremony through the public port ends in an
+/// The baseline: a real session through the public port ends in an
 /// attestation the notary signed, and the lease it held is gone.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_real_ceremony_completes_through_the_public_port() {
+async fn a_real_session_completes_through_the_public_port() {
     let Some(lab) = Lab::open().await else { return };
     let notary = lab.spawn("A", &[]).await;
     let client = fresh_client();
 
-    let outcome = run_ceremony(&notary.public(), &xff(&client))
+    let outcome = run_session(&notary.public(), &xff(&client))
         .await
         .expect("admitted");
     assert_signed(outcome.attested());
@@ -910,9 +910,9 @@ async fn the_upgrades_window_holds_across_two_replicas() {
     let _other = admitted(&b.public(), &xff(&other)).await;
 }
 
-/// `--per-ip-bytes` is charged with what a ceremony really relayed. One
-/// ceremony is measured first, on a notary with a wide window; on one whose
-/// window is one and a half of that, the first ceremony fits, the second
+/// `--per-ip-bytes` is charged with what a session really relayed. One
+/// session is measured first, on a notary with a wide window; on one whose
+/// window is one and a half of that, the first session fits, the second
 /// fits -- the window only has to have room -- and the third is refused with
 /// 429 naming the bytes window. The upgrades window is off, so nothing else
 /// can be what refuses.
@@ -926,18 +926,18 @@ async fn the_bytes_window_is_charged_by_real_ceremonies() {
         )
         .await;
     let client = fresh_client();
-    run_ceremony(&measure.public(), &xff(&client))
+    run_session(&measure.public(), &xff(&client))
         .await
         .expect("admitted")
         .attested();
-    let one_ceremony = until_charged(&lab.pool, &client, 0).await;
+    let one_session = until_charged(&lab.pool, &client, 0).await;
     assert!(
-        one_ceremony > 1000,
+        one_session > 1000,
         "a TLS handshake alone is over a kilobyte"
     );
     drop(measure);
 
-    let limit = one_ceremony * 3 / 2;
+    let limit = one_session * 3 / 2;
     let notary = lab
         .spawn(
             "limited",
@@ -951,16 +951,16 @@ async fn the_bytes_window_is_charged_by_real_ceremonies() {
         .await;
     let client = fresh_client();
 
-    run_ceremony(&notary.public(), &xff(&client))
+    run_session(&notary.public(), &xff(&client))
         .await
-        .expect("the first ceremony is admitted")
+        .expect("the first session is admitted")
         .attested();
     let charged = until_charged(&lab.pool, &client, 0).await;
     assert!(charged <= limit, "{charged} > {limit}");
 
-    run_ceremony(&notary.public(), &xff(&client))
+    run_session(&notary.public(), &xff(&client))
         .await
-        .expect("the second ceremony is admitted: the window has room")
+        .expect("the second session is admitted: the window has room")
         .attested();
     let charged = until_charged(&lab.pool, &client, charged).await;
     assert!(charged > limit, "{charged} <= {limit}");
@@ -968,7 +968,7 @@ async fn the_bytes_window_is_charged_by_real_ceremonies() {
     let refused = refused(
         &notary.public(),
         &xff(&client),
-        "the third ceremony finds the window full",
+        "the third session finds the window full",
     )
     .await;
     assert_eq!(refused.status, 429, "{refused:?}");
@@ -998,8 +998,8 @@ async fn the_global_pool_refuses_with_503() {
 }
 
 /// Every public limit at its minimum, and the internal route ignores them
-/// all: three held sessions and a whole ceremony, with no client header,
-/// and the store's tables are exactly as they were. A public ceremony
+/// all: three held sessions and a whole session, with no client header,
+/// and the store's tables are exactly as they were. A public session
 /// afterwards shows the store would have recorded one. The same route
 /// reached through a proxy -- `X-Forwarded-For` set -- is 403.
 #[tokio::test(flavor = "multi_thread")]
@@ -1028,7 +1028,7 @@ async fn the_internal_route_ignores_every_limit() {
     let _one = admitted(&notary.internal(), &[]).await;
     let _two = admitted(&notary.internal(), &[]).await;
     let _three = admitted(&notary.internal(), &[]).await;
-    let outcome = run_ceremony(&notary.internal(), &[])
+    let outcome = run_session(&notary.internal(), &[])
         .await
         .expect("the internal route admits");
     assert_signed(outcome.attested());
@@ -1049,20 +1049,20 @@ async fn the_internal_route_ignores_every_limit() {
     assert_eq!(proxied.status, 403, "{proxied:?}");
     assert_eq!(proxied.body, "internal route is not served through a proxy");
 
-    run_ceremony(&notary.public(), &xff(&client))
+    run_session(&notary.public(), &xff(&client))
         .await
-        .expect("one public ceremony fits every minimum")
+        .expect("one public session fits every minimum")
         .attested();
     until_charged(&lab.pool, &client, 0).await;
     assert!(
         rows(&lab.pool, "notary_windows").await > before.1,
-        "the public ceremony left no window rows"
+        "the public session left no window rows"
     );
 }
 
 /// With `--client-ip-header cf-connecting-ip` the client is that header and
 /// nothing else: `X-Forwarded-For` alone is 400, `CF-Connecting-IP` carries
-/// a ceremony through, and the per-client cap counts its value -- two values
+/// a session through, and the per-client cap counts its value -- two values
 /// both hold, the same value twice is closed 1013.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_missing_header_is_400_and_cf_mode_switches_the_source() {
@@ -1090,7 +1090,7 @@ async fn a_missing_header_is_400_and_cf_mode_switches_the_source() {
     .await;
     assert_eq!(refused.status, 400, "{refused:?}");
 
-    let outcome = run_ceremony(&notary.public(), &cf(&client))
+    let outcome = run_session(&notary.public(), &cf(&client))
         .await
         .expect("the Cloudflare header names the client");
     assert_signed(outcome.attested());
@@ -1127,7 +1127,7 @@ async fn a_store_outage_fails_closed_and_recovers() {
         .await;
     let client = fresh_client();
 
-    run_ceremony(&notary.public(), &xff(&client))
+    run_session(&notary.public(), &xff(&client))
         .await
         .expect("admitted through the forwarder")
         .attested();
@@ -1198,10 +1198,10 @@ async fn limits_recover_when_a_replica_dies_holding_leases() {
     .await;
 }
 
-/// SIGTERM with a ceremony in flight: the ceremony finishes with its
+/// SIGTERM with a session in flight: the session finishes with its
 /// attestation, and the process exits 0 once it has.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_ceremony_started_before_sigterm_completes() {
+async fn a_session_started_before_sigterm_completes() {
     let Some(lab) = Lab::open().await else { return };
     let mut notary = lab.spawn("A", &[]).await;
     let client = fresh_client();
@@ -1209,11 +1209,11 @@ async fn a_ceremony_started_before_sigterm_completes() {
     let socket = upgrade(&notary.public(), &xff(&client))
         .await
         .expect("admitted");
-    let running = tokio::spawn(ceremony(socket));
+    let running = tokio::spawn(session(socket));
     tokio::time::sleep(Duration::from_millis(100)).await;
     notary.signal(libc::SIGTERM);
 
-    // The drain is observable while the ceremony runs: the health check
+    // The drain is observable while the session runs: the health check
     // flips to 503 and a new upgrade is refused as draining, not admitted.
     let port = notary.ports.public;
     poll(
@@ -1231,7 +1231,7 @@ async fn a_ceremony_started_before_sigterm_completes() {
     assert_eq!(late.status, 503, "{late:?}");
     assert!(late.body.contains("draining"), "{late:?}");
 
-    let outcome = running.await.expect("the ceremony task");
+    let outcome = running.await.expect("the session task");
     assert_signed(outcome.attested());
     let status = notary.exit_status(Duration::from_secs(5)).await;
     assert!(status.success(), "exit status: {status}");

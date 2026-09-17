@@ -125,8 +125,8 @@ pub struct NotaryServerConfig {
     ///
     /// Concurrency, not request rate, because that is what a session costs:
     /// one relay task, its transcript, and up to `--proxy-max-bytes`, held
-    /// until it ends. One browser ceremony opens two sessions at once, so the
-    /// default leaves a user one ceremony of headroom -- and a shared office
+    /// until it ends. One browser identity flow opens two sessions at once, so
+    /// the default leaves a user one flow of headroom -- and a shared office
     /// address two users.
     ///
     /// The client is whoever `--client-ip-header` names; see there.

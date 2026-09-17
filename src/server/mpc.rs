@@ -111,7 +111,7 @@ impl NotaryState {
         // One record whatever host the session reached: whether that host was
         // wanted is the reading contract's decision, not the notary's
         // (REQ-COMMON-33).
-        let ceremony_attestation = self
+        let attestation = self
             .attest(
                 &result.partial_transcript,
                 &domain,
@@ -120,8 +120,8 @@ impl NotaryState {
             .await?;
 
         let mut io = result.recovered_io;
-        write_msg(&mut io, &ceremony_attestation).await?;
-        info!("Ceremony attestation sent to prover");
+        write_msg(&mut io, &attestation).await?;
+        info!("attestation sent to prover");
 
         Ok(())
     }

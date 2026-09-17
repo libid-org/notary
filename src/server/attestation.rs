@@ -1,4 +1,4 @@
-//! The section 9.1 ceremony attestation: the attested data for what a
+//! The section 9.1 attestation: the attested data for what a
 //! session observed, and the notary's signature over its keccak256.
 //!
 //! The record carries nothing the notary derived by applying a profile
