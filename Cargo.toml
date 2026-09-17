@@ -8,7 +8,7 @@ edition = "2021"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/libid-org/notary"
-description = "The libID notary service: MPC-TLS / zkTLS notarization of a prover's HTTPS session into one signed ceremony attestation, under one notary identity."
+description = "The libID notary service: MPC-TLS / zkTLS notarization of a prover's HTTPS session into one signed attestation, under one notary identity."
 # A binary + companion library, never a registry crate: it names `tlsn`
 # (git-only upstream) in its manifest, which cargo refuses to publish.
 publish = false

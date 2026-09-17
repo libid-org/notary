@@ -3,14 +3,14 @@
 //! # Endpoints
 //!
 //! - **TCP** (`--port`): MPC-TLS verifier for Rust backend provers. The section
-//!   9.1 ceremony attestation is written back down the socket the prover
+//!   9.1 attestation is written back down the socket the prover
 //!   opened. Nothing here dispatches on the server name: the record carries
 //!   it, and the contract that reads the record pins it.
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
 //! - **GET  /healthcheck**: `{"status":"ok"}`, or 503 `{"status":"draining"}`
 //!   once the process has been told to stop.
 //! - **GET /notarize-proxy** (WS upgrade): ProxyMode session followed by one
-//!   length-prefixed ceremony attestation in its own WebSocket message.
+//!   length-prefixed attestation in its own WebSocket message.
 //! - **GET /internal/notarize-proxy** (WS upgrade, `--internal-proxy-route`
 //!   only): the same session for our own in-cluster services, with no
 //!   per-client limit and its own session pool. It exists for the load
@@ -32,7 +32,7 @@
 //! describes.
 //!
 //! Its signature alone registers nothing. A contract on the Consumer Chain
-//! authenticates it -- the Notary Service of ceremony-common section 9.1 --
+//! authenticates it -- the Notary Service, spec section 9.1 --
 //! and NOT the proving circuit: an attestation is authenticated on chain, and
 //! the circuit proves only what cannot be read from authenticated evidence.
 

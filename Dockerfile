@@ -76,7 +76,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 
 # Links the ghcr package to this repo and records what the image came from.
 LABEL org.opencontainers.image.source="https://github.com/libid-org/notary" \
-      org.opencontainers.image.description="libID notary service: MPC-TLS / zkTLS notarization into one signed ceremony attestation." \
+      org.opencontainers.image.description="libID notary service: MPC-TLS / zkTLS notarization into one signed attestation." \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 ENTRYPOINT ["notary"]

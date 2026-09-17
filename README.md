@@ -3,7 +3,7 @@
 The libID notary service. One binary, one signing identity, one record.
 
 The notary acts as the MPC-TLS or ProxyMode (zkTLS) verifier for a prover's
-HTTPS session and signs the canonical ceremony section 9.1 attested data for
+HTTPS session and signs the canonical section 9.1 attested data for
 the authenticated transcript. Every session gets the same record —
 `{ attested_data, notary_signature }` — whether it is a prover's request to a
 platform API (X, GitHub, …), read on chain by that platform's Platform
@@ -75,7 +75,7 @@ Flags or environment variables:
 | `--mpc-max-sessions` | `NOTARY_MPC_MAX_SESSIONS` | `4x` | Concurrent MPC-TLS sessions: a count (`16`) or per-core multiplier (`4x`), resolved at startup; provers past it wait, never refused |
 | `--connection-deadline-secs` | `NOTARY_CONNECTION_DEADLINE_SECS` | `300` | Lifetime of one session on either transport, queue time included; past it the connection is dropped |
 | `--setup-deadline-secs` | `NOTARY_SETUP_DEADLINE_SECS` | `15` | How long a connection may sit before starting its session; until it does it holds no session slot |
-| `--max-sessions-per-ip` | `NOTARY_MAX_SESSIONS_PER_IP` | `4` | Concurrent public ProxyMode sessions one client may hold; past it the session is closed with code 1013. One browser ceremony opens two, so the default leaves one ceremony of headroom. `0` disables |
+| `--max-sessions-per-ip` | `NOTARY_MAX_SESSIONS_PER_IP` | `4` | Concurrent public ProxyMode sessions one client may hold; past it the session is closed with code 1013. One browser identity flow opens two, so the default leaves one flow of headroom. `0` disables |
 | `--per-ip-upgrades` | `NOTARY_PER_IP_UPGRADES` | `10/1m,60/30m,100/1h` | Sessions one client may start per window on the public port, `<count>/<window>`; every window must have room. Empty disables |
 | `--per-ip-bytes` | `NOTARY_PER_IP_BYTES` | `100MB/1m,600MB/30m,1GB/1h` | Bytes one client may relay per window on the public port, `<size>/<window>`, both directions; charged when a session ends, refused at the next upgrade. Empty disables |
 | `--client-ip-header` | `NOTARY_CLIENT_IP_HEADER` | `x-forwarded-for` | Which header names the client on the public port: `x-forwarded-for` (the rightmost entry; notary directly behind the ALB) or `cf-connecting-ip` (Cloudflare proxied record only). A public upgrade without it is refused with 400 |

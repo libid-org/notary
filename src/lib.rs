@@ -2,7 +2,7 @@
 //!
 //! One binary, one signing identity, one record. The notary takes part as the
 //! MPC-TLS or ProxyMode (zkTLS) verifier in a prover's HTTPS session and signs
-//! the canonical ceremony section 9.1 attestation for the authenticated
+//! the canonical section 9.1 attestation for the authenticated
 //! transcript -- `libid_transcript::AttestationWire`, the attested data and the
 //! signature over it and nothing else. The notary does not know, and does not
 //! ask, what the session was for: a platform API call (X, GitHub, …) and the

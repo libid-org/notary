@@ -712,7 +712,7 @@ impl NotaryState {
         let attestation = self
             .attest(&partial, dns_name.as_str(), &transcript_commitments)
             .await?;
-        info!("ProxyMode: ceremony attestation ready for {domain}");
+        info!("ProxyMode: attestation ready for {domain}");
         Ok(attestation)
     }
 }
