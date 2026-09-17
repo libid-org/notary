@@ -11,9 +11,11 @@
 //! debug build, and one of them counts whole tables.
 //!
 //! The upstream is a local TLS fixture holding a certificate for
-//! `test-server.io`, reached through `--proxy-upstream` with its CA in
-//! `--proxy-upstream-ca`. Every client is a fresh `10.x.y.z`: the tables
+//! `test-server.io`, reached through the `notary-e2e` binary's `--upstream`
+//! with its CA in `--upstream-ca`. Every client is a fresh `10.x.y.z`: the tables
 //! are shared across tests and runs.
+
+#![cfg(feature = "e2e")]
 
 mod common;
 
@@ -121,7 +123,7 @@ fn pg_url() -> Option<String> {
 }
 
 /// What every test needs: its turn, the database, the TLS fixture every
-/// notary dials, and the fixture's CA on disk for `--proxy-upstream-ca`.
+/// notary dials, and the fixture's CA on disk for `--upstream-ca`.
 struct Lab {
     _turn: tokio::sync::MutexGuard<'static, ()>,
     pg_url: String,
@@ -179,7 +181,7 @@ impl Lab {
         store: &str,
         extra: &[&str],
     ) -> Notary {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_notary"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_notary-e2e"))
             .args([
                 "--host",
                 "127.0.0.1",
@@ -190,9 +192,9 @@ impl Lab {
                 "--internal-proxy-route",
                 "--limits-store",
                 store,
-                "--proxy-upstream",
+                "--upstream",
                 &self.fixture.addr.to_string(),
-                "--proxy-upstream-ca",
+                "--upstream-ca",
                 self.ca_path.to_str().unwrap(),
                 "--signing-key",
                 TEST_KEY,

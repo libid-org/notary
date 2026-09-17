@@ -80,8 +80,6 @@ Flags or environment variables:
 | `--per-ip-bytes` | `NOTARY_PER_IP_BYTES` | `100MB/1m,600MB/30m,1GB/1h` | Bytes one client may relay per window on the public port, `<size>/<window>`, both directions; charged when a session ends, refused at the next upgrade. Empty disables |
 | `--client-ip-header` | `NOTARY_CLIENT_IP_HEADER` | `x-forwarded-for` | Which header names the client on the public port: `x-forwarded-for` (the rightmost entry; notary directly behind the ALB) or `cf-connecting-ip` (Cloudflare proxied record only). A public upgrade without it is refused with 400 |
 | `--limits-store` | `NOTARY_LIMITS_STORE` | — | Where the per-client counts live: a `postgres://` URL, or `memory` for a single replica |
-| `--proxy-upstream` | `NOTARY_PROXY_UPSTREAM` | — | Tests only; loopback binds only. `<ip>:<port>` every ProxyMode session dials instead of `<server name>:443`, so the real binary can be run against a local TLS fixture; refuses to start on a non-loopback `--host` |
-| `--proxy-upstream-ca` | `NOTARY_PROXY_UPSTREAM_CA` | — | Tests only; with `--proxy-upstream`. A CA certificate file (DER or PEM) added to the roots the upstream's certificate is verified against |
 
 Windows are `<limit>/<window>` lists: a limit is a count, or bytes with a
 `KB`/`MB`/`GB` suffix (powers of ten); a window is `<n>s`, `<n>m` or `<n>h`.
@@ -160,6 +158,10 @@ With a per-client limit on a non-loopback bind, an empty setting is a startup
 error: the failure it hides looks like ordinary load.
 
 ## Docker
+
+The release binary has no test switches. The e2e suite runs `notary-e2e`,
+the same server with one addition, where ProxyMode dials; it exists only
+under `cargo test --features e2e` and is never in the image.
 
 Released images are published to GitHub Container Registry:
 

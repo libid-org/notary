@@ -53,6 +53,7 @@ use libid_signer::{
     ManagedSigner,
     SignerSource,
 };
+use tlsn::webpki::CertificateDer;
 use tokio::{
     net::TcpListener,
     sync::{
@@ -225,7 +226,8 @@ struct NotaryState {
     proxy_max_bytes: usize,
     proxy_root_store: Arc<tlsn::webpki::RootCertStore>,
     /// `None` connects to the TLS-authenticated server name on port 443;
-    /// `--proxy-upstream`, a test hook, dials this instead.
+    /// The upstream override `run_with` was given; `None` dials
+    /// `<server name>:443`.
     proxy_server_addr: Option<SocketAddr>,
     /// MPC-TLS slots: a prover that finds none waits for one. Closed on
     /// shutdown, so the queue drains with an error instead of hanging.
@@ -282,9 +284,28 @@ impl NotaryState {
 /// How often expired leases and dead windows are swept from the store.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
+/// Where every ProxyMode session dials instead of `<server name>:443`, and
+/// the root its certificate may chain to besides the public ones. Not a
+/// configuration: the release binary passes none, and only the binary the
+/// e2e suite builds (`--features e2e`) can supply one.
+#[derive(Clone, Debug)]
+pub struct Upstream {
+    pub addr: SocketAddr,
+    pub ca: Option<CertificateDer>,
+}
+
 /// Start the notary server: the MPC-TLS listener and the HTTP/WebSocket
 /// server, each only if configured.
 pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
+    run_with(config, None).await
+}
+
+/// [`run`], with every ProxyMode session dialling `upstream` instead of the
+/// server it authenticates.
+pub async fn run_with(
+    config: NotaryServerConfig,
+    upstream: Option<Upstream>,
+) -> Result<NotaryServerHandle> {
     if config.internal_proxy_route && config.ws_port == 0 {
         return Err(Error::NotaryServer {
             detail: "--internal-proxy-route mounts on the public port, which \
@@ -298,18 +319,15 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         .limits_store()
         .map_err(|detail| Error::NotaryServer { detail })?;
     let mut proxy_root_store = libid_tlsn::root_store();
-    let proxy_upstream = config
-        .proxy_upstream()
-        .map_err(|detail| Error::NotaryServer { detail })?
-        .map(|upstream| {
-            warn!(
-                addr = %upstream.addr,
-                extra_root = upstream.ca.is_some(),
-                "TEST HOOK: every ProxyMode session dials --proxy-upstream"
-            );
-            proxy_root_store.roots.extend(upstream.ca);
-            upstream.addr
-        });
+    let proxy_upstream = upstream.map(|upstream| {
+        warn!(
+            addr = %upstream.addr,
+            extra_root = upstream.ca.is_some(),
+            "every ProxyMode session dials the upstream override"
+        );
+        proxy_root_store.roots.extend(upstream.ca);
+        upstream.addr
+    });
 
     // A store that cannot be reached is a startup error, not a limit that
     // refuses every client once the process is up.
