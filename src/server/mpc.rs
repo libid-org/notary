@@ -5,7 +5,6 @@ use std::{
     time::{
         Duration,
         Instant,
-        SystemTime,
     },
 };
 
@@ -17,10 +16,7 @@ use tokio::{
 };
 use tracing::info;
 
-use super::{
-    attestation::sign_ceremony_attestation,
-    NotaryState,
-};
+use super::NotaryState;
 use crate::{
     error::{
         Error,
@@ -29,21 +25,118 @@ use crate::{
     limits::PeekedIo,
 };
 
-/// TCP client (Rust backend prover) — uses the full custom wire protocol.
-pub(super) async fn handle_tcp_prover<T>(socket: T, state: &NotaryState) -> Result<()>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
-{
-    // Wait for the prover to say something before spending a slot on it. A
-    // slot taken on accept is a slot anyone who can open a TCP socket may
-    // reserve -- no TLS, no protocol, not one byte -- and hold for the whole
-    // connection deadline. Sixteen such sockets took every MPC slot on a
-    // four-core pod, and the real provers behind them queued until their own
-    // deadlines expired. The first byte costs the attacker nothing either, but
-    // it puts them on a clock this side controls: the slot is now held by a
-    // session in progress, which the connection deadline already bounds.
-    let socket = await_session_start(socket, state.setup_deadline).await?;
-    with_mpc_slot(state, handle_notary_session(socket, state)).await
+impl NotaryState {
+    /// TCP client (Rust backend prover) — uses the full custom wire protocol.
+    pub(super) async fn handle_tcp_prover<T>(&self, socket: T) -> Result<()>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        // Wait for the prover to say something before spending a slot on it. A
+        // slot taken on accept is a slot anyone who can open a TCP socket may
+        // reserve -- no TLS, no protocol, not one byte -- and hold for the whole
+        // connection deadline. Sixteen such sockets took every MPC slot on a
+        // four-core pod, and the real provers behind them queued until their own
+        // deadlines expired. The first byte costs the attacker nothing either, but
+        // it puts them on a clock this side controls: the slot is now held by a
+        // session in progress, which the connection deadline already bounds.
+        let socket = await_session_start(socket, self.setup_deadline).await?;
+        self.with_mpc_slot(self.handle_notary_session(socket)).await
+    }
+
+    /// Run `session` holding one of the MPC-TLS slots, waiting for one first if
+    /// they are all taken.
+    ///
+    /// Waiting, not refusing, is the point: MPC-TLS is the heavy path, and a
+    /// prover refused after paying for its setup would pay again, so the slots
+    /// only bound how many run at once. The queue is FIFO. The connection
+    /// deadline covers the whole session -- the wait for a slot and then the
+    /// session itself -- so no client, however broken, pins this handler task
+    /// past it, and a queued prover never waits forever either.
+    async fn with_mpc_slot<F, T>(&self, session: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        let deadline = self.connection_deadline;
+        let shutting_down = || Error::NotaryServer {
+            detail: "notary is shutting down; not starting a session".into(),
+        };
+        tokio::time::timeout(deadline, async {
+            let slots = Arc::clone(&self.mpc_sessions);
+            let _slot = match slots.clone().try_acquire_owned() {
+                Ok(slot) => slot,
+                Err(TryAcquireError::Closed) => return Err(shutting_down()),
+                Err(TryAcquireError::NoPermits) => {
+                    info!("MPC-TLS: all session slots busy; prover queued");
+                    let queued = Instant::now();
+                    let slot =
+                        slots.acquire_owned().await.map_err(|_| shutting_down())?;
+                    info!(
+                        waited_ms = queued.elapsed().as_millis(),
+                        "MPC-TLS: prover left the queue and starts its session"
+                    );
+                    slot
+                }
+            };
+            session.await
+        })
+        .await
+        .map_err(|_| Error::NotaryServer {
+            detail: format!("connection exceeded the {}s deadline", deadline.as_secs()),
+        })?
+    }
+
+    async fn handle_notary_session<T>(&self, socket: T) -> Result<()>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        let result = libid_tlsn::verifier(socket).await?;
+        self.handle_verified_session(result).await
+    }
+
+    async fn handle_verified_session<T>(
+        &self,
+        result: libid_tlsn::VerifierResult<T>,
+    ) -> Result<()>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        let transcript = &result.partial_transcript;
+        let sent = transcript.sent_unsafe();
+        let recv = transcript.received_unsafe();
+        info!(
+            "Verification complete: {} sent, {} recv bytes",
+            sent.len(),
+            recv.len()
+        );
+
+        let ServerName::Dns(ref dns_name) = result.server_name;
+        let domain = dns_name.as_str().to_string();
+        info!("Domain from SNI: {}", domain);
+
+        // The ceremony record is transport-agnostic and session-agnostic. It is
+        // built from what the session revealed, the server the notary
+        // authenticated, the commitments over the rest, and the notary's own clock
+        // -- an MPC-TLS session produces all four exactly as a ProxyMode one does,
+        // and the keeper's JWKS reading exactly as a platform session does. This
+        // used to dispatch on the server name and answer `www.googleapis.com` with
+        // a Merkle proof of its own shape; that was the notary deciding what a
+        // session was for, which is the profile-specific decision REQ-COMMON-33
+        // forbids it from making. The record names the host; the contract that
+        // reads the record decides whether it wanted that host.
+        let ceremony_attestation = self
+            .attest(
+                &result.partial_transcript,
+                &domain,
+                &result.transcript_commitments,
+            )
+            .await?;
+
+        let mut io = result.recovered_io;
+        write_msg(&mut io, &ceremony_attestation).await?;
+        info!("Ceremony attestation sent to prover");
+
+        Ok(())
+    }
 }
 
 /// `socket` with its first byte read and put back, once the prover sends one.
@@ -73,104 +166,6 @@ where
         });
     }
     Ok(PeekedIo::new(first[..read].to_vec(), socket))
-}
-
-/// Run `session` holding one of the MPC-TLS slots, waiting for one first if
-/// they are all taken.
-///
-/// Waiting, not refusing, is the point: MPC-TLS is the heavy path, and a
-/// prover refused after paying for its setup would pay again, so the slots
-/// only bound how many run at once. The queue is FIFO. The connection
-/// deadline covers the whole session -- the wait for a slot and then the
-/// session itself -- so no client, however broken, pins this handler task
-/// past it, and a queued prover never waits forever either.
-async fn with_mpc_slot<F, T>(state: &NotaryState, session: F) -> Result<T>
-where
-    F: std::future::Future<Output = Result<T>>,
-{
-    let deadline = state.connection_deadline;
-    let shutting_down = || Error::NotaryServer {
-        detail: "notary is shutting down; not starting a session".into(),
-    };
-    tokio::time::timeout(deadline, async {
-        let slots = Arc::clone(&state.mpc_sessions);
-        let _slot = match slots.clone().try_acquire_owned() {
-            Ok(slot) => slot,
-            Err(TryAcquireError::Closed) => return Err(shutting_down()),
-            Err(TryAcquireError::NoPermits) => {
-                info!("MPC-TLS: all session slots busy; prover queued");
-                let queued = Instant::now();
-                let slot = slots.acquire_owned().await.map_err(|_| shutting_down())?;
-                info!(
-                    waited_ms = queued.elapsed().as_millis(),
-                    "MPC-TLS: prover left the queue and starts its session"
-                );
-                slot
-            }
-        };
-        session.await
-    })
-    .await
-    .map_err(|_| Error::NotaryServer {
-        detail: format!("connection exceeded the {}s deadline", deadline.as_secs()),
-    })?
-}
-
-async fn handle_notary_session<T>(socket: T, state: &NotaryState) -> Result<()>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
-{
-    let result = libid_tlsn::verifier(socket).await?;
-    handle_verified_session(result, state).await
-}
-
-async fn handle_verified_session<T>(
-    result: libid_tlsn::VerifierResult<T>,
-    state: &NotaryState,
-) -> Result<()>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
-{
-    let transcript = &result.partial_transcript;
-    let sent = transcript.sent_unsafe();
-    let recv = transcript.received_unsafe();
-    info!(
-        "Verification complete: {} sent, {} recv bytes",
-        sent.len(),
-        recv.len()
-    );
-
-    let ServerName::Dns(ref dns_name) = result.server_name;
-    let domain = dns_name.as_str().to_string();
-    info!("Domain from SNI: {}", domain);
-
-    // The ceremony record is transport-agnostic and session-agnostic. It is
-    // built from what the session revealed, the server the notary
-    // authenticated, the commitments over the rest, and the notary's own clock
-    // -- an MPC-TLS session produces all four exactly as a ProxyMode one does,
-    // and the keeper's JWKS reading exactly as a platform session does. This
-    // used to dispatch on the server name and answer `www.googleapis.com` with
-    // a Merkle proof of its own shape; that was the notary deciding what a
-    // session was for, which is the profile-specific decision REQ-COMMON-33
-    // forbids it from making. The record names the host; the contract that
-    // reads the record decides whether it wanted that host.
-    let ceremony_attestation = sign_ceremony_attestation(
-        &state.signer,
-        &result.partial_transcript,
-        &domain,
-        &result.transcript_commitments,
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    )
-    .await?;
-
-    let mut io = result.recovered_io;
-    write_msg(&mut io, &ceremony_attestation).await?;
-    info!("Ceremony attestation sent to prover");
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -211,10 +206,7 @@ mod tests {
             TokioAsyncReadCompatExt,
         };
 
-        use super::{
-            handle_verified_session,
-            NotaryState,
-        };
+        use super::NotaryState;
         use libid_transcript::AttestationWire;
 
         const TEST_KEY: &str =
@@ -269,18 +261,16 @@ mod tests {
                 ..
             } = output;
             let recovered_io = driver_task.await.unwrap().unwrap().into_inner();
-            handle_verified_session(
-                libid_tlsn::VerifierResult {
+            state
+                .handle_verified_session(libid_tlsn::VerifierResult {
                     partial_transcript: transcript.unwrap(),
                     server_name: server_name.unwrap(),
                     tls_transcript,
                     transcript_commitments,
                     recovered_io,
-                },
-                &state,
-            )
-            .await
-            .unwrap();
+                })
+                .await
+                .unwrap();
         });
 
         let protocol = async {
@@ -356,10 +346,7 @@ mod tests {
 
         use libid_signer::SignerSource;
 
-        use super::{
-            handle_tcp_prover,
-            NotaryState,
-        };
+        use super::NotaryState;
 
         // anvil #0 — public test key.
         let key_hex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -377,7 +364,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let connection = {
             let state = state.clone();
-            tokio::spawn(async move { handle_tcp_prover(server, &state).await })
+            tokio::spawn(async move { state.handle_tcp_prover(server).await })
         };
 
         // A moment in: the connection is alive and still holds nothing.
@@ -460,9 +447,6 @@ mod tests {
         };
 
         use super::super::{
-            handle_tcp_prover,
-            handle_verified_session,
-            with_mpc_slot,
             NotaryState,
             Result,
         };
@@ -508,17 +492,15 @@ mod tests {
                 ..
             } = output;
             let recovered_io = driver_task.await.unwrap().unwrap().into_inner();
-            handle_verified_session(
-                libid_tlsn::VerifierResult {
+            state
+                .handle_verified_session(libid_tlsn::VerifierResult {
                     partial_transcript: transcript.unwrap(),
                     server_name: server_name.unwrap(),
                     tls_transcript,
                     transcript_commitments,
                     recovered_io,
-                },
-                state,
-            )
-            .await
+                })
+                .await
         }
 
         /// With one MPC-TLS slot taken, a second prover is not refused: it
@@ -537,7 +519,7 @@ mod tests {
             let (mut a_client, a_server) = tokio::io::duplex(1 << 16);
             let a_state = state.clone();
             let a_task =
-                tokio::spawn(async move { handle_tcp_prover(a_server, &a_state).await });
+                tokio::spawn(async move { a_state.handle_tcp_prover(a_server).await });
             a_client.write_all(b"\x00").await.unwrap();
             let slot_taken = async {
                 while state.mpc_sessions.available_permits() != 0 {
@@ -561,11 +543,12 @@ mod tests {
             let b_task = tokio::spawn({
                 let b_started = Arc::clone(&b_started);
                 async move {
-                    with_mpc_slot(&b_state, async {
-                        b_started.store(true, Ordering::SeqCst);
-                        fixture_mpc_session(notary_io, &b_state).await
-                    })
-                    .await
+                    b_state
+                        .with_mpc_slot(async {
+                            b_started.store(true, Ordering::SeqCst);
+                            fixture_mpc_session(notary_io, &b_state).await
+                        })
+                        .await
                 }
             });
 
@@ -658,7 +641,8 @@ mod tests {
                 .unwrap();
 
             let started = tokio::time::Instant::now();
-            let err = with_mpc_slot(&state, async { Ok(()) })
+            let err = state
+                .with_mpc_slot(async { Ok(()) })
                 .await
                 .expect_err("a queued prover must not wait past the deadline");
             assert!(err.to_string().contains("deadline"), "got: {err}");
@@ -679,7 +663,7 @@ mod tests {
 
             let queued_state = state.clone();
             let queued = tokio::spawn(async move {
-                with_mpc_slot(&queued_state, async { Ok(()) }).await
+                queued_state.with_mpc_slot(async { Ok(()) }).await
             });
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(!queued.is_finished(), "the prover was not queued");

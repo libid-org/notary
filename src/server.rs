@@ -91,7 +91,6 @@ mod mpc;
 mod routes;
 mod ws;
 
-use mpc::handle_tcp_prover;
 use routes::router;
 
 /// How far along the server is in stopping. The listeners watch this.
@@ -480,7 +479,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
                                 let in_flight = s.in_flight.enter();
                                 tokio::spawn(async move {
                                     let _in_flight = in_flight;
-                                    if let Err(e) = handle_tcp_prover(stream, &s).await {
+                                    if let Err(e) = s.handle_tcp_prover(stream).await {
                                         error!("TCP handler error for {}: {}", peer, e);
                                     }
                                 });

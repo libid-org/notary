@@ -1,7 +1,8 @@
 //! Ceremony attestation.
 
+use std::time::SystemTime;
+
 use libid_ceremony::AttestedData;
-use libid_signer::ManagedSigner;
 use libid_tlsn::attest::{
     FromObserved,
     ObservedSession,
@@ -12,6 +13,7 @@ use tlsn::transcript::{
     TranscriptCommitment,
 };
 
+use super::NotaryState;
 use crate::error::{
     Error,
     Result,
@@ -30,39 +32,46 @@ use crate::error::{
 // itself, and the notary deciding them would be the profile-specific
 // judgement REQ-COMMON-33 forbids it.
 
-/// Build the section 9.1 attested data for one completed session and sign it.
-///
-/// Both transports end here and receive the same record on their reclaimed
-/// channel, because transport says nothing about the TLS session it describes.
-pub(super) async fn sign_ceremony_attestation(
-    signer: &ManagedSigner,
-    partial: &PartialTranscript,
-    authority: &str,
-    commitments: &[TranscriptCommitment],
-    created_at: u64,
-) -> Result<AttestationWire> {
-    let attested = AttestedData::from_observed(ObservedSession {
-        transcript: partial,
-        authority,
-        commitments,
-        created_at,
-    })
-    .map_err(|e| Error::NotaryServer {
-        detail: format!("attested data: {e}"),
-    })?;
-    let encoded = attested.encode().map_err(|e| Error::NotaryServer {
-        detail: format!("encode attested data: {e}"),
-    })?;
+impl NotaryState {
+    /// Build the section 9.1 attested data for one completed session, stamped
+    /// with the notary's own clock, and sign it.
+    ///
+    /// Both transports end here and receive the same record on their reclaimed
+    /// channel, because transport says nothing about the TLS session it
+    /// describes.
+    pub(super) async fn attest(
+        &self,
+        transcript: &PartialTranscript,
+        authority: &str,
+        commitments: &[TranscriptCommitment],
+    ) -> Result<AttestationWire> {
+        let attested = AttestedData::from_observed(ObservedSession {
+            transcript,
+            authority,
+            commitments,
+            created_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        })
+        .map_err(|e| Error::NotaryServer {
+            detail: format!("attested data: {e}"),
+        })?;
+        let encoded = attested.encode().map_err(|e| Error::NotaryServer {
+            detail: format!("encode attested data: {e}"),
+        })?;
 
-    // The notary signs `keccak256(attestedData)` and no other preimage
-    // (REQ-COMMON-47).
-    let notary_signature = signer
-        .sign_claim(&libid_crypto::keccak256(&encoded))
-        .await?;
-    Ok(AttestationWire {
-        attested_data: encoded,
-        notary_signature,
-    })
+        // The notary signs `keccak256(attestedData)` and no other preimage
+        // (REQ-COMMON-47).
+        let notary_signature = self
+            .signer
+            .sign_claim(&libid_crypto::keccak256(&encoded))
+            .await?;
+        Ok(AttestationWire {
+            attested_data: encoded,
+            notary_signature,
+        })
+    }
 }
 
 pub(super) fn attestation_frame(attestation: &AttestationWire) -> Result<Vec<u8>> {
