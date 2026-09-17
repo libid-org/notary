@@ -13,7 +13,10 @@ use libid_tlsn::attest::{
     FromObserved,
     ObservedSession,
 };
-use libid_transcript::AttestationWire;
+use libid_transcript::{
+    write_msg,
+    AttestationWire,
+};
 use tlsn::transcript::{
     PartialTranscript,
     TranscriptCommitment,
@@ -67,23 +70,11 @@ impl NotaryState {
     }
 }
 
-pub(super) fn attestation_frame(attestation: &AttestationWire) -> Result<Vec<u8>> {
-    const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
-
-    let json = serde_json::to_vec(attestation)?;
-    if json.len() > MAX_FRAME_BYTES {
-        return Err(Error::NotaryServer {
-            detail: format!("attestation frame is too large: {} bytes", json.len()),
-        });
-    }
-    let len = u32::try_from(json.len())
-        .map_err(|_| Error::NotaryServer {
-            detail: format!("attestation frame is too large: {} bytes", json.len()),
-        })?
-        .to_be_bytes();
-    let mut frame = Vec::with_capacity(len.len() + json.len());
-    frame.extend_from_slice(&len);
-    frame.extend_from_slice(&json);
+/// The attestation as one WebSocket message: the framing `write_msg` puts on
+/// the TCP wire, so a browser and a Rust prover read the same bytes.
+pub(super) async fn attestation_frame(attestation: &AttestationWire) -> Result<Vec<u8>> {
+    let mut frame = Vec::new();
+    write_msg(&mut frame, attestation).await?;
     Ok(frame)
 }
 
@@ -103,6 +94,7 @@ mod tests {
             attested_data: vec![1, 2, 3],
             notary_signature: vec![4; 65],
         })
+        .await
         .unwrap();
         let mut browser = frame.as_slice();
 

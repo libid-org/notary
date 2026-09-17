@@ -29,6 +29,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bytesize::ByteSize;
+use url::Url;
 
 use crate::{
     client_ip::ClientKey,
@@ -110,45 +112,31 @@ impl fmt::Display for WindowLimits {
 }
 
 fn parse_units(s: &str) -> Result<u64, String> {
-    let (digits, mult) = if let Some(n) = s.strip_suffix("GB") {
-        (n, 1_000_000_000)
-    } else if let Some(n) = s.strip_suffix("MB") {
-        (n, 1_000_000)
-    } else if let Some(n) = s.strip_suffix("KB") {
-        (n, 1_000)
-    } else {
-        (s, 1)
+    let n = match s.parse::<u64>() {
+        Ok(n) => n,
+        Err(_) => s
+            .parse::<ByteSize>()
+            .map(|size| size.as_u64())
+            .map_err(|_| format!("'{s}': not a count (10) or a size (100MB)"))?,
     };
-    let n: u64 = digits
-        .trim()
-        .parse()
-        .map_err(|_| format!("'{s}': not a count (10) or a size (100MB)"))?;
     if n == 0 {
         return Err(format!(
             "'{s}': a limit of 0 admits nothing; omit the window instead"
         ));
     }
-    Ok(n * mult)
+    Ok(n)
 }
 
 fn parse_window(s: &str) -> Result<Duration, String> {
-    let (digits, secs) = if let Some(n) = s.strip_suffix('h') {
-        (n, 3600)
-    } else if let Some(n) = s.strip_suffix('m') {
-        (n, 60)
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, 1)
-    } else {
-        return Err(format!("'{s}': a window needs a unit: 30s, 5m or 1h"));
-    };
-    let n: u64 = digits
-        .trim()
-        .parse()
-        .map_err(|_| format!("'{s}': not a duration"))?;
-    if n == 0 {
+    let window =
+        humantime::parse_duration(s).map_err(|error| format!("'{s}': {error}"))?;
+    if window.is_zero() {
         return Err(format!("'{s}': a window of zero length"));
     }
-    Ok(Duration::from_secs(n * secs))
+    if window.subsec_nanos() != 0 {
+        return Err(format!("'{s}': a window is whole seconds"));
+    }
+    Ok(window)
 }
 
 /// What a window counts.
@@ -257,38 +245,25 @@ pub async fn connect(spec: &LimitsStoreSpec) -> Result<Arc<dyn LimitStore>, Stor
 
 /// A URL with any password replaced, for logs and errors: the one in the
 /// user info, and a `password=` query parameter, which sqlx honours too.
-///
-/// Cut the way a URL parser cuts: the authority ends at the first `/`, `?`
-/// or `#` (a password holding one has to be percent-encoded to parse at
-/// all), and the user info is everything before its last `@`.
 pub fn redact(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Ok(mut parsed) = Url::parse(url) else {
         return url.to_string();
     };
-    let (authority, tail) =
-        rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
-    let authority = match authority.rsplit_once('@') {
-        Some((creds, host)) => {
-            let user = creds.split_once(':').map_or(creds, |(u, _)| u);
-            format!("{user}:***@{host}")
-        }
-        None => authority.to_string(),
-    };
-    let tail = match tail.split_once('?') {
-        Some((path, query)) => {
-            let query = query
-                .split('&')
-                .map(|pair| match pair.split_once('=') {
-                    Some(("password", _)) => "password=***",
-                    _ => pair,
-                })
-                .collect::<Vec<_>>()
-                .join("&");
-            format!("{path}?{query}")
-        }
-        None => tail.to_string(),
-    };
-    format!("{scheme}://{authority}{tail}")
+    if !parsed.username().is_empty() {
+        let _ = parsed.set_password(Some("***"));
+    }
+    if let Some(query) = parsed.query() {
+        let masked = query
+            .split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some(("password", _)) => "password=***",
+                _ => pair,
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        parsed.set_query(Some(&masked));
+    }
+    parsed.to_string()
 }
 
 /// The windows a store keys on: one per length, the tightest limit winning.
