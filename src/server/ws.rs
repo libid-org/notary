@@ -72,8 +72,8 @@ use super::{
 };
 use crate::{
     client_ip::{
-        self,
         ClientKey,
+        ClientSource,
     },
     error::{
         Error,
@@ -200,7 +200,7 @@ impl NotaryState {
         // fallback to the socket peer: behind a load balancer that peer is the
         // balancer, so falling back would quietly turn the per-client cap into a
         // cap on the whole service.
-        let client = match client_ip::resolve(headers, self.client_ip_header) {
+        let client = match self.client_ip_header.resolve(headers) {
             Ok(client) => client,
             Err(reason) => {
                 info!(%peer, %reason, "ProxyMode: upgrade refused, client unidentified");
