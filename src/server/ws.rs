@@ -15,7 +15,6 @@ use std::{
         },
         Arc,
     },
-    time::SystemTime,
 };
 
 use axum::{
@@ -64,10 +63,7 @@ use tracing::{
 };
 
 use super::{
-    attestation::{
-        attestation_frame,
-        sign_ceremony_attestation,
-    },
+    attestation::attestation_frame,
     NotaryState,
     Tier,
     PROXIED_BY,
@@ -104,7 +100,9 @@ pub(super) async fn notarize_proxy_ws_handler(
     headers: axum::http::HeaderMap,
     State(state): State<NotaryState>,
 ) -> Response {
-    admit_proxy_upgrade(Tier::Public, ws, peer, headers, state).await
+    state
+        .admit_proxy_upgrade(Tier::Public, ws, peer, headers)
+        .await
 }
 
 /// `/internal/notarize-proxy`: our own services, nothing counted per client.
@@ -138,128 +136,613 @@ pub(super) async fn internal_notarize_proxy_ws_handler(
         )
             .into_response();
     }
-    admit_proxy_upgrade(Tier::Internal, ws, peer, headers, state).await
+    state
+        .admit_proxy_upgrade(Tier::Internal, ws, peer, headers)
+        .await
 }
 
-/// The checks before a ProxyMode upgrade on `tier`, and the upgrade.
-async fn admit_proxy_upgrade(
-    tier: Tier,
-    ws: WebSocketUpgrade,
-    peer: SocketAddr,
-    headers: axum::http::HeaderMap,
-    state: NotaryState,
-) -> Response {
-    // In flight from here, before the draining check: admission is two
-    // store round trips, and an upgrade inside them when the drain starts
-    // must be waited for, not raced. Every refusal below drops the guard.
-    let in_flight = state.in_flight.enter();
+impl NotaryState {
+    /// The checks before a ProxyMode upgrade on `tier`, and the upgrade.
+    async fn admit_proxy_upgrade(
+        self,
+        tier: Tier,
+        ws: WebSocketUpgrade,
+        peer: SocketAddr,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        // In flight from here, before the draining check: admission is two
+        // store round trips, and an upgrade inside them when the drain starts
+        // must be waited for, not raced. Every refusal below drops the guard.
+        let in_flight = self.in_flight.enter();
 
-    // Nothing new once the process is stopping; the sessions already
-    // running finish, and the balancer has been told by the health check.
-    if state.draining.load(Ordering::SeqCst) {
-        info!(%peer, "ProxyMode: upgrade refused, notary is draining");
-        return (StatusCode::SERVICE_UNAVAILABLE, "notary is draining").into_response();
-    }
+        // Nothing new once the process is stopping; the sessions already
+        // running finish, and the balancer has been told by the health check.
+        if self.draining.load(Ordering::SeqCst) {
+            info!(%peer, "ProxyMode: upgrade refused, notary is draining");
+            return (StatusCode::SERVICE_UNAVAILABLE, "notary is draining")
+                .into_response();
+        }
 
-    // The route is the whole classification. The internal one asks nothing
-    // about the client and consults no store: our own services are the
-    // protocol, not users of it.
-    let client = match tier {
-        Tier::Internal => {
-            if state.internal_proxy_sessions.available_permits() == 0 {
-                info!(%peer, "ProxyMode (internal): all session slots busy; upgrade refused with 503");
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        // The route is the whole classification. The internal one asks nothing
+        // about the client and consults no store: our own services are the
+        // protocol, not users of it.
+        let client = match tier {
+            Tier::Internal => {
+                if self.internal_proxy_sessions.available_permits() == 0 {
+                    info!(%peer, "ProxyMode (internal): all session slots busy; upgrade refused with 503");
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                None
             }
-            None
-        }
-        Tier::Public => match admit_public_upgrade(peer, &headers, &state).await {
-            Ok(client) => Some(client),
-            Err(refusal) => return refusal,
-        },
-    };
+            Tier::Public => match self.admit_public_upgrade(peer, &headers).await {
+                Ok(client) => Some(client),
+                Err(refusal) => return refusal,
+            },
+        };
 
-    ws.on_upgrade(move |socket| async move {
-        let _in_flight = in_flight;
-        handle_ws_proxy_notarize(socket, peer, client, state).await;
-    })
-}
-
-/// The public route's checks before an upgrade, cheapest first, and the
-/// client the session counts against if it passes them all. A refusal is the
-/// response to send instead.
-async fn admit_public_upgrade(
-    peer: SocketAddr,
-    headers: &axum::http::HeaderMap,
-    state: &NotaryState,
-) -> std::result::Result<ClientKey, Response> {
-    // Who this session counts against. A refusal here is a refusal, never a
-    // fallback to the socket peer: behind a load balancer that peer is the
-    // balancer, so falling back would quietly turn the per-client cap into a
-    // cap on the whole service.
-    let client = match client_ip::resolve(headers, state.client_ip_header) {
-        Ok(client) => client,
-        Err(reason) => {
-            info!(%peer, %reason, "ProxyMode: upgrade refused, client unidentified");
-            return Err((StatusCode::BAD_REQUEST, reason.to_string()).into_response());
-        }
-    };
-
-    // Refuse rather than queue: a browser retries a refused upgrade cheaply,
-    // and nothing has been spent on this session yet.
-    //
-    // No slot is reserved here. The check is advisory -- it turns a saturated
-    // notary away at the cheapest point, before the upgrade -- and the slot
-    // itself is taken when the browser sends its first relayed bytes. A socket
-    // that upgrades and then stays silent would otherwise hold a slot for the
-    // whole connection deadline: a denial of service costing one 150-byte
-    // request per slot.
-    if state.proxy_sessions.available_permits() == 0 {
-        info!(%peer, "ProxyMode: all session slots busy; upgrade refused with 503");
-        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        ws.on_upgrade(move |socket| async move {
+            let _in_flight = in_flight;
+            self.handle_ws_proxy_notarize(socket, peer, client).await;
+        })
     }
 
-    // The windows, in the shared store. An upgrade is counted here, before
-    // anything is spent on it; the bytes window only has to have room, since
-    // the bytes are charged when the session ends. A store that cannot
-    // answer is a refusal: a limit that fails open under a store outage is a
-    // limit an attacker can switch off. An empty window is no limit, and
-    // asks the store nothing.
-    let store_down = |error: store::StoreError| {
-        warn!(%peer, %client, %error, "ProxyMode: upgrade refused, limits store unavailable");
-        (StatusCode::SERVICE_UNAVAILABLE, "limits store unavailable").into_response()
-    };
-    let too_many = |what: &str| {
-        info!(%peer, %client, "ProxyMode: upgrade refused with 429, {what} window full");
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(RETRY_AFTER, RETRY_AFTER_SECS)],
-            format!("too many {what} from this client; retry later"),
+    /// The public route's checks before an upgrade, cheapest first, and the
+    /// client the session counts against if it passes them all. A refusal is the
+    /// response to send instead.
+    async fn admit_public_upgrade(
+        &self,
+        peer: SocketAddr,
+        headers: &axum::http::HeaderMap,
+    ) -> std::result::Result<ClientKey, Response> {
+        // Who this session counts against. A refusal here is a refusal, never a
+        // fallback to the socket peer: behind a load balancer that peer is the
+        // balancer, so falling back would quietly turn the per-client cap into a
+        // cap on the whole service.
+        let client = match client_ip::resolve(headers, self.client_ip_header) {
+            Ok(client) => client,
+            Err(reason) => {
+                info!(%peer, %reason, "ProxyMode: upgrade refused, client unidentified");
+                return Err((StatusCode::BAD_REQUEST, reason.to_string()).into_response());
+            }
+        };
+
+        // Refuse rather than queue: a browser retries a refused upgrade cheaply,
+        // and nothing has been spent on this session yet.
+        //
+        // No slot is reserved here. The check is advisory -- it turns a saturated
+        // notary away at the cheapest point, before the upgrade -- and the slot
+        // itself is taken when the browser sends its first relayed bytes. A socket
+        // that upgrades and then stays silent would otherwise hold a slot for the
+        // whole connection deadline: a denial of service costing one 150-byte
+        // request per slot.
+        if self.proxy_sessions.available_permits() == 0 {
+            info!(%peer, "ProxyMode: all session slots busy; upgrade refused with 503");
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+
+        // The windows, in the shared store. An upgrade is counted here, before
+        // anything is spent on it; the bytes window only has to have room, since
+        // the bytes are charged when the session ends. A store that cannot
+        // answer is a refusal: a limit that fails open under a store outage is a
+        // limit an attacker can switch off. An empty window is no limit, and
+        // asks the store nothing.
+        let store_down = |error: store::StoreError| {
+            warn!(%peer, %client, %error, "ProxyMode: upgrade refused, limits store unavailable");
+            (StatusCode::SERVICE_UNAVAILABLE, "limits store unavailable").into_response()
+        };
+        let too_many = |what: &str| {
+            info!(%peer, %client, "ProxyMode: upgrade refused with 429, {what} window full");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(RETRY_AFTER, RETRY_AFTER_SECS)],
+                format!("too many {what} from this client; retry later"),
+            )
+                .into_response()
+        };
+        if !self.per_ip_upgrades.is_empty() {
+            match self
+                .limits
+                .count(&client, Dimension::Upgrades, 1, &self.per_ip_upgrades)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return Err(too_many("sessions started")),
+                Err(error) => return Err(store_down(error)),
+            }
+        }
+        if !self.per_ip_bytes.is_empty() {
+            match self
+                .limits
+                .would_fit(&client, Dimension::Bytes, 1, &self.per_ip_bytes)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return Err(too_many("bytes relayed")),
+                Err(error) => return Err(store_down(error)),
+            }
+        }
+        Ok(client)
+    }
+
+    /// One ProxyMode session on an upgraded socket. `client` is `Some` on the
+    /// public route, where the session holds a lease and its bytes are charged,
+    /// and `None` on the internal route, where nothing is counted per client.
+    async fn handle_ws_proxy_notarize(
+        &self,
+        socket: WebSocket,
+        peer: SocketAddr,
+        client: Option<ClientKey>,
+    ) {
+        let (mut ws_tx, mut ws_rx) = socket.split();
+
+        // The session starts here, not at the upgrade: a slot is worth spending
+        // once there is a session to spend it on.
+        let first = match tokio::time::timeout(
+            self.setup_deadline,
+            first_relayed_bytes(&mut ws_rx),
         )
-            .into_response()
-    };
-    if !state.per_ip_upgrades.is_empty() {
-        match state
-            .limits
-            .count(&client, Dimension::Upgrades, 1, &state.per_ip_upgrades)
-            .await
+        .await
         {
-            Ok(true) => {}
-            Ok(false) => return Err(too_many("sessions started")),
-            Err(error) => return Err(store_down(error)),
+            Ok(Some(first)) => first,
+            Ok(None) => {
+                info!(%peer, "ProxyMode: browser closed before starting a session");
+                return;
+            }
+            Err(_) => {
+                info!(
+                    %peer,
+                    "ProxyMode: no session data within the {}s setup deadline; closing",
+                    self.setup_deadline.as_secs()
+                );
+                let _ = ws_tx
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CLOSE_POLICY_VIOLATION,
+                        reason: "no session data within the setup deadline".into(),
+                    })))
+                    .await;
+                return;
+            }
+        };
+
+        // Every relayed byte counts against the session cap on both tiers -- it
+        // is what bounds a transcript, not a rate -- and on the public tier the
+        // total is charged to the client when the session ends.
+        let relayed = DataCap::new(self.proxy_max_bytes);
+
+        // This client's own lease first: one client at its cap must not spend a
+        // slot from the shared pool to find that out. Held for the session
+        // lifetime, like the pool permit below.
+        let (pool, accounting) = match client {
+            None => (&self.internal_proxy_sessions, None),
+            Some(client) => {
+                let lease = if self.max_sessions_per_ip == 0 {
+                    None
+                } else {
+                    match self
+                        .limits
+                        .try_lease(
+                            &client,
+                            self.max_sessions_per_ip,
+                            self.connection_deadline,
+                        )
+                        .await
+                    {
+                        Ok(Some(lease)) => Some(lease),
+                        Ok(None) => {
+                            info!(
+                                %peer, %client,
+                                "ProxyMode: client already running {} sessions; refused with 1013",
+                                self.max_sessions_per_ip
+                            );
+                            let _ = ws_tx
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: CLOSE_TRY_AGAIN_LATER,
+                                    reason: "too many sessions from this client; retry"
+                                        .into(),
+                                })))
+                                .await;
+                            return;
+                        }
+                        Err(error) => {
+                            warn!(%peer, %client, %error, "ProxyMode: session refused, limits store unavailable");
+                            let _ = ws_tx
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: CLOSE_TRY_AGAIN_LATER,
+                                    reason: "limits store unavailable".into(),
+                                })))
+                                .await;
+                            return;
+                        }
+                    }
+                };
+                let accounting = Accounting::new(self, client, lease, &relayed);
+                (&self.proxy_sessions, Some(accounting))
+            }
+        };
+
+        // Held for the session lifetime; dropping it returns the slot.
+        let Ok(_permit) = Arc::clone(pool).try_acquire_owned() else {
+            info!(%peer, "ProxyMode: all session slots busy; session refused with 1013");
+            let _ = ws_tx
+                .send(Message::Close(Some(CloseFrame {
+                    code: CLOSE_TRY_AGAIN_LATER,
+                    reason: "notary is at capacity; retry".into(),
+                })))
+                .await;
+            if let Some(accounting) = accounting {
+                accounting.settle().await;
+            }
+            return;
+        };
+
+        let (io_a, io_b) = tokio::io::duplex(1 << 17);
+        let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
+
+        // Keep inbound and outbound ownership separate. Whichever direction ends
+        // first must not cancel a write already accepted in the other direction.
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel::<SessionEnd>();
+        let _inbound_task = AbortOnDrop::new(tokio::spawn(async move {
+            // The frame that started the session, put back in front of the rest.
+            if pipe_writer.write_all(&first).await.is_ok() {
+                while let Some(Ok(msg)) = ws_rx.next().await {
+                    match msg {
+                        Message::Binary(data)
+                            if pipe_writer.write_all(&data).await.is_err() =>
+                        {
+                            break
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+            // The browser is gone, by close frame or by dropped socket. Tell the
+            // session so: it reads EOF, fails, and the connection's session slot
+            // comes back now. Dropping the write half alone would not do that --
+            // the read half in the outbound pump keeps the pipe open -- and the
+            // session would sit on its slot until the connection deadline.
+            let _ = pipe_writer.shutdown().await;
+        }));
+        let outbound_task = AbortOnDrop::new(tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match pipe_reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if ws_tx
+                            .send(Message::Binary(buf[..n].to_vec().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // This message boundary is the handoff: TLSNotary may read ahead
+            // within one WebSocket message, but it cannot consume this later one
+            // before its mux has finished.
+            match end_rx.await {
+                Ok(SessionEnd::Attested(frame)) => {
+                    let _ = ws_tx.send(Message::Binary(frame.into())).await;
+                    let _ = ws_tx.send(Message::Close(None)).await;
+                }
+                Ok(SessionEnd::Aborted(close)) => {
+                    let _ = ws_tx.send(Message::Close(Some(close))).await;
+                }
+                Err(_) => {
+                    let _ = ws_tx.send(Message::Close(None)).await;
+                }
+            }
+        }));
+
+        let protocol = async {
+            let result = match self.run_proxy_verifier_session(io_b, &relayed).await {
+                Ok(attestation) => attestation_frame(&attestation).and_then(|frame| {
+                    end_tx.send(SessionEnd::Attested(frame)).map_err(|_| {
+                        Error::NotaryServer {
+                            detail: "browser disconnected before attestation handoff"
+                                .into(),
+                        }
+                    })
+                }),
+                Err(Error::ProxyDataCapExceeded {
+                    authority,
+                    used,
+                    limit,
+                }) => {
+                    // The browser must learn it was the cap and not the network;
+                    // a bare drop would look like any other failure. Fits the
+                    // 123-byte reason budget with room to spare.
+                    let _ = end_tx.send(SessionEnd::Aborted(CloseFrame {
+                        code: CLOSE_POLICY_VIOLATION,
+                        reason: format!(
+                            "PROXY_DATA_CAP_EXCEEDED: relayed {used} bytes, cap {limit}"
+                        )
+                        .into(),
+                    }));
+                    Err(Error::ProxyDataCapExceeded {
+                        authority,
+                        used,
+                        limit,
+                    })
+                }
+                Err(error) => {
+                    drop(end_tx);
+                    Err(error)
+                }
+            };
+            if let Err(error) = outbound_task.into_inner().await {
+                error!("ProxyMode WebSocket outbound pump join error: {error}");
+            }
+            result
+        };
+
+        match tokio::time::timeout(self.connection_deadline, protocol).await {
+            Ok(Ok(())) => {}
+            Ok(Err(Error::ProxyDataCapExceeded {
+                authority,
+                used,
+                limit,
+            })) => error!(
+                %peer,
+                authority,
+                used,
+                limit,
+                "ProxyMode session aborted: data cap exceeded; nothing attested"
+            ),
+            Ok(Err(e)) => error!(%peer, "ProxyMode verifier error: {}", e),
+            Err(_) => error!(
+                %peer,
+                "ProxyMode session exceeded the {}s connection deadline; aborting",
+                self.connection_deadline.as_secs()
+            ),
+        }
+
+        if let Some(accounting) = accounting {
+            accounting.settle().await;
         }
     }
-    if !state.per_ip_bytes.is_empty() {
-        match state
-            .limits
-            .would_fit(&client, Dimension::Bytes, 1, &state.per_ip_bytes)
+
+    /// The verifier's half of one ProxyMode session on `socket`; every byte
+    /// relayed to the server counts against `relayed`.
+    async fn run_proxy_verifier_session<T>(
+        &self,
+        socket: T,
+        relayed: &Arc<DataCap>,
+    ) -> Result<AttestationWire>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let session = Session::new(socket.compat());
+        let (driver, mut handle) = session.split();
+        // Guarded spawn: every exit path below — each `?`, panics, the caller
+        // dropping this future — aborts the driver instead of detaching it.
+        let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
+
+        // Set once the relay has run. Before that, the driver finishing means the
+        // browser went away under the session; after, it means the peer closed
+        // the mux, which is how a session ends.
+        let established = AtomicBool::new(false);
+        let established = &established;
+
+        // An inner error means a rejection was sent and the driver must be joined
+        // before returning; an outer error can abort the guarded driver.
+        let setup = async {
+            let verifier = handle
+                .new_verifier(
+                    VerifierConfig::builder()
+                        .root_store(self.proxy_root_store.as_ref().clone())
+                        .build()
+                        .map_err(|e| Error::NotaryServer {
+                            detail: format!("verifier config: {e}"),
+                        })?,
+                )
+                .map_err(|e| Error::NotaryServer {
+                    detail: format!("new verifier: {e}"),
+                })?;
+
+            let verifier = verifier.commit().await.map_err(|e| Error::NotaryServer {
+                detail: format!("verifier commit: {e}"),
+            })?;
+
+            let proxy_verifier = match verifier {
+                VerifierCommitStart::Proxy(v) => v,
+                _ => {
+                    return Err(Error::NotaryServer {
+                        detail: "expected ProxyTls protocol, got other".into(),
+                    });
+                }
+            };
+
+            let server_name_str =
+                proxy_verifier.config().server_name().as_str().to_string();
+            info!("ProxyMode: connecting to {server_name_str}:443");
+
+            let server_addr = self
+                .proxy_server_addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| format!("{server_name_str}:443"));
+            let server_tcp = match tokio::net::TcpStream::connect(server_addr).await {
+                Ok(server_tcp) => server_tcp,
+                Err(error) => {
+                    let detail = format!("TCP connect to {server_name_str}: {error}");
+                    proxy_verifier
+                        .reject(Some("UPSTREAM_CONNECT_FAILED"))
+                        .await
+                        .map_err(|error| Error::NotaryServer {
+                            detail: format!("send connection rejection: {error}"),
+                        })?;
+                    handle.close();
+                    return Ok(Err(Error::NotaryServer { detail }));
+                }
+            };
+
+            // The relay is the only unbounded thing in ProxyMode: tlsn buffers
+            // every relayed byte for the tag check that follows, so the cap on the
+            // server stream is the cap on this session's memory. Crossing it fails
+            // the relay mid-stream; the transcript is never shortened, because a
+            // shortened one would attest as complete.
+            let cap = Arc::clone(relayed);
+            let verifier = proxy_verifier
+                .accept()
+                .await
+                .map_err(|e| Error::NotaryServer {
+                    detail: format!("verifier accept: {e}"),
+                })?
+                .run(CappedIo::new(server_tcp, Arc::clone(&cap)).compat())
+                .await
+                .map_err(|e| {
+                    if cap.exceeded() {
+                        Error::ProxyDataCapExceeded {
+                            authority: server_name_str.clone(),
+                            used: cap.used(),
+                            limit: cap.limit(),
+                        }
+                    } else {
+                        Error::NotaryServer {
+                            detail: format!("run_proxy: {e}"),
+                        }
+                    }
+                })?;
+            established.store(true, Ordering::Release);
+
+            let verifier = verifier.verify().await.map_err(|e| Error::NotaryServer {
+                detail: format!("verifier verify: {e}"),
+            })?;
+
+            if !verifier.request().server_identity() {
+                verifier
+                    .reject(Some("server identity is required"))
+                    .await
+                    .ok();
+                return Err(Error::NotaryServer {
+                    detail: "prover did not request server identity reveal".into(),
+                });
+            }
+
+            let (
+                VerifierOutput {
+                    server_name,
+                    transcript,
+                    transcript_commitments,
+                },
+                verifier,
+            ) = verifier.accept().await.map_err(|e| Error::NotaryServer {
+                detail: format!("verifier output accept: {e}"),
+            })?;
+
+            verifier.close().await.map_err(|e| Error::NotaryServer {
+                detail: format!("verifier close: {e}"),
+            })?;
+            handle.close();
+
+            Ok::<_, Error>(Ok((server_name, transcript, transcript_commitments)))
+        };
+        tokio::pin!(setup);
+
+        // Race setup against the driver. The driver only finishes early when the
+        // transport died under the session -- a browser that connected and went
+        // away -- and a protocol request already submitted to it may then never
+        // resolve, so fail instead of pending forever on a taken slot.
+        let mut finished_driver = None;
+        let setup_outcome = tokio::select! {
+            biased;
+            res = &mut setup => res?,
+            driver_res = driver_task.handle_mut() => {
+                if !established.load(Ordering::Acquire) {
+                    return Err(driver_finished_early(driver_res));
+                }
+                // The peer closed the mux as its last act while this side was
+                // still finishing. Let setup complete and keep the driver's
+                // result: a finished handle cannot be polled a second time.
+                finished_driver = Some(driver_res);
+                (&mut setup).await?
+            }
+        };
+        let join_driver = |driver_task: AbortOnDrop<_>| async move {
+            match finished_driver {
+                Some(res) => res,
+                None => driver_task.into_inner().await,
+            }
+        };
+        let (server_name, transcript, transcript_commitments) = match setup_outcome {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = join_driver(driver_task).await;
+                return Err(error);
+            }
+        };
+
+        let io = join_driver(driver_task)
             .await
-        {
-            Ok(true) => {}
-            Ok(false) => return Err(too_many("bytes relayed")),
-            Err(error) => return Err(store_down(error)),
+            .map_err(|e| Error::NotaryServer {
+                detail: format!("driver join: {e}"),
+            })?
+            .map_err(|e| Error::NotaryServer {
+                detail: format!("driver: {e}"),
+            })?
+            .into_inner();
+        drop(io);
+
+        // What the prover chose to reveal is not read here and not judged here.
+        // Which ranges a profile expects belongs to the Platform Verifier
+        // (REQ-COMMON-51), and this used to name them -- one endpoint's shape
+        // written into the notary, which is the profile-specific decision
+        // REQ-COMMON-33 forbids it from making.
+        let server_name = server_name.ok_or_else(|| Error::NotaryServer {
+            detail: "prover did not reveal server name".into(),
+        })?;
+        let ServerName::Dns(ref dns_name) = server_name;
+        let domain = dns_name.as_str().to_string();
+
+        // Which host answered is attested, not restricted. The record carries the
+        // cert-verified server name as `authorityId`, and each Platform Verifier
+        // compares that against the authority its own profile pins -- so an
+        // attestation naming an attacker's server is refused on chain, by the
+        // contract that knows which host the session was supposed to reach.
+        //
+        // Pinning one hostname here would add nothing to that and would cost
+        // something real: GitHub alone needs two authorities (`github.com` for the
+        // exchange, `api.github.com` for the identity session), so a single
+        // platform identity cannot serve even one platform, let alone a notary
+        // shared by X and GitHub. Limiting who may use a public notary is access
+        // control, and belongs where access control lives.
+
+        let partial_transcript = transcript;
+        if let Some(ref pt) = partial_transcript {
+            info!(
+                "ProxyMode verified: {} sent, {} recv bytes for {domain}",
+                pt.sent_unsafe().len(),
+                pt.received_unsafe().len()
+            );
+        } else {
+            info!(
+                "ProxyMode verified: no transcript revealed for {domain} (commits only)"
+            );
         }
+
+        // ── Extract the single hash commit per session ──
+        //
+        // Keep the session's own output rather than flattening it. Which ranges a
+        // profile expects, and what their bytes must contain, is the Platform
+        // Verifier's business (REQ-COMMON-51); the notary answers only for what it
+        // observed. The range-count rules that used to live here encoded one
+        // endpoint's shape into the notary, which is exactly the profile-specific
+        // decision REQ-COMMON-33 forbids it from making.
+        let Some(partial) = partial_transcript else {
+            return Err(Error::NotaryServer {
+                detail: "session revealed no transcript".into(),
+            });
+        };
+
+        let attestation = self
+            .attest(&partial, dns_name.as_str(), &transcript_commitments)
+            .await?;
+        info!("ProxyMode: ceremony attestation ready for {domain}");
+        Ok(attestation)
     }
-    Ok(client)
 }
 
 /// How a ProxyMode WebSocket ends once the session is over: with the
@@ -309,561 +792,81 @@ async fn first_relayed_bytes(
 /// Neither can fail the session: a store that will not take the charge is
 /// logged and the session has already ended.
 struct Accounting {
+    bill: Option<Bill>,
+}
+
+/// The client a public session ran as, the lease it held, and the bytes it
+/// relayed, with the store and the windows they are charged to.
+struct Bill {
     store: Arc<dyn LimitStore>,
     client: ClientKey,
     lease: Option<LeaseId>,
     relayed: Arc<DataCap>,
     windows: WindowLimits,
-    settled: bool,
 }
 
 impl Accounting {
+    /// `client`'s session on `state`, holding `lease`, with its relayed
+    /// bytes counted in `relayed`.
+    fn new(
+        state: &NotaryState,
+        client: ClientKey,
+        lease: Option<LeaseId>,
+        relayed: &Arc<DataCap>,
+    ) -> Self {
+        Self {
+            bill: Some(Bill {
+                store: Arc::clone(&state.limits),
+                client,
+                lease,
+                relayed: Arc::clone(relayed),
+                windows: state.per_ip_bytes.clone(),
+            }),
+        }
+    }
+
     async fn settle(mut self) {
-        self.settled = true;
-        settle(
-            &*self.store,
-            self.client,
-            self.lease.take(),
-            self.relayed.used(),
-            &self.windows,
-        )
-        .await;
+        if let Some(bill) = self.bill.take() {
+            bill.settle().await;
+        }
     }
 }
 
 impl Drop for Accounting {
     fn drop(&mut self) {
-        if self.settled {
+        let Some(bill) = self.bill.take() else {
             return;
-        }
-        let store = Arc::clone(&self.store);
-        let client = self.client;
-        let lease = self.lease.take();
-        let used = self.relayed.used();
-        let windows = std::mem::take(&mut self.windows);
+        };
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(async move {
-                    settle(&*store, client, lease, used, &windows).await;
-                });
+                runtime.spawn(bill.settle());
             }
             // The runtime itself is going away; the lease expires by itself.
             Err(_) => {
-                warn!(%client, "ProxyMode: no runtime to settle a session's accounting")
+                warn!(client = %bill.client, "ProxyMode: no runtime to settle a session's accounting")
             }
         }
     }
 }
 
-async fn settle(
-    store: &dyn LimitStore,
-    client: ClientKey,
-    lease: Option<LeaseId>,
-    used: usize,
-    windows: &WindowLimits,
-) {
-    if used > 0 {
-        if let Err(error) = store
-            .charge(&client, Dimension::Bytes, used as u64, windows)
-            .await
-        {
-            warn!(%client, used, %error, "ProxyMode: relayed bytes not charged");
-        }
-    }
-    if let Some(lease) = lease {
-        if let Err(error) = store.release(&lease).await {
-            warn!(%client, %error, "ProxyMode: session lease not released; it expires by itself");
-        }
-    }
-}
-
-/// One ProxyMode session on an upgraded socket. `client` is `Some` on the
-/// public route, where the session holds a lease and its bytes are charged,
-/// and `None` on the internal route, where nothing is counted per client.
-async fn handle_ws_proxy_notarize(
-    socket: WebSocket,
-    peer: SocketAddr,
-    client: Option<ClientKey>,
-    state: NotaryState,
-) {
-    let (mut ws_tx, mut ws_rx) = socket.split();
-
-    // The session starts here, not at the upgrade: a slot is worth spending
-    // once there is a session to spend it on.
-    let first =
-        match tokio::time::timeout(state.setup_deadline, first_relayed_bytes(&mut ws_rx))
-            .await
-        {
-            Ok(Some(first)) => first,
-            Ok(None) => {
-                info!(%peer, "ProxyMode: browser closed before starting a session");
-                return;
-            }
-            Err(_) => {
-                info!(
-                    %peer,
-                    "ProxyMode: no session data within the {}s setup deadline; closing",
-                    state.setup_deadline.as_secs()
-                );
-                let _ = ws_tx
-                    .send(Message::Close(Some(CloseFrame {
-                        code: CLOSE_POLICY_VIOLATION,
-                        reason: "no session data within the setup deadline".into(),
-                    })))
-                    .await;
-                return;
-            }
-        };
-
-    // Every relayed byte counts against the session cap on both tiers -- it
-    // is what bounds a transcript, not a rate -- and on the public tier the
-    // total is charged to the client when the session ends.
-    let relayed = DataCap::new(state.proxy_max_bytes);
-
-    // This client's own lease first: one client at its cap must not spend a
-    // slot from the shared pool to find that out. Held for the session
-    // lifetime, like the pool permit below.
-    let (pool, accounting) = match client {
-        None => (&state.internal_proxy_sessions, None),
-        Some(client) => {
-            let lease = if state.max_sessions_per_ip == 0 {
-                None
-            } else {
-                match state
-                    .limits
-                    .try_lease(
-                        &client,
-                        state.max_sessions_per_ip,
-                        state.connection_deadline,
-                    )
-                    .await
-                {
-                    Ok(Some(lease)) => Some(lease),
-                    Ok(None) => {
-                        info!(
-                            %peer, %client,
-                            "ProxyMode: client already running {} sessions; refused with 1013",
-                            state.max_sessions_per_ip
-                        );
-                        let _ = ws_tx
-                            .send(Message::Close(Some(CloseFrame {
-                                code: CLOSE_TRY_AGAIN_LATER,
-                                reason: "too many sessions from this client; retry"
-                                    .into(),
-                            })))
-                            .await;
-                        return;
-                    }
-                    Err(error) => {
-                        warn!(%peer, %client, %error, "ProxyMode: session refused, limits store unavailable");
-                        let _ = ws_tx
-                            .send(Message::Close(Some(CloseFrame {
-                                code: CLOSE_TRY_AGAIN_LATER,
-                                reason: "limits store unavailable".into(),
-                            })))
-                            .await;
-                        return;
-                    }
-                }
-            };
-            let accounting = Accounting {
-                store: Arc::clone(&state.limits),
-                client,
-                lease,
-                relayed: Arc::clone(&relayed),
-                windows: state.per_ip_bytes.clone(),
-                settled: false,
-            };
-            (&state.proxy_sessions, Some(accounting))
-        }
-    };
-
-    // Held for the session lifetime; dropping it returns the slot.
-    let Ok(_permit) = Arc::clone(pool).try_acquire_owned() else {
-        info!(%peer, "ProxyMode: all session slots busy; session refused with 1013");
-        let _ = ws_tx
-            .send(Message::Close(Some(CloseFrame {
-                code: CLOSE_TRY_AGAIN_LATER,
-                reason: "notary is at capacity; retry".into(),
-            })))
-            .await;
-        if let Some(accounting) = accounting {
-            accounting.settle().await;
-        }
-        return;
-    };
-
-    let (io_a, io_b) = tokio::io::duplex(1 << 17);
-    let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
-
-    // Keep inbound and outbound ownership separate. Whichever direction ends
-    // first must not cancel a write already accepted in the other direction.
-    let (end_tx, end_rx) = tokio::sync::oneshot::channel::<SessionEnd>();
-    let _inbound_task = AbortOnDrop::new(tokio::spawn(async move {
-        // The frame that started the session, put back in front of the rest.
-        if pipe_writer.write_all(&first).await.is_ok() {
-            while let Some(Ok(msg)) = ws_rx.next().await {
-                match msg {
-                    Message::Binary(data)
-                        if pipe_writer.write_all(&data).await.is_err() =>
-                    {
-                        break
-                    }
-                    Message::Close(_) => break,
-                    _ => {}
-                }
-            }
-        }
-        // The browser is gone, by close frame or by dropped socket. Tell the
-        // session so: it reads EOF, fails, and the connection's session slot
-        // comes back now. Dropping the write half alone would not do that --
-        // the read half in the outbound pump keeps the pipe open -- and the
-        // session would sit on its slot until the connection deadline.
-        let _ = pipe_writer.shutdown().await;
-    }));
-    let outbound_task = AbortOnDrop::new(tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        loop {
-            match pipe_reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if ws_tx
-                        .send(Message::Binary(buf[..n].to_vec().into()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-        }
-
-        // This message boundary is the handoff: TLSNotary may read ahead
-        // within one WebSocket message, but it cannot consume this later one
-        // before its mux has finished.
-        match end_rx.await {
-            Ok(SessionEnd::Attested(frame)) => {
-                let _ = ws_tx.send(Message::Binary(frame.into())).await;
-                let _ = ws_tx.send(Message::Close(None)).await;
-            }
-            Ok(SessionEnd::Aborted(close)) => {
-                let _ = ws_tx.send(Message::Close(Some(close))).await;
-            }
-            Err(_) => {
-                let _ = ws_tx.send(Message::Close(None)).await;
-            }
-        }
-    }));
-
-    let protocol = async {
-        let result = match run_proxy_verifier_session(io_b, &state, &relayed).await {
-            Ok(attestation) => attestation_frame(&attestation).and_then(|frame| {
-                end_tx.send(SessionEnd::Attested(frame)).map_err(|_| {
-                    Error::NotaryServer {
-                        detail: "browser disconnected before attestation handoff".into(),
-                    }
-                })
-            }),
-            Err(Error::ProxyDataCapExceeded {
-                authority,
-                used,
-                limit,
-            }) => {
-                // The browser must learn it was the cap and not the network;
-                // a bare drop would look like any other failure. Fits the
-                // 123-byte reason budget with room to spare.
-                let _ = end_tx.send(SessionEnd::Aborted(CloseFrame {
-                    code: CLOSE_POLICY_VIOLATION,
-                    reason: format!(
-                        "PROXY_DATA_CAP_EXCEEDED: relayed {used} bytes, cap {limit}"
-                    )
-                    .into(),
-                }));
-                Err(Error::ProxyDataCapExceeded {
-                    authority,
-                    used,
-                    limit,
-                })
-            }
-            Err(error) => {
-                drop(end_tx);
-                Err(error)
-            }
-        };
-        if let Err(error) = outbound_task.into_inner().await {
-            error!("ProxyMode WebSocket outbound pump join error: {error}");
-        }
-        result
-    };
-
-    match tokio::time::timeout(state.connection_deadline, protocol).await {
-        Ok(Ok(())) => {}
-        Ok(Err(Error::ProxyDataCapExceeded {
-            authority,
-            used,
-            limit,
-        })) => error!(
-            %peer,
-            authority,
-            used,
-            limit,
-            "ProxyMode session aborted: data cap exceeded; nothing attested"
-        ),
-        Ok(Err(e)) => error!(%peer, "ProxyMode verifier error: {}", e),
-        Err(_) => error!(
-            %peer,
-            "ProxyMode session exceeded the {}s connection deadline; aborting",
-            state.connection_deadline.as_secs()
-        ),
-    }
-
-    if let Some(accounting) = accounting {
-        accounting.settle().await;
-    }
-}
-
-/// The verifier's half of one ProxyMode session on `socket`; every byte
-/// relayed to the server counts against `relayed`.
-async fn run_proxy_verifier_session<T>(
-    socket: T,
-    state: &NotaryState,
-    relayed: &Arc<DataCap>,
-) -> Result<AttestationWire>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-{
-    let session = Session::new(socket.compat());
-    let (driver, mut handle) = session.split();
-    // Guarded spawn: every exit path below — each `?`, panics, the caller
-    // dropping this future — aborts the driver instead of detaching it.
-    let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
-
-    // Set once the relay has run. Before that, the driver finishing means the
-    // browser went away under the session; after, it means the peer closed
-    // the mux, which is how a session ends.
-    let established = AtomicBool::new(false);
-    let established = &established;
-
-    // An inner error means a rejection was sent and the driver must be joined
-    // before returning; an outer error can abort the guarded driver.
-    let setup = async {
-        let verifier = handle
-            .new_verifier(
-                VerifierConfig::builder()
-                    .root_store(state.proxy_root_store.as_ref().clone())
-                    .build()
-                    .map_err(|e| Error::NotaryServer {
-                        detail: format!("verifier config: {e}"),
-                    })?,
-            )
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("new verifier: {e}"),
-            })?;
-
-        let verifier = verifier.commit().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier commit: {e}"),
-        })?;
-
-        let proxy_verifier = match verifier {
-            VerifierCommitStart::Proxy(v) => v,
-            _ => {
-                return Err(Error::NotaryServer {
-                    detail: "expected ProxyTls protocol, got other".into(),
-                });
-            }
-        };
-
-        let server_name_str = proxy_verifier.config().server_name().as_str().to_string();
-        info!("ProxyMode: connecting to {server_name_str}:443");
-
-        let server_addr = state
-            .proxy_server_addr
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| format!("{server_name_str}:443"));
-        let server_tcp = match tokio::net::TcpStream::connect(server_addr).await {
-            Ok(server_tcp) => server_tcp,
-            Err(error) => {
-                let detail = format!("TCP connect to {server_name_str}: {error}");
-                proxy_verifier
-                    .reject(Some("UPSTREAM_CONNECT_FAILED"))
-                    .await
-                    .map_err(|error| Error::NotaryServer {
-                        detail: format!("send connection rejection: {error}"),
-                    })?;
-                handle.close();
-                return Ok(Err(Error::NotaryServer { detail }));
-            }
-        };
-
-        // The relay is the only unbounded thing in ProxyMode: tlsn buffers
-        // every relayed byte for the tag check that follows, so the cap on the
-        // server stream is the cap on this session's memory. Crossing it fails
-        // the relay mid-stream; the transcript is never shortened, because a
-        // shortened one would attest as complete.
-        let cap = Arc::clone(relayed);
-        let verifier = proxy_verifier
-            .accept()
-            .await
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("verifier accept: {e}"),
-            })?
-            .run(CappedIo::new(server_tcp, Arc::clone(&cap)).compat())
-            .await
-            .map_err(|e| {
-                if cap.exceeded() {
-                    Error::ProxyDataCapExceeded {
-                        authority: server_name_str.clone(),
-                        used: cap.used(),
-                        limit: cap.limit(),
-                    }
-                } else {
-                    Error::NotaryServer {
-                        detail: format!("run_proxy: {e}"),
-                    }
-                }
-            })?;
-        established.store(true, Ordering::Release);
-
-        let verifier = verifier.verify().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier verify: {e}"),
-        })?;
-
-        if !verifier.request().server_identity() {
-            verifier
-                .reject(Some("server identity is required"))
+impl Bill {
+    async fn settle(self) {
+        let used = self.relayed.used();
+        if used > 0 {
+            if let Err(error) = self
+                .store
+                .charge(&self.client, Dimension::Bytes, used as u64, &self.windows)
                 .await
-                .ok();
-            return Err(Error::NotaryServer {
-                detail: "prover did not request server identity reveal".into(),
-            });
-        }
-
-        let (
-            VerifierOutput {
-                server_name,
-                transcript,
-                transcript_commitments,
-            },
-            verifier,
-        ) = verifier.accept().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier output accept: {e}"),
-        })?;
-
-        verifier.close().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier close: {e}"),
-        })?;
-        handle.close();
-
-        Ok::<_, Error>(Ok((server_name, transcript, transcript_commitments)))
-    };
-    tokio::pin!(setup);
-
-    // Race setup against the driver. The driver only finishes early when the
-    // transport died under the session -- a browser that connected and went
-    // away -- and a protocol request already submitted to it may then never
-    // resolve, so fail instead of pending forever on a taken slot.
-    let mut finished_driver = None;
-    let setup_outcome = tokio::select! {
-        biased;
-        res = &mut setup => res?,
-        driver_res = driver_task.handle_mut() => {
-            if !established.load(Ordering::Acquire) {
-                return Err(driver_finished_early(driver_res));
+            {
+                warn!(client = %self.client, used, %error, "ProxyMode: relayed bytes not charged");
             }
-            // The peer closed the mux as its last act while this side was
-            // still finishing. Let setup complete and keep the driver's
-            // result: a finished handle cannot be polled a second time.
-            finished_driver = Some(driver_res);
-            (&mut setup).await?
         }
-    };
-    let join_driver = |driver_task: AbortOnDrop<_>| async move {
-        match finished_driver {
-            Some(res) => res,
-            None => driver_task.into_inner().await,
+        if let Some(lease) = self.lease {
+            if let Err(error) = self.store.release(&lease).await {
+                warn!(client = %self.client, %error, "ProxyMode: session lease not released; it expires by itself");
+            }
         }
-    };
-    let (server_name, transcript, transcript_commitments) = match setup_outcome {
-        Ok(output) => output,
-        Err(error) => {
-            let _ = join_driver(driver_task).await;
-            return Err(error);
-        }
-    };
-
-    let io = join_driver(driver_task)
-        .await
-        .map_err(|e| Error::NotaryServer {
-            detail: format!("driver join: {e}"),
-        })?
-        .map_err(|e| Error::NotaryServer {
-            detail: format!("driver: {e}"),
-        })?
-        .into_inner();
-    drop(io);
-
-    // What the prover chose to reveal is not read here and not judged here.
-    // Which ranges a profile expects belongs to the Platform Verifier
-    // (REQ-COMMON-51), and this used to name them -- one endpoint's shape
-    // written into the notary, which is the profile-specific decision
-    // REQ-COMMON-33 forbids it from making.
-    let server_name = server_name.ok_or_else(|| Error::NotaryServer {
-        detail: "prover did not reveal server name".into(),
-    })?;
-    let ServerName::Dns(ref dns_name) = server_name;
-    let domain = dns_name.as_str().to_string();
-
-    // Which host answered is attested, not restricted. The record carries the
-    // cert-verified server name as `authorityId`, and each Platform Verifier
-    // compares that against the authority its own profile pins -- so an
-    // attestation naming an attacker's server is refused on chain, by the
-    // contract that knows which host the session was supposed to reach.
-    //
-    // Pinning one hostname here would add nothing to that and would cost
-    // something real: GitHub alone needs two authorities (`github.com` for the
-    // exchange, `api.github.com` for the identity session), so a single
-    // platform identity cannot serve even one platform, let alone a notary
-    // shared by X and GitHub. Limiting who may use a public notary is access
-    // control, and belongs where access control lives.
-
-    let partial_transcript = transcript;
-    if let Some(ref pt) = partial_transcript {
-        info!(
-            "ProxyMode verified: {} sent, {} recv bytes for {domain}",
-            pt.sent_unsafe().len(),
-            pt.received_unsafe().len()
-        );
-    } else {
-        info!("ProxyMode verified: no transcript revealed for {domain} (commits only)");
     }
-
-    // ── Extract the single hash commit per session ──
-    //
-    // Keep the session's own output rather than flattening it. Which ranges a
-    // profile expects, and what their bytes must contain, is the Platform
-    // Verifier's business (REQ-COMMON-51); the notary answers only for what it
-    // observed. The range-count rules that used to live here encoded one
-    // endpoint's shape into the notary, which is exactly the profile-specific
-    // decision REQ-COMMON-33 forbids it from making.
-    let Some(partial) = partial_transcript else {
-        return Err(Error::NotaryServer {
-            detail: "session revealed no transcript".into(),
-        });
-    };
-
-    let attestation = sign_ceremony_attestation(
-        &state.signer,
-        &partial,
-        dns_name.as_str(),
-        &transcript_commitments,
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    )
-    .await?;
-    info!("ProxyMode: ceremony attestation ready for {domain}");
-    Ok(attestation)
 }
 
 /// Owns a spawned task and aborts it on drop unless the handle was taken back
