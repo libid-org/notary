@@ -1,9 +1,11 @@
 name: Release
 
-# Publishing a GitHub Release tagged `v<version>` produces the two release
-# artifacts:
+# Publishing a GitHub Release tagged `v<version>` or `v<version>-rc.N` produces
+# the two release artifacts:
 #
-#   * a Docker image pushed to ghcr.io/libid-org/notary:<version> and :latest;
+#   * a Docker image pushed to ghcr.io/libid-org/notary:<version> (`:latest`
+#     only for a final release), as one manifest list covering linux/amd64 and
+#     linux/arm64;
 #   * a tlsn_wasm browser bundle (built from the exact tlsn rev Cargo.lock
 #     pins) uploaded to the release as tlsn-wasm-<version>.tar.gz.
 #
@@ -23,8 +25,9 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/notary
 
 jobs:
-  # The tag names the version the manifest already carries — the tag is a
-  # pointer, never a source. Everything that publishes needs this first.
+  # The tag names the version the manifest already carries, optionally with an
+  # RC suffix — the tag is a pointer, never a source. Everything that publishes
+  # needs this first.
   verify-tag:
     name: Release tag matches version
     runs-on: ubuntu-latest
@@ -32,14 +35,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Tag equals Cargo.toml version
+      - name: Tag matches Cargo.toml version
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
-          if [ "$TAG" != "v$version" ]; then
-            echo "::error::release tag '$TAG' does not match Cargo.toml version 'v$version'"
+          version_regex="${version//./\\.}"
+          if [[ "$TAG" != "v$version" && ! "$TAG" =~ ^v${version_regex}-rc\.[1-9][0-9]*$ ]]; then
+            echo "::error::release tag '$TAG' does not match 'v$version' or 'v$version-rc.N'"
             exit 1
           fi
           echo "Tag $TAG matches Cargo.toml."
@@ -71,11 +75,29 @@ jobs:
       - name: Tests
         run: cargo test --all
 
+  # Each platform compiles on a runner of its own architecture and pushes an
+  # untagged image addressed only by digest; `docker-manifest` then joins the
+  # digests under the release tags. QEMU is deliberately not used: emulating a
+  # tlsn/mpz build costs hours, while `ubuntu-24.04-arm` is native and free for
+  # this public repo. Those per-platform images stay in the ghcr package as
+  # UNTAGGED versions; the manifest list is the only thing pointing at them, so
+  # a "delete untagged versions" retention policy would break every tag.
   docker:
-    name: Docker image → ghcr.io
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    name: Docker image ${{ matrix.platform }} → ghcr.io
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     needs: [verify-tag, checks]
+    strategy:
+      # One architecture failing should not hide whether the other one builds.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
@@ -88,15 +110,74 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push by digest
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          # The default `docker` driver cannot push by digest; a container
+          # builder can, and still compiles natively on this runner.
+          docker buildx create --name notary --driver docker-container --use
+          # oci-mediatypes=false keeps the classic Docker manifest list this
+          # repo has always published: `docker manifest inspect` before Docker
+          # 23 cannot read an OCI index, and nothing here needs one.
+          # No provenance/SBOM attestations: they would ride along as extra
+          # manifests with platform unknown/unknown, and a release tag's
+          # contract is exactly two platform entries.
+          docker buildx build \
+            --platform "$PLATFORM" \
+            --provenance=false \
+            --sbom=false \
+            --metadata-file metadata.json \
+            --output "type=image,name=$IMAGE,oci-mediatypes=false,push-by-digest=true,name-canonical=true,push=true" \
+            .
+          mkdir -p digests
+          jq -er '."containerimage.digest"' metadata.json > "digests/$ARCH"
+          echo "$PLATFORM $(cat "digests/$ARCH")"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-manifest:
+    name: Docker manifest list → ghcr.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [docker]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Join the per-platform digests under the release tags
         env:
           TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
-          docker build -t "$IMAGE:$version" -t "$IMAGE:latest" .
-          docker push "$IMAGE:$version"
-          docker push "$IMAGE:latest"
+          sources=()
+          for f in digests/*; do sources+=("$IMAGE@$(cat "$f")"); done
+          docker buildx imagetools create -t "$IMAGE:$version" "${sources[@]}"
+          if [ "$PRERELEASE" = "false" ]; then
+            docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$version"
+          fi
+          docker buildx imagetools inspect "$IMAGE:$version"
 
   tlsn-wasm:
     name: tlsn_wasm bundle → release asset
@@ -119,7 +200,7 @@ jobs:
           set -euo pipefail
           version="${TAG#v}"
           tar -czf "tlsn-wasm-$version.tar.gz" -C tlsn-wasm \
-            tlsn_wasm.js tlsn_wasm_bg.wasm spawn.js
+            tlsn_wasm.js tlsn_wasm_bg.wasm snippets
           sha256sum "tlsn-wasm-$version.tar.gz"
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2

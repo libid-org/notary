@@ -1,5 +1,5 @@
 //! Boot the whole server on ephemeral ports with a local hex key and drive
-//! the HTTP API the way tlsn-js / the browser wallet does.
+//! the HTTP API the way the browser prover does.
 
 use clap::Parser;
 use notary::{
@@ -35,15 +35,11 @@ fn test_config(ws_port: u16) -> NotaryServerConfig {
         &ws_port.to_string(),
         "--signing-key",
         TEST_KEY,
-        "--x-zk-verifier-address",
-        "0x1111111111111111111111111111111111111111",
-        "--verifying-contract",
-        "0x2222222222222222222222222222222222222222",
     ])
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn info_session_and_longpoll_endpoints_work() {
+async fn info_works() {
     let ws_port = free_port().await;
     let handle = server::run(test_config(ws_port))
         .await
@@ -63,34 +59,6 @@ async fn info_session_and_longpoll_endpoints_work() {
         .expect("info json");
     assert_eq!(info["publicKey"], TEST_PUBKEY);
     assert_eq!(info["version"], format!("v{}", env!("CARGO_PKG_VERSION")));
-
-    // POST /session creates a session and returns its id.
-    let resp = client
-        .post(format!("{base}/session"))
-        .json(&serde_json::json!({"clientType": "websocket"}))
-        .send()
-        .await
-        .expect("POST /session");
-    assert_eq!(resp.status(), 200);
-    let session: serde_json::Value = resp.json().await.expect("session json");
-    let session_id = session["sessionId"].as_str().expect("sessionId");
-    assert_eq!(session_id.len(), 32, "16 random bytes, hex-encoded");
-
-    // An unknown session id 404s immediately on the long-poll endpoints.
-    let resp = client
-        .get(format!("{base}/evm-proof/does-not-exist"))
-        .send()
-        .await
-        .expect("GET /evm-proof");
-    assert_eq!(resp.status(), 404);
-
-    // The attestation endpoint refuses to guess the digest shape.
-    let resp = client
-        .get(format!("{base}/zk/proxy/attestation/{session_id}"))
-        .send()
-        .await
-        .expect("GET /zk/proxy/attestation");
-    assert_eq!(resp.status(), 400, "session_type is required");
 
     handle.shutdown();
 }

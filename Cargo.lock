@@ -935,6 +935,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "async-task"
+version = "4.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -991,7 +997,7 @@ dependencies = [
  "fastrand",
  "hex",
  "http 1.5.0",
- "sha1",
+ "sha1 0.10.7",
  "time",
  "tokio",
  "tracing",
@@ -1426,10 +1432,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
- "sha1",
+ "sha1 0.10.7",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.29.0",
  "tower",
  "tower-layer",
  "tower-service",
@@ -1474,6 +1480,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64-simd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1515,6 +1527,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "bincode"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
+dependencies = [
+ "bincode_derive",
+ "serde",
+ "unty",
+]
+
+[[package]]
+name = "bincode_derive"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
+dependencies = [
+ "virtue",
 ]
 
 [[package]]
@@ -1847,8 +1879,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clmul"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -2695,6 +2727,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-rustls"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8d8a2499f0fecc0492eb3e47eab4e92da7875e1028ad2528f214ac3346ca04e"
+dependencies = [
+ "futures-io",
+ "rustls 0.22.4",
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2772,11 +2815,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -3111,7 +3152,6 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tower-service",
- "webpki-roots",
 ]
 
 [[package]]
@@ -3131,7 +3171,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -3531,19 +3571,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
-name = "libid-attestations"
-version = "0.2.0"
-source = "git+https://github.com/libid-org/libID-rs?tag=v0.2.0#ec71e1536cb76df80cf8c0ca923273d40671db60"
+name = "libid-ceremony"
+version = "0.4.0"
+source = "git+https://github.com/libid-org/libID-rs?tag=v0.4.0#82bc4e286d762531ba3ac86996db4afc6ea38f56"
 dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
+ "bincode 2.0.1",
  "libid-crypto",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "libid-crypto"
-version = "0.2.0"
-source = "git+https://github.com/libid-org/libID-rs?tag=v0.2.0#ec71e1536cb76df80cf8c0ca923273d40671db60"
+version = "0.4.0"
+source = "git+https://github.com/libid-org/libID-rs?tag=v0.4.0#82bc4e286d762531ba3ac86996db4afc6ea38f56"
 dependencies = [
  "hex",
  "k256",
@@ -3553,9 +3593,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libid-profiles"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b500f5875925c4bce39377730a0ffc8f66dd4d623fc7c1555411b48b2076530e"
+
+[[package]]
 name = "libid-signer"
-version = "0.2.0"
-source = "git+https://github.com/libid-org/libID-rs?tag=v0.2.0#ec71e1536cb76df80cf8c0ca923273d40671db60"
+version = "0.4.0"
+source = "git+https://github.com/libid-org/libID-rs?tag=v0.4.0#82bc4e286d762531ba3ac86996db4afc6ea38f56"
 dependencies = [
  "alloy",
  "aws-config",
@@ -3566,12 +3612,13 @@ dependencies = [
 
 [[package]]
 name = "libid-tlsn"
-version = "0.2.0"
-source = "git+https://github.com/libid-org/libID-rs?tag=v0.2.0#ec71e1536cb76df80cf8c0ca923273d40671db60"
+version = "0.4.0"
+source = "git+https://github.com/libid-org/libID-rs?tag=v0.4.0#82bc4e286d762531ba3ac86996db4afc6ea38f56"
 dependencies = [
  "http-body-util",
  "hyper 1.11.0",
  "hyper-util",
+ "libid-ceremony",
  "libid-transcript",
  "thiserror 2.0.20",
  "tlsn",
@@ -3583,9 +3630,11 @@ dependencies = [
 
 [[package]]
 name = "libid-transcript"
-version = "0.2.0"
-source = "git+https://github.com/libid-org/libID-rs?tag=v0.2.0#ec71e1536cb76df80cf8c0ca923273d40671db60"
+version = "0.4.0"
+source = "git+https://github.com/libid-org/libID-rs?tag=v0.4.0#82bc4e286d762531ba3ac86996db4afc6ea38f56"
 dependencies = [
+ "httparse",
+ "libid-profiles",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -3620,12 +3669,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
-name = "lru-slab"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
-
-[[package]]
 name = "macro-string"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3653,8 +3696,8 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "matrix-transpose"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "thiserror 1.0.69",
 ]
@@ -3684,8 +3727,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-circuits"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "mpz-circuits-core",
  "mpz-circuits-data",
@@ -3693,10 +3736,10 @@ dependencies = [
 
 [[package]]
 name = "mpz-circuits-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "itybity 0.3.3",
  "once_cell",
  "rand 0.9.5",
@@ -3708,18 +3751,18 @@ dependencies = [
 
 [[package]]
 name = "mpz-circuits-data"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "mpz-circuits-core",
  "once_cell",
 ]
 
 [[package]]
 name = "mpz-cointoss"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "futures",
  "mpz-cointoss-core",
@@ -3731,8 +3774,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-cointoss-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "mpz-core",
  "opaque-debug",
@@ -3742,13 +3785,16 @@ dependencies = [
 
 [[package]]
 name = "mpz-common"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
+ "async-task",
  "async-trait",
  "bytes",
  "cfg-if",
  "crossbeam-channel",
+ "crossbeam-deque",
+ "crossbeam-utils",
  "futures",
  "pin-project-lite",
  "pollster",
@@ -3761,8 +3807,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "aes 0.9.2",
  "bcs",
@@ -3787,8 +3833,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-fields"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "ark-ff 0.4.2",
  "ark-secp256r1",
@@ -3808,8 +3854,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-garble"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "async-trait",
  "derive_builder 0.11.2",
@@ -3834,8 +3880,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-garble-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "aes 0.9.2",
  "bitvec",
@@ -3865,8 +3911,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-hash"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "blake3",
  "itybity 0.3.3",
@@ -3878,8 +3924,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ideal-vm"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "async-trait",
  "futures",
@@ -3895,8 +3941,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-memory-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "blake3",
  "futures",
@@ -3910,8 +3956,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ole"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "async-trait",
  "futures",
@@ -3928,8 +3974,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ole-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "hybrid-array",
  "itybity 0.3.3",
@@ -3944,8 +3990,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ot"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -3967,8 +4013,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ot-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "aes 0.9.2",
  "blake3",
@@ -3998,8 +4044,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-share-conversion"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "async-trait",
  "mpz-common",
@@ -4014,8 +4060,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-share-conversion-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "mpz-common",
  "mpz-core",
@@ -4028,8 +4074,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-vm-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "async-trait",
  "futures",
@@ -4041,8 +4087,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-zk"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4059,8 +4105,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-zk-core"
-version = "0.1.0-alpha.5"
-source = "git+https://github.com/privacy-ethereum/mpz?rev=8e9b66165d800635bc57c07bbbcb4a32592a1d7e#8e9b66165d800635bc57c07bbbcb4a32592a1d7e"
+version = "0.1.0-alpha.6"
+source = "git+https://github.com/libid-org/mpz?rev=4db9454a0b6380f1a23a7b4807989d866f838fff#4db9454a0b6380f1a23a7b4807989d866f838fff"
 dependencies = [
  "blake3",
  "cfg-if",
@@ -4085,32 +4131,30 @@ checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "notary"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
  "anyhow",
  "axum",
- "base64 0.22.1",
  "clap",
  "futures-util",
  "hex",
- "k256",
- "libid-attestations",
+ "libid-ceremony",
  "libid-crypto",
  "libid-signer",
  "libid-tlsn",
  "libid-transcript",
- "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",
- "serde_with",
  "thiserror 2.0.20",
  "tlsn",
+ "tlsn-sdk-core",
+ "tlsn-server-fixture",
+ "tlsn-server-fixture-certs",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tokio-util",
- "tower-http",
+ "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4309,6 +4353,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "pest_derive"
+version = "2.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e2dd6fc3b26b3462ee188aac870f5a41d398f1cd5e2408d16531bd71c9591fd"
+dependencies = [
+ "pest",
+ "pest_generator",
+]
+
+[[package]]
+name = "pest_generator"
+version = "2.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a7a9205cfb6f596a9e8b689c0a15f9ceb7a1aafae7aaf788150ac65b29975b6"
+dependencies = [
+ "pest",
+ "pest_meta",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "pest_meta"
+version = "2.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85abd351c0de1e8384fc791a0737111a350394937e92b956b743dac12429f57c"
+dependencies = [
+ "pest",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4502,62 +4578,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quinn"
-version = "0.11.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8"
-dependencies = [
- "bytes",
- "cfg_aliases",
- "pin-project-lite",
- "quinn-proto",
- "quinn-udp",
- "rustc-hash",
- "rustls 0.23.43",
- "socket2 0.6.5",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "web-time 1.1.0",
-]
-
-[[package]]
-name = "quinn-proto"
-version = "0.11.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
-dependencies = [
- "bytes",
- "getrandom 0.4.3",
- "lru-slab",
- "rand 0.10.2",
- "rand_pcg",
- "ring",
- "rustc-hash",
- "rustls 0.23.43",
- "rustls-pki-types",
- "slab",
- "thiserror 2.0.20",
- "tinyvec",
- "tracing",
- "web-time 1.1.0",
-]
-
-[[package]]
-name = "quinn-udp"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
-dependencies = [
- "cfg_aliases",
- "libc",
- "once_cell",
- "socket2 0.6.5",
- "tracing",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4674,15 +4694,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
-name = "rand_pcg"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
-dependencies = [
- "rand_core 0.10.1",
-]
-
-[[package]]
 name = "rand_xorshift"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4795,40 +4806,33 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
-version = "0.12.28"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "futures-core",
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
  "hyper 1.11.0",
- "hyper-rustls 0.27.9",
  "hyper-util",
  "js-sys",
  "log",
  "percent-encoding",
  "pin-project-lite",
- "quinn",
- "rustls 0.23.43",
- "rustls-pki-types",
  "serde",
  "serde_json",
- "serde_urlencoded",
  "sync_wrapper",
  "tokio",
- "tokio-rustls 0.26.4",
  "tower",
- "tower-http",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots",
 ]
 
 [[package]]
@@ -4953,6 +4957,19 @@ dependencies = [
 
 [[package]]
 name = "rustls"
+version = "0.22.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf4ef73721ac7bcd79b2b315da7779d8fc09718c6b3d2d1b2d94850eb8c18432"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki 0.102.8",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "rustls"
 version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
@@ -4993,7 +5010,6 @@ version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
 dependencies = [
- "web-time 1.1.0",
  "zeroize",
 ]
 
@@ -5004,6 +5020,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
 dependencies = [
  "ring",
+ "untrusted",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.102.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
  "untrusted",
 ]
 
@@ -5311,7 +5338,7 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96005f01d74e0866a7c27bc47e6051e286339df96c5ab10dd0ee833043a0fbd5"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "bytes",
  "futures-channel",
  "futures-core",
@@ -5332,6 +5359,17 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -5444,6 +5482,19 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spansy"
+version = "0.1.0"
+source = "git+https://github.com/tlsnotary/tlsn-utils?rev=64722f7#64722f7de999cbd41c0cab7312dade306d50ea5f"
+dependencies = [
+ "bytes",
+ "httparse",
+ "pest",
+ "pest_derive",
+ "rangeset",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -5712,8 +5763,8 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tlsn"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.16-pre"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
 dependencies = [
  "aes 0.8.4",
  "ctr 0.9.2",
@@ -5751,7 +5802,6 @@ dependencies = [
  "tlsn-hmac-sha256",
  "tlsn-mpc-tls",
  "tlsn-mux",
- "tlsn-tls-client",
  "tlsn-tls-core",
  "tokio",
  "tracing",
@@ -5761,8 +5811,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-attestation"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.16-pre"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
 dependencies = [
  "bcs",
  "blake3",
@@ -5779,8 +5829,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-cipher"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.16-pre"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
 dependencies = [
  "aes 0.8.4",
  "async-trait",
@@ -5792,8 +5842,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-core"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.16-pre"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
 dependencies = [
  "bimap",
  "blake3",
@@ -5821,8 +5871,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-deap"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.16-pre"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
 dependencies = [
  "async-trait",
  "futures",
@@ -5838,8 +5888,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-hmac-sha256"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.16-pre"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
 dependencies = [
  "mpz-circuits",
  "mpz-core",
@@ -5852,8 +5902,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-key-exchange"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.16-pre"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
 dependencies = [
  "async-trait",
  "derive_builder 0.12.0",
@@ -5875,17 +5925,13 @@ dependencies = [
 
 [[package]]
 name = "tlsn-mpc-tls"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.16-pre"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
 dependencies = [
- "aes 0.8.4",
  "aes-gcm",
  "async-trait",
- "ctr 0.9.2",
  "derive_builder 0.12.0",
- "enum-try-as-inner",
  "futures",
- "ghash 0.5.1",
  "mpz-common",
  "mpz-core",
  "mpz-fields",
@@ -5894,10 +5940,10 @@ dependencies = [
  "mpz-ot",
  "mpz-share-conversion",
  "mpz-vm-core",
- "opaque-debug",
  "p256",
  "pin-project-lite",
  "rand 0.9.5",
+ "ring",
  "serde",
  "serio",
  "thiserror 1.0.69",
@@ -5905,7 +5951,6 @@ dependencies = [
  "tlsn-core",
  "tlsn-hmac-sha256",
  "tlsn-key-exchange",
- "tlsn-tls-client",
  "tlsn-tls-core",
  "tokio",
  "tracing",
@@ -5929,35 +5974,61 @@ dependencies = [
 ]
 
 [[package]]
-name = "tlsn-tls-client"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+name = "tlsn-sdk-core"
+version = "0.1.0-alpha.16-pre"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
 dependencies = [
- "aes-gcm",
- "async-trait",
- "digest 0.10.7",
+ "bytes",
  "futures",
- "hmac 0.12.1",
- "log",
- "mpz-common",
- "p256",
- "rand 0.9.5",
- "rand06-compat",
- "ring",
+ "http-body-util",
+ "hyper 1.11.0",
+ "pin-project-lite",
+ "rangeset",
+ "regex",
  "rustls-pki-types",
  "rustls-webpki 0.103.14",
- "sct",
- "sha2 0.10.9",
+ "serde",
+ "serde_json",
+ "spansy",
  "thiserror 1.0.69",
+ "tlsn",
  "tlsn-core",
  "tlsn-tls-core",
- "web-time 0.2.4",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
+name = "tlsn-server-fixture"
+version = "0.0.0"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures",
+ "futures-rustls",
+ "hyper 1.11.0",
+ "hyper-util",
+ "serde_json",
+ "tlsn-server-fixture-certs",
+ "tokio",
+ "tokio-util",
+ "tower-http 0.6.11",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "tlsn-server-fixture-certs"
+version = "0.0.0"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
+
+[[package]]
 name = "tlsn-tls-core"
-version = "0.1.0-alpha.15-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=040c6881f3ec65ea042de134a0586b23cf382443#040c6881f3ec65ea042de134a0586b23cf382443"
+version = "0.1.0-alpha.16-pre"
+source = "git+https://github.com/libid-org/tlsn?rev=550220ee18a8c0bb60217d58cb73f5fd2e74e441#550220ee18a8c0bb60217d58cb73f5fd2e74e441"
 dependencies = [
  "futures",
  "hmac 0.12.1",
@@ -6030,7 +6101,19 @@ dependencies = [
  "futures-util",
  "log",
  "tokio",
- "tungstenite",
+ "tungstenite 0.29.0",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite 0.30.0",
 ]
 
 [[package]]
@@ -6109,7 +6192,23 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08a05a66a4fdd61cbbe0a1d755ffe0ca6aba159dd4820936a0ff8a8278245b9c"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytes",
+ "http 1.5.0",
+ "percent-encoding",
+ "pin-project-lite",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]
@@ -6204,7 +6303,23 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
- "sha1",
+ "sha1 0.10.7",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http 1.5.0",
+ "httparse",
+ "log",
+ "rand 0.10.2",
+ "sha1 0.11.0",
  "thiserror 2.0.20",
 ]
 
@@ -6283,6 +6398,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "unty"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6333,6 +6454,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtue"
+version = "0.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "vsimd"

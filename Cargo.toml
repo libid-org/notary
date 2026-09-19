@@ -1,15 +1,14 @@
 [package]
 name = "notary"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # The real floor, inherited from libid-rs (and the original monorepo before it):
-#   * the `mpz` MPC dependency (via tlsn) uses `cfg_select!`, unstable
-#     before 1.94;
+#   * TLSNotary alpha.15's `mpz` graph declares Rust 1.95;
 #   * the AWS SDK crates (via libid-signer) declare 1.94.1.
-rust-version = "1.94.1"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/libid-org/notary"
-description = "The libID notary service: MPC-TLS / zkTLS notarization for platform sessions and notarized JWKS (OIDC) readings, under one notary identity."
+description = "The libID notary service: MPC-TLS / zkTLS notarization of a prover's HTTPS session into one signed ceremony attestation, under one notary identity."
 # A binary + companion library, never a registry crate: it names `tlsn`
 # (git-only upstream) in its manifest, which cargo refuses to publish.
 publish = false
@@ -24,29 +23,27 @@ path = "src/main.rs"
 
 [dependencies]
 # ── libid-rs shared crates ──────────────────────────────────────────────────
-# All five ride the same git source so their intra-workspace `path` deps
-# unify. The upstream `tlsn` git rev is pinned by libid-tlsn and arrives
-# transitively; the direct `tlsn` entry below MUST name the same rev.
-# All five come from the same release tag: libid-tlsn is git-only (upstream
-# tlsn is not on crates.io) and exposes sibling-crate types, so mixing the
-# crates.io copies with the git copy would put two incompatible versions of
-# the same types in the graph.
-libid-attestations = { git = "https://github.com/libid-org/libID-rs", tag = "v0.2.0" }
-libid-crypto = { git = "https://github.com/libid-org/libID-rs", tag = "v0.2.0" }
-libid-signer = { git = "https://github.com/libid-org/libID-rs", tag = "v0.2.0" }
-libid-tlsn = { git = "https://github.com/libid-org/libID-rs", tag = "v0.2.0" }
-libid-transcript = { git = "https://github.com/libid-org/libID-rs", tag = "v0.2.0" }
+# All five ride the same git source, at the same tag, so their intra-workspace
+# `path` deps unify. libid-tlsn is git-only (upstream tlsn is not on crates.io)
+# and exposes sibling-crate types, so mixing the crates.io copies with the git
+# copy would put two incompatible versions of the same types in the graph.
+# libid-ceremony is direct because the notary constructs its attested record;
+# libid-tlsn also reaches the same crate through the workspace tag.
+# The upstream `tlsn` git rev is pinned by libid-tlsn and arrives the same way;
+# the direct `tlsn` entry below MUST name the same rev.
+#
+libid-ceremony = { git = "https://github.com/libid-org/libID-rs", tag = "v0.4.0" }
+libid-crypto = { git = "https://github.com/libid-org/libID-rs", tag = "v0.4.0" }
+libid-signer = { git = "https://github.com/libid-org/libID-rs", tag = "v0.4.0" }
+libid-tlsn = { git = "https://github.com/libid-org/libID-rs", tag = "v0.4.0" }
+libid-transcript = { git = "https://github.com/libid-org/libID-rs", tag = "v0.4.0" }
 
-# Upstream TLSNotary. The rev MUST equal libid-tlsn's pin (same source →
+# Upstream TLSNotary. The pin MUST equal libid-tlsn's (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible
 # `tlsn` crates and type errors at the libid-tlsn boundary). The wasm bundle
 # script reads this pin back out of Cargo.lock so the browser prover can
 # never drift onto a different tlsn version than the server.
-tlsn = { git = "https://github.com/tlsnotary/tlsn", rev = "040c6881f3ec65ea042de134a0586b23cf382443" }
-
-# ── Solidity ABI mirrors (JwksOracle wire types) ────────────────────────────
-alloy-primitives = { version = "1", features = ["serde"] }
-alloy-sol-types = "1"
+tlsn = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15" }
 
 # ── server ──────────────────────────────────────────────────────────────────
 anyhow = "1.0"
@@ -54,7 +51,6 @@ axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 hex = "0.4"
-rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
@@ -68,20 +64,61 @@ tokio = { version = "1", features = [
     "time",
 ] }
 tokio-util = { version = "0.7", features = ["compat"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# ── JWKS role ───────────────────────────────────────────────────────────────
-base64 = "0.22"
-k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
-# Plain-TLS JWKS fetch for the mock prover only.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-serde_with = { version = "3", features = ["hex"] }
-
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
-    "json",
-] }
+# Test-only HTTP client: it GETs the notary's own /info over plain HTTP on
+# loopback, so it needs no TLS backend. Leaving rustls on would pull
+# rustls-platform-verifier and its Android JNI tree into the lockfile for
+# nothing.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
+tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
+tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
 tokio = { version = "1", features = ["test-util"] }
+tokio-tungstenite = "0.30"
+
+# libid-org/tlsn#3 (merged) moved that branch onto libid-org/mpz 4db9454 and the
+# typed KOS `InstanceId` from libid-org/mpz#1; this pin is the merge commit on
+# integration/notary-alpha15, and it and the MPZ block below move together.
+[patch."https://github.com/tlsnotary/tlsn"]
+# WIP: TLSNotary #1178 reclaims the channel, #1179 preserves hash-opening
+# order, #1173 fixes RCOT preprocessing deadlocks, and libid-org/tlsn#2 bounds
+# verifier transcript allocation. Return to a release containing the fixes.
+tlsn = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
+
+# TLSNotary #1173 also needs privacy-ethereum/mpz#446 KOS instance-domain
+# separation. libid-org/mpz carries that on top of alpha.6, plus libid-org/mpz#2
+# (executor context lifetime) and libid-org/mpz#1 (typed `InstanceId`, PRG
+# stream-id derivation -- a solo instance is byte-identical to stock KOS -- and
+# the bench, tests and `Default` removal #446 shipped without). Cargo ignores
+# dependency-workspace patches, so repeat TLSN's matching pin for the server and
+# the test clients; the browser WASM build reads the same TLSN rev from
+# Cargo.lock and therefore the same MPZ.
+[patch."https://github.com/privacy-ethereum/mpz"]
+clmul = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+matrix-transpose = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-circuits = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-circuits-core = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-circuits-data = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-cointoss = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-cointoss-core = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-common = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-core = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-fields = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-garble = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-garble-core = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-hash = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-ideal-vm = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-memory-core = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-ole = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-ole-core = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-ot = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-ot-core = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-share-conversion = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-share-conversion-core = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-vm-core = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-zk = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }
+mpz-zk-core = { git = "https://github.com/libid-org/mpz", rev = "4db9454a0b6380f1a23a7b4807989d866f838fff" }

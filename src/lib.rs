@@ -1,27 +1,22 @@
 //! The libID notary service.
 //!
-//! One binary, one signing identity, two notary duties:
+//! One binary, one signing identity, one record. The notary takes part as the
+//! MPC-TLS or ProxyMode (zkTLS) verifier in a prover's HTTPS session and signs
+//! the canonical ceremony section 9.1 attestation for the authenticated
+//! transcript -- `libid_transcript::AttestationWire`, the attested data and the
+//! signature over it and nothing else. The notary does not know, and does not
+//! ask, what the session was for: a platform API call (X, GitHub, …) and the
+//! keeper's reading of Google's OIDC JWKS get the same record, and the contract
+//! that reads the record decides whether it wanted that host. What differs is
+//! only what the prover chose to reveal.
 //!
-//! * **Platform sessions** — MPC-TLS / zkTLS (ProxyMode) notarization of
-//!   platform API sessions (X, GitHub, …), producing tlsn attestations,
-//!   `EvmProof`s and on-demand token/me hash-commit attestations.
-//! * **JWKS readings** — notarized readings of Google's OIDC JWKS
-//!   (`https://www.googleapis.com/oauth2/v3/certs`), producing signed
-//!   `JwksRotationProof`s for the on-chain `JwksOracle`.
-//!
-//! Both duties are served by the same TCP wire listener: the notary runs the
-//! MPC-TLS verifier first, then dispatches on the TLS-cert-verified server
-//! name — `www.googleapis.com` gets the JWKS response shape, everything else
-//! the platform response shape. The browser-facing HTTP/WS API (tlsn-js /
-//! tlsn_wasm compatible) lives on a second port.
-//!
-//! The crate is a library too: [`jwks`] exposes the prover-side helpers a
-//! backend rotation listener needs to obtain a `JwksRotationProof` from a
-//! running notary.
+//! The TCP wire listener serves Rust backend provers; the browser-facing
+//! HTTP/WS API (tlsn_wasm compatible) lives on a second port. The crate builds
+//! as a library so tests can embed [`run`]; the prover-side helpers for the
+//! JWKS reading live in the keeper, on libid-rs's primitives.
 
 pub mod config;
 pub mod error;
-pub mod jwks;
 pub mod server;
 
 pub use config::NotaryServerConfig;

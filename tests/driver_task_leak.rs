@@ -39,8 +39,8 @@ fn probe_connections_leave_no_live_tasks() {
 
     runtime.block_on(async {
         // TCP wire listener on an ephemeral port; HTTP/WS server disabled
-        // (ws_port 0) so the only long-lived tasks are the session sweep and
-        // the accept loop, both of which exit on shutdown.
+        // (ws_port 0) so the only long-lived task is the accept loop, which
+        // exits on shutdown.
         let config = NotaryServerConfig::parse_from([
             "notary",
             "--host",
@@ -51,10 +51,6 @@ fn probe_connections_leave_no_live_tasks() {
             "0",
             "--signing-key",
             TEST_KEY,
-            "--x-zk-verifier-address",
-            "0x1111111111111111111111111111111111111111",
-            "--verifying-contract",
-            "0x2222222222222222222222222222222222222222",
         ]);
         let handle = server::run(config).await.expect("server starts");
         let addr = handle.local_addr();

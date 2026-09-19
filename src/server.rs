@@ -3,32 +3,27 @@
 //! # Endpoints
 //!
 //! - **TCP** (port `NOTARY_PORT`): MPC-TLS verifier for Rust backend provers.
-//!   Dispatches on the TLS-cert-verified server name after verification:
-//!   `www.googleapis.com` sessions are answered with a signed
-//!   [`crate::jwks::JwksNotaryResponse`] (JWKS rotation duty); every other
-//!   session with the platform [`NotaryResponse`].
+//!   The section 9.1 ceremony attestation is written back down the socket the
+//!   prover opened. Nothing here dispatches on the server name: the record
+//!   carries it, and the contract that reads the record pins it.
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
-//! - **POST /session**: creates a session, returns `{sessionId}` — tlsn-js API.
-//! - **GET  /notarize?sessionId=…** (WS upgrade): MPC-TLS session for tlsn-js
-//!   browser client.
-//! - **GET  /notarize-proxy?sessionId=…** (WS upgrade): ProxyMode session for
-//!   WASM browser client (the primary browser path).
-//! - **GET  /evm-proof/:session_id**: returns the `NotaryResponse` after the
-//!   MPC-TLS session completes (long-poll).
-//! - **GET  /zk/proxy/attestation/:session_id?session_type=token|me&…**: signs
-//!   an on-demand token/me attestation from a completed ProxyMode session.
-//! - **GET  /proxy** (WS upgrade): raw TCP proxy used by the tlsn-js MPC path.
-//! - **GET  /notary** (WS upgrade): legacy TCP-over-WS path.
+//! - **GET /notarize-proxy** (WS upgrade): ProxyMode session followed by one
+//!   length-prefixed ceremony attestation in its own WebSocket message.
 //!
 //! # Trust model
 //!
-//! The notary is one half of a 2-of-2 trust scheme. It signs the
-//! transcript root after participating as the MPC-TLS verifier or ProxyMode
-//! verifier. Its signature alone does NOT register an identity on-chain — the
-//! ZK circuit or smart contract verifies the signature against the notary pubkey.
+//! The notary is one half of a 2-of-2 trust scheme. Having taken part as the
+//! MPC-TLS or ProxyMode verifier, it signs what it observed, and one thing
+//! only: the section 9.1 attested data. Both transports produce the same
+//! record, because the transport says nothing about the TLS session it
+//! describes.
+//!
+//! Its signature alone registers nothing. A contract on the Consumer Chain
+//! authenticates it -- the Notary Service of ceremony-common section 9.1 --
+//! and NOT the proving circuit: an attestation is authenticated on chain, and
+//! the circuit proves only what cannot be read from authenticated evidence.
 
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     sync::Arc,
     time::SystemTime,
@@ -41,8 +36,6 @@ use axum::{
             WebSocket,
             WebSocketUpgrade,
         },
-        Path,
-        Query,
         State,
     },
     http::StatusCode,
@@ -50,63 +43,33 @@ use axum::{
         IntoResponse,
         Json,
     },
-    routing::{
-        get,
-        post,
-    },
+    routing::get,
     Router,
 };
 use futures_util::{
     SinkExt,
     StreamExt,
 };
-use libid_attestations::{
-    compute_me_attest_digest,
-    compute_notary_digest,
-    compute_token_attest_digest,
-    MeAttestInput,
-    TokenAttestInput,
-};
-use libid_crypto::{
-    double_hash_leaf,
-    keccak256,
-};
+use libid_ceremony::AttestedData;
 use libid_signer::{
     ManagedSigner,
     SignerSource,
 };
+use libid_tlsn::attest::{
+    FromObserved,
+    ObservedSession,
+};
 use libid_transcript::{
-    find_request_line_range,
-    read_msg,
     write_msg,
-    EvmProof,
-    NotaryResponse,
+    AttestationWire,
 };
-use rand::RngCore;
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::Serialize;
 use tlsn::{
-    attestation::{
-        request::Request,
-        signing::{
-            KeyAlgId,
-            Signature as TlsnSignature,
-            SignatureAlgId,
-            SignatureError as TlsnSignatureError,
-            Signer as TlsnSigner,
-            VerifyingKey as TlsnVerifyingKey,
-        },
-        Attestation,
-        AttestationConfig,
-        CryptoProvider,
-    },
     config::verifier::VerifierConfig,
-    connection::{
-        ConnectionInfo,
-        ServerName,
-        TranscriptLength,
+    connection::ServerName,
+    transcript::{
+        PartialTranscript,
+        TranscriptCommitment,
     },
     verifier::{
         VerifierCommitStart,
@@ -120,7 +83,7 @@ use tokio::{
         AsyncWriteExt,
     },
     net::TcpListener,
-    sync::RwLock,
+    sync::Semaphore,
 };
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tower_http::cors::{
@@ -130,19 +93,14 @@ use tower_http::cors::{
 use tracing::{
     error,
     info,
-    warn,
 };
 
 use crate::{
-    config::{
-        parse_hex_address,
-        NotaryServerConfig,
-    },
+    config::NotaryServerConfig,
     error::{
         Error,
         Result,
     },
-    jwks,
 };
 
 /// Handle for controlling the running notary server.
@@ -163,85 +121,16 @@ impl NotaryServerHandle {
         self.ws_local_addr
     }
 
-    /// Signals every background task (TCP accept loop, WS server, session
-    /// sweep) to stop, so none leaks after shutdown.
+    /// Signals every background task (TCP accept loop and WS server) to stop.
     pub fn shutdown(self) {
         let _ = self.shutdown.send(true);
     }
 }
 
-// ─── Session state ───────────────────────────────────────────────────────────
-
-/// Raw TLSN reveal data captured during `run_proxy_verifier_session`.
-/// The on-demand attestation handler signs either a token or a /me
-/// attestation digest from this based on the `session_type` hint.
-#[derive(Default, Clone)]
-pub struct RawAttestationData {
-    /// Bearer hash-commit (SHA256(bearer || blinder)) from TLSN.
-    pub bearer_hash: [u8; 32],
-    /// Range covering the bearer in its source direction (sent for /me,
-    /// recv for /token).
-    pub bearer_range_start: u32,
-    /// End offset (exclusive) of the bearer range.
-    pub bearer_range_end: u32,
-    /// All sent-direction bytes the prover revealed (concatenated if multiple
-    /// ranges were revealed; today: prefix range and optional 2-byte CRLF
-    /// trailer for /me's H1 anchor).
-    pub sent_revealed: Vec<u8>,
-    /// End offset (exclusive) of the first revealed sent range.
-    pub sent_prefix_end: u32,
-    /// End offset (exclusive) of the second revealed sent range, or 0 if
-    /// only one range was revealed (e.g. /token path).
-    pub sent_suffix_end: u32,
-    /// All recv-direction bytes the prover revealed.
-    pub recv_revealed: Vec<u8>,
-    /// Unix seconds when the session completed.
-    pub timestamp: u64,
-}
-
-struct SessionEntry {
-    /// Set once the MPC-TLS session completes and EVM proof is computed.
-    evm_proof_result: Option<NotaryResponse>,
-    /// Raw revealed data captured at session completion. The notary signs an
-    /// on-demand token or /me attestation digest from this when the browser
-    /// fetches via `GET /zk/proxy/attestation/{session_id}`.
-    raw_attest: Option<RawAttestationData>,
-    /// Notified when `evm_proof_result` or `raw_attest` is populated so
-    /// fetch-handlers wake up immediately instead of polling.
-    ready: Arc<tokio::sync::Notify>,
-    /// When the entry was created. Monotonic (`tokio::time::Instant`) so a
-    /// wall-clock step can't disable or mis-fire the background sweep. Used to
-    /// evict abandoned sessions so the map can't grow without bound (DoS).
-    created_at: tokio::time::Instant,
-}
-
-impl Default for SessionEntry {
-    fn default() -> Self {
-        Self {
-            evm_proof_result: None,
-            raw_attest: None,
-            ready: Arc::new(tokio::sync::Notify::new()),
-            created_at: tokio::time::Instant::now(),
-        }
-    }
-}
-
-type SessionMap = Arc<RwLock<HashMap<String, SessionEntry>>>;
-
-/// How long any session entry lives before the background sweep evicts it.
-/// Generous so the whole creation → MPC → client-side proving → fetch pipeline
-/// fits comfortably inside it — yet finite, so produced-but-never-fetched
-/// entries can't accumulate without bound.
-const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
-
-/// How often the background sweep runs.
-const SESSION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Overall deadline for one prover connection (TCP or WebSocket), covering
 /// the whole MPC-TLS/ProxyMode session plus the attestation exchange. A real
 /// session completes in well under a minute even on a slow link; 5 minutes is
-/// generous headroom while staying far inside [`SESSION_TTL`] (30 min), which
-/// bounds the session *entry*, not the connection. This is defense in depth:
+/// generous headroom. This is defense in depth:
 /// whatever future bug makes a session pend, no connection can pin a handler
 /// task (and its MPC buffers) forever.
 const CONNECTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
@@ -263,11 +152,6 @@ impl<T> AbortOnDrop<T> {
         Self(Some(handle))
     }
 
-    /// The wrapped handle, for polling the task without disarming the guard.
-    fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
-        self.0.as_mut().expect("handle present until into_inner")
-    }
-
     /// Disarm the guard and hand the handle back for joining.
     fn into_inner(mut self) -> tokio::task::JoinHandle<T> {
         self.0.take().expect("handle present until into_inner")
@@ -282,85 +166,15 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-/// Error for a session driver that finished while session setup was still in
-/// flight. The driver only completes once the underlying socket is closed or
-/// dead, so a protocol request submitted to it may never resolve — without
-/// this check a connect-then-close client (the kubelet `tcpSocket` probe
-/// pattern) could wedge the handler forever.
-fn driver_finished_early<T, E: std::fmt::Display>(
-    result: std::result::Result<std::result::Result<T, E>, tokio::task::JoinError>,
-) -> Error {
-    let detail = match result {
-        Ok(Ok(_)) => "driver task finished before the session completed".into(),
-        Ok(Err(e)) => format!("driver task: {e}"),
-        Err(e) => format!("driver task join: {e}"),
-    };
-    Error::NotaryServer { detail }
-}
-
-/// Evict session entries older than [`SESSION_TTL`]. Returns the count evicted.
-/// Age is measured on a monotonic clock (`Instant`), so a wall-clock step never
-/// disables the sweep (unbounded-growth DoS) or early-evicts a live session.
-/// EVERY entry — in-flight, abandoned, and produced-but-unfetched — is bounded
-/// by the TTL; a client that hasn't fetched its attestation within the (very
-/// generous) TTL has effectively abandoned it and re-runs the flow.
-///
-/// An evicted entry wakes any handler blocked on its `ready` notify so the
-/// handler re-checks, finds the entry gone, and returns 404 promptly instead of
-/// sleeping out its full timeout and reporting a misleading "not ready".
-async fn sweep_stale_sessions(sessions: &SessionMap) -> usize {
-    let mut map = sessions.write().await;
-    let before = map.len();
-    map.retain(|_, e| {
-        let keep = e.created_at.elapsed() < SESSION_TTL;
-        if !keep {
-            e.ready.notify_waiters();
-        }
-        keep
-    });
-    before.saturating_sub(map.len())
-}
-
 #[derive(Clone)]
 struct NotaryState {
-    /// Notary signing identity (local hex key or AWS KMS). The one path KMS
-    /// cannot serve directly is tlsn attestation — see [`HeaderCaptureSigner`].
+    /// Notary signing identity (local hex key or AWS KMS).
     signer: Arc<ManagedSigner>,
-    sessions: SessionMap,
-    /// Max concurrent live sessions (`NOTARY_MAX_SESSIONS`).
-    max_sessions: usize,
+    proxy_sessions: Arc<Semaphore>,
+    proxy_root_store: Arc<tlsn::webpki::RootCertStore>,
+    /// `None` connects to the TLS-authenticated server name on port 443.
+    proxy_server_addr: Option<SocketAddr>,
     public_key_hex: String,
-    /// EVM chain id the contracts that consume these attestations run on.
-    /// Baked into the signed digest as part of the EIP-712-style domain
-    /// separator so a single notary signing key can serve multiple
-    /// deployments without cross-chain replay.
-    chain_id: u64,
-    /// ZK verifier (e.g. `XZkVerifier`) address for the hash-commit digests.
-    zk_verifying_contract: [u8; 20],
-    /// `verifyingContract` for the MPC-TLS digest (`Registry` in wallet
-    /// deployments, `GitHubIdentityVerifier` in identity deployments).
-    mpc_verifying_contract: [u8; 20],
-    /// SNI / `platformName` the verifier on-chain is configured for.
-    platform_name: String,
-    /// Whether the TCP listener also serves JWKS notarization sessions.
-    jwks_enabled: bool,
-}
-
-// ─── REST request/response types ────────────────────────────────────────────
-
-// Reserved fields the tlsn-js client sends but we don't act on
-// (`clientType`, `maxSentData`, `maxRecvData`). Deserialize into a
-// permissive `Value` so unknown fields don't 400.
-#[derive(Default, Deserialize)]
-struct SessionRequest {
-    #[serde(flatten, default)]
-    _ignored: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct SessionResponse {
-    #[serde(rename = "sessionId")]
-    session_id: String,
 }
 
 #[derive(Serialize)]
@@ -370,31 +184,9 @@ struct InfoResponse {
     public_key: String,
 }
 
-#[derive(Deserialize)]
-struct NotarizeQuery {
-    #[serde(rename = "sessionId")]
-    session_id: Option<String>,
-}
-
-/// Reject a ProxyMode session whose TLS-cert-verified server identity does not
-/// match the platform baked into the attestation digest. Without this a prover
-/// could connect the notary to any WebPKI-valid host and obtain a signature
-/// claiming `platform` (e.g. "api.x.com"). Case-insensitive: DNS is.
-fn check_server_identity(domain: &str, platform_name: &str) -> Result<()> {
-    if domain.eq_ignore_ascii_case(platform_name) {
-        Ok(())
-    } else {
-        Err(Error::NotaryServer {
-            detail: format!(
-                "server identity '{domain}' does not match configured platform '{platform_name}'"
-            ),
-        })
-    }
-}
-
 // ─── Server startup ──────────────────────────────────────────────────────────
 
-/// Start the notary server (TCP + optional WebSocket with tlsn-js API).
+/// Start the notary server (TCP + optional browser TLSNotary WebSocket).
 pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     // SIGNING_KEY accepts `kms:<key-id-or-alias>` or a hex key.
     let signer = SignerSource::from_spec(&config.signing_key)?
@@ -406,44 +198,16 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         "notary signer ready"
     );
     let public_key_hex = hex::encode(signer.compressed_public_key());
-    let zk_verifying_contract = parse_hex_address(&config.x_zk_verifier_address)?;
-    let mpc_verifying_contract = config.resolve_verifying_contract()?;
     let state = NotaryState {
         signer: Arc::new(signer),
-        sessions: Arc::new(RwLock::new(HashMap::new())),
-        max_sessions: config.max_sessions,
+        proxy_sessions: Arc::new(Semaphore::new(config.max_sessions)),
+        proxy_root_store: Arc::new(libid_tlsn::root_store()),
+        proxy_server_addr: None,
         public_key_hex,
-        chain_id: config.chain_id,
-        zk_verifying_contract,
-        mpc_verifying_contract,
-        platform_name: config.platform_name,
-        jwks_enabled: config.jwks_enabled,
     };
 
-    // Broadcast shutdown to every background task (TCP loop, WS server, sweep)
-    // so none leaks after NotaryServerHandle::shutdown().
+    // Broadcast shutdown to the TCP and WebSocket servers.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-    // ── Background sweep: evict abandoned sessions so the map can't grow
-    //    without bound (memory DoS). Exits on shutdown.
-    {
-        let sessions = Arc::clone(&state.sessions);
-        let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(SESSION_SWEEP_INTERVAL);
-            loop {
-                tokio::select! {
-                    _ = tick.tick() => {
-                        let evicted = sweep_stale_sessions(&sessions).await;
-                        if evicted > 0 {
-                            info!("notary: swept {evicted} stale session(s)");
-                        }
-                    }
-                    _ = shutdown.changed() => break,
-                }
-            }
-        });
-    }
 
     // ── TCP listener (Rust client) ────────────────────────────────────
     let tcp_listener =
@@ -460,7 +224,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
     };
     let ws_local_addr = ws_listener.as_ref().and_then(|l| l.local_addr().ok());
     if let Some(addr) = ws_local_addr {
-        info!("Notary WebSocket listening on {addr} (tlsn-js compatible API)");
+        info!("Notary WebSocket listening on {addr} (browser TLSNotary API)");
     }
 
     let tcp_state = state.clone();
@@ -499,17 +263,7 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
 
         let app = Router::new()
             .route("/info", get(info_handler))
-            .route("/session", post(session_handler))
-            .route("/notarize", get(notarize_ws_handler))
-            .route("/evm-proof/{session_id}", get(evm_proof_handler))
-            .route(
-                "/zk/proxy/attestation/{session_id}",
-                get(proxy_attestation_handler),
-            )
-            .route("/proxy", get(ws_proxy_handler))
             .route("/notarize-proxy", get(notarize_proxy_ws_handler))
-            // Legacy path kept for backward compat
-            .route("/notary", get(notary_legacy_ws_handler))
             .layer(cors)
             .with_state(ws_state);
 
@@ -540,406 +294,164 @@ async fn info_handler(State(state): State<NotaryState>) -> Json<InfoResponse> {
     })
 }
 
-async fn session_handler(
-    State(state): State<NotaryState>,
-    Json(_req): Json<SessionRequest>,
-) -> impl IntoResponse {
-    let mut sessions = state.sessions.write().await;
-    if !admit_session(&mut sessions, state.max_sessions) {
-        tracing::warn!(
-            cap = state.max_sessions,
-            "notary session cap reached — rejecting"
-        );
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "notary at capacity, retry shortly"})),
-        )
-            .into_response();
-    }
+// ─── Ceremony attestation ───────────────────────────────────────────────────
 
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let session_id = hex::encode(bytes);
-    sessions.insert(session_id.clone(), SessionEntry::default());
-    drop(sessions);
-    info!("Created session {}", session_id);
-    (StatusCode::OK, Json(SessionResponse { session_id })).into_response()
+// The wire record itself is `libid_transcript::AttestationWire`. It is defined
+// there, beside the `write_msg`/`read_msg` that frame it, because a prover has
+// to read exactly what this writes -- and a copy here would be a second
+// definition of one message, agreeing only for as long as nobody renames a
+// field. What the notary puts in it is still decided here, and it is nothing
+// it derived by applying a profile rule: no handle, no account identifier, no
+// client identifier, no chain address (REQ-COMMON-61). Every one is derivable
+// from the revealed ranges, and a second signed representation can disagree
+// with the bytes it was taken from. That is why this endpoint no longer takes
+// `handle`, `user_id` or `session_addr` -- the Platform Verifier reads them
+// itself, and the notary deciding them would be the profile-specific
+// judgement REQ-COMMON-33 forbids it.
+
+/// Build the section 9.1 attested data for one completed session and sign it.
+///
+/// Both transports end here and receive the same record on their reclaimed
+/// channel, because transport says nothing about the TLS session it describes.
+async fn sign_ceremony_attestation(
+    signer: &ManagedSigner,
+    partial: &PartialTranscript,
+    authority: &str,
+    commitments: &[TranscriptCommitment],
+    created_at: u64,
+) -> Result<AttestationWire> {
+    let attested = AttestedData::from_observed(ObservedSession {
+        transcript: partial,
+        authority,
+        commitments,
+        created_at,
+    })
+    .map_err(|e| Error::NotaryServer {
+        detail: format!("attested data: {e}"),
+    })?;
+    let encoded = attested.encode().map_err(|e| Error::NotaryServer {
+        detail: format!("encode attested data: {e}"),
+    })?;
+
+    // The notary signs `keccak256(attestedData)` and no other preimage
+    // (REQ-COMMON-47).
+    let notary_signature = signer
+        .sign_claim(&libid_crypto::keccak256(&encoded))
+        .await?;
+    Ok(AttestationWire {
+        attested_data: encoded,
+        notary_signature,
+    })
 }
 
-/// Whether a new session may be admitted under `max` concurrent sessions. At
-/// capacity it first reclaims stale entries inline (same predicate + waiter-
-/// notify as the background sweep — a burst is usually mostly abandoned sessions
-/// past the TTL); returns `false` only if the map is still full of live
-/// sessions. The caller must hold the map write lock.
-fn admit_session(map: &mut HashMap<String, SessionEntry>, max: usize) -> bool {
-    if map.len() >= max {
-        map.retain(|_, e| {
-            let keep = e.created_at.elapsed() < SESSION_TTL;
-            if !keep {
-                e.ready.notify_waiters();
-            }
-            keep
+fn attestation_frame(attestation: &AttestationWire) -> Result<Vec<u8>> {
+    const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
+
+    let json = serde_json::to_vec(attestation)?;
+    if json.len() > MAX_FRAME_BYTES {
+        return Err(Error::NotaryServer {
+            detail: format!("attestation frame is too large: {} bytes", json.len()),
         });
     }
-    map.len() < max
-}
-
-async fn evm_proof_handler(
-    Path(session_id): Path<String>,
-    State(state): State<NotaryState>,
-) -> impl IntoResponse {
-    let start = tokio::time::Instant::now();
-    let budget = tokio::time::Duration::from_secs(60);
-    loop {
-        let notify = {
-            let sessions = state.sessions.read().await;
-            let Some(entry) = sessions.get(&session_id) else {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": "session not found"})),
-                )
-                    .into_response();
-            };
-            if let Some(ref notary_response) = entry.evm_proof_result {
-                let json = serde_json::to_value(notary_response).unwrap_or_default();
-                return (StatusCode::OK, Json(json)).into_response();
-            }
-            entry.ready.clone()
-        };
-        let remaining = budget.checked_sub(start.elapsed()).unwrap_or_default();
-        if remaining.is_zero() {
-            break;
-        }
-        let _ = tokio::time::timeout(remaining, notify.notified()).await;
-    }
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"error": "proof not yet ready"})),
-    )
-        .into_response()
-}
-
-// ─── ProxyMode ZK: hash-commit attestation endpoint ──────────────────────────
-
-/// Query parameters for the on-demand attestation endpoint.
-#[derive(Debug, Deserialize)]
-struct AttestationQuery {
-    /// "token" or "me".
-    session_type: Option<String>,
-    /// /me only: claimed handle string (notary signs over its keccak).
-    handle: Option<String>,
-    /// /me only: immutable platform user-id (notary signs over its keccak).
-    user_id: Option<String>,
-    /// /me only: session key the wallet will register (hex `0x...`).
-    session_addr: Option<String>,
-}
-
-/// Token attestation wire JSON.
-#[derive(Debug, Serialize)]
-struct TokenAttestationWire {
-    bearer_hash: Vec<u8>,
-    bearer_range_start: u32,
-    bearer_range_end: u32,
-    sent_revealed: Vec<u8>,
-    timestamp: u64,
-    notary_signature: Vec<u8>,
-}
-
-/// /me attestation wire JSON.
-#[derive(Debug, Serialize)]
-struct MeAttestationWire {
-    bearer_hash: Vec<u8>,
-    bearer_range_start: u32,
-    bearer_range_end: u32,
-    sent_revealed: Vec<u8>,
-    sent_prefix_end: u32,
-    sent_suffix_end: u32,
-    recv_revealed: Vec<u8>,
-    handle: String,
-    user_id: String,
-    session_addr: String,
-    timestamp: u64,
-    notary_signature: Vec<u8>,
-}
-
-/// Fetch a notary-signed attestation for a completed TLSNotary session.
-///
-/// `?session_type=` selects the digest shape:
-///   - `token` → returns `TokenAttestationWire` signed with `OP_TOKEN_ATTEST`.
-///   - `me` → returns `MeAttestationWire` signed with `OP_ME_ATTEST`; requires
-///     `handle` + `user_id` + `session_addr` query params.
-///   - missing → 400 BAD_REQUEST.
-async fn proxy_attestation_handler(
-    Path(session_id): Path<String>,
-    Query(query): Query<AttestationQuery>,
-    State(state): State<NotaryState>,
-) -> impl IntoResponse {
-    if query.session_type.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "?session_type=token|me required"})),
-        )
-            .into_response();
-    }
-
-    let start = tokio::time::Instant::now();
-    let budget = tokio::time::Duration::from_secs(60);
-    let raw: RawAttestationData = loop {
-        let notify = {
-            let sessions = state.sessions.read().await;
-            let Some(entry) = sessions.get(&session_id) else {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": "session not found"})),
-                )
-                    .into_response();
-            };
-            if let Some(ref raw) = entry.raw_attest {
-                break raw.clone();
-            }
-            entry.ready.clone()
-        };
-        let remaining = budget.checked_sub(start.elapsed()).unwrap_or_default();
-        if remaining.is_zero() {
-            return (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({"error": "attestation not yet ready"})),
-            )
-                .into_response();
-        }
-        let _ = tokio::time::timeout(remaining, notify.notified()).await;
-    };
-
-    let session_type = query.session_type.as_deref().unwrap_or("");
-    let platform_name = state.platform_name.as_str();
-    let verifying_contract = state.zk_verifying_contract;
-    let chain_id = state.chain_id;
-
-    match session_type {
-        "token" => {
-            let input = TokenAttestInput {
-                chain_id,
-                verifying_contract: &verifying_contract,
-                platform_name,
-                bearer_hash: &raw.bearer_hash,
-                bearer_range_start: raw.bearer_range_start,
-                bearer_range_end: raw.bearer_range_end,
-                sent_revealed: &raw.sent_revealed,
-                timestamp: raw.timestamp,
-            };
-            let digest = compute_token_attest_digest(&input);
-            match state.signer.sign_claim(&digest).await.map_err(Error::from) {
-                Ok(sig) => {
-                    let resp = TokenAttestationWire {
-                        bearer_hash: raw.bearer_hash.to_vec(),
-                        bearer_range_start: raw.bearer_range_start,
-                        bearer_range_end: raw.bearer_range_end,
-                        sent_revealed: raw.sent_revealed,
-                        timestamp: raw.timestamp,
-                        notary_signature: sig,
-                    };
-                    (StatusCode::OK, Json(resp)).into_response()
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("sign: {e}")})),
-                )
-                    .into_response(),
-            }
-        }
-        "me" => {
-            let handle = match query.handle.as_deref() {
-                Some(h) if !h.is_empty() => h,
-                _ => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "?handle= required for me"})),
-                    )
-                        .into_response();
-                }
-            };
-            // Bound handle length + reject control bytes so we
-            // don't sign a runaway string into the digest.
-            if handle.len() > 32
-                || handle.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n')
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "handle must be 1..=32 chars and free of NUL/CR/LF"
-                    })),
-                )
-                    .into_response();
-            }
-            // Immutable platform user-id: REQUIRED (receiver key is id-derived, no
-            // handle fallback). Reject empty up front so it fails actionably
-            // here instead of an opaque on-chain IdNotFound revert later.
-            // Same length/control-byte bound as the handle.
-            let user_id = query.user_id.as_deref().unwrap_or("");
-            if user_id.is_empty()
-                || user_id.len() > 32
-                || user_id.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n')
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "user_id must be 1..=32 chars and free of NUL/CR/LF"
-                    })),
-                )
-                    .into_response();
-            }
-            // Don't attest an id the prover didn't reveal: require `"id":"<id>"`
-            // in recv (mirrors XZkVerifier._verifyIdInRecv).
-            {
-                let needle = format!("\"id\":\"{user_id}\"");
-                let nb = needle.as_bytes();
-                if !raw.recv_revealed.windows(nb.len()).any(|w| w == nb) {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "user_id not found in revealed recv transcript"
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-            let session_addr_str = match query.session_addr.as_deref() {
-                Some(s) => s,
-                None => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(
-                            serde_json::json!({"error": "?session_addr= required for me"}),
-                        ),
-                    )
-                        .into_response();
-                }
-            };
-            let session_addr_bytes = match parse_hex_address(session_addr_str) {
-                Ok(a) => a,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                        .into_response();
-                }
-            };
-            let input = MeAttestInput {
-                chain_id,
-                verifying_contract: &verifying_contract,
-                platform_name,
-                bearer_hash: &raw.bearer_hash,
-                bearer_range_start: raw.bearer_range_start,
-                bearer_range_end: raw.bearer_range_end,
-                sent_revealed: &raw.sent_revealed,
-                sent_prefix_end: raw.sent_prefix_end,
-                sent_suffix_end: raw.sent_suffix_end,
-                recv_revealed: &raw.recv_revealed,
-                handle,
-                user_id,
-                session_addr: &session_addr_bytes,
-                timestamp: raw.timestamp,
-            };
-            let digest = compute_me_attest_digest(&input);
-            match state.signer.sign_claim(&digest).await.map_err(Error::from) {
-                Ok(sig) => {
-                    let resp = MeAttestationWire {
-                        bearer_hash: raw.bearer_hash.to_vec(),
-                        bearer_range_start: raw.bearer_range_start,
-                        bearer_range_end: raw.bearer_range_end,
-                        sent_revealed: raw.sent_revealed,
-                        sent_prefix_end: raw.sent_prefix_end,
-                        sent_suffix_end: raw.sent_suffix_end,
-                        recv_revealed: raw.recv_revealed,
-                        handle: handle.to_string(),
-                        user_id: user_id.to_string(),
-                        session_addr: format!("0x{}", hex::encode(session_addr_bytes)),
-                        timestamp: raw.timestamp,
-                        notary_signature: sig,
-                    };
-                    (StatusCode::OK, Json(resp)).into_response()
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("sign: {e}")})),
-                )
-                    .into_response(),
-            }
-        }
-        other => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!("unknown session_type: {other}")
-            })),
-        )
-            .into_response(),
-    }
+    let len = u32::try_from(json.len())
+        .map_err(|_| Error::NotaryServer {
+            detail: format!("attestation frame is too large: {} bytes", json.len()),
+        })?
+        .to_be_bytes();
+    let mut frame = Vec::with_capacity(len.len() + json.len());
+    frame.extend_from_slice(&len);
+    frame.extend_from_slice(&json);
+    Ok(frame)
 }
 
 // ─── ProxyMode WebSocket handler ─────────────────────────────────────────────
 //
 // The browser (prover) connects here as a WebSocket. The notary runs the
 // ProxyMode verifier: it forwards raw TLS bytes between the browser and the
-// target server, verifies the TLS transcript via ZK tags, then receives the
-// prover's reveal request and captures the raw attestation data.
+// target server, authenticates the transcript against the record layer's own
+// tags, then receives the prover's reveal request and captures what the
+// session disclosed.
 
 async fn notarize_proxy_ws_handler(
     ws: WebSocketUpgrade,
-    Query(query): Query<NotarizeQuery>,
     State(state): State<NotaryState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_proxy_notarize(socket, state, query.session_id))
+    let Ok(permit) = Arc::clone(&state.proxy_sessions).try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    ws.on_upgrade(move |socket| handle_ws_proxy_notarize(socket, state, permit))
+        .into_response()
 }
 
 async fn handle_ws_proxy_notarize(
     socket: WebSocket,
     state: NotaryState,
-    session_id: Option<String>,
+    // Held for the connection lifetime; dropping it returns the session slot.
+    _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let (io_a, io_b) = tokio::io::duplex(1 << 17);
     let (mut ws_tx, mut ws_rx) = socket.split();
+    let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
 
-    // Guarded: when this handler returns, the pump is aborted with it —
-    // otherwise a client that keeps the WebSocket open after the session
-    // failed would pin the pump task (and the socket) indefinitely.
-    let _pump_task = AbortOnDrop::new(tokio::spawn(async move {
-        let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
-        let ws_to_pipe = async {
-            while let Some(Ok(msg)) = ws_rx.next().await {
-                match msg {
-                    Message::Binary(data)
-                        if pipe_writer.write_all(&data).await.is_err() =>
+    // Keep inbound and outbound ownership separate. Whichever direction ends
+    // first must not cancel a write already accepted in the other direction.
+    let (attestation_tx, attestation_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    let _inbound_task = AbortOnDrop::new(tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            match msg {
+                Message::Binary(data) if pipe_writer.write_all(&data).await.is_err() => {
+                    break
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    }));
+    let outbound_task = AbortOnDrop::new(tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match pipe_reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if ws_tx
+                        .send(Message::Binary(buf[..n].to_vec().into()))
+                        .await
+                        .is_err()
                     {
-                        break;
-                    }
-                    Message::Close(_) => break,
-                    _ => {}
-                }
-            }
-        };
-        let pipe_to_ws = async {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                match pipe_reader.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if ws_tx
-                            .send(Message::Binary(buf[..n].to_vec().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                        return;
                     }
                 }
             }
-        };
-        tokio::join!(ws_to_pipe, pipe_to_ws);
+        }
+
+        // This message boundary is the handoff: TLSNotary may read ahead
+        // within one WebSocket message, but it cannot consume this later one
+        // before its mux has finished.
+        if let Ok(frame) = attestation_rx.await {
+            let _ = ws_tx.send(Message::Binary(frame.into())).await;
+        }
+        let _ = ws_tx.send(Message::Close(None)).await;
     }));
 
-    let session = run_proxy_verifier_session(io_b, &state, session_id);
-    match tokio::time::timeout(CONNECTION_DEADLINE, session).await {
+    let protocol = async {
+        let result = match run_proxy_verifier_session(io_b, &state).await {
+            Ok(attestation) => attestation_frame(&attestation).and_then(|frame| {
+                attestation_tx.send(frame).map_err(|_| Error::NotaryServer {
+                    detail: "browser disconnected before attestation handoff".into(),
+                })
+            }),
+            Err(error) => {
+                drop(attestation_tx);
+                Err(error)
+            }
+        };
+        if let Err(error) = outbound_task.into_inner().await {
+            error!("ProxyMode WebSocket outbound pump join error: {error}");
+        }
+        result
+    };
+
+    match tokio::time::timeout(CONNECTION_DEADLINE, protocol).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => error!("ProxyMode verifier error: {}", e),
         Err(_) => error!(
@@ -952,8 +464,7 @@ async fn handle_ws_proxy_notarize(
 async fn run_proxy_verifier_session<T>(
     socket: T,
     state: &NotaryState,
-    session_id: Option<String>,
-) -> Result<()>
+) -> Result<AttestationWire>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
@@ -961,13 +472,15 @@ where
     let (driver, mut handle) = session.split();
     // Guarded spawn: every exit path below — each `?`, panics, the caller
     // dropping this future — aborts the driver instead of detaching it.
-    let mut driver_task = AbortOnDrop::new(tokio::spawn(driver));
+    let driver_task = AbortOnDrop::new(tokio::spawn(driver));
 
+    // An inner error means a rejection was sent and the driver must be joined
+    // before returning; an outer error can abort the guarded driver.
     let setup = async {
         let verifier = handle
             .new_verifier(
                 VerifierConfig::builder()
-                    .root_store(libid_tlsn::root_store())
+                    .root_store(state.proxy_root_store.as_ref().clone())
                     .build()
                     .map_err(|e| Error::NotaryServer {
                         detail: format!("verifier config: {e}"),
@@ -993,11 +506,24 @@ where
         let server_name_str = proxy_verifier.config().server_name().as_str().to_string();
         info!("ProxyMode: connecting to {server_name_str}:443");
 
-        let server_tcp = tokio::net::TcpStream::connect(format!("{server_name_str}:443"))
-            .await
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("TCP connect to {server_name_str}: {e}"),
-            })?;
+        let server_addr = state
+            .proxy_server_addr
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| format!("{server_name_str}:443"));
+        let server_tcp = match tokio::net::TcpStream::connect(server_addr).await {
+            Ok(server_tcp) => server_tcp,
+            Err(error) => {
+                let detail = format!("TCP connect to {server_name_str}: {error}");
+                proxy_verifier
+                    .reject(Some("UPSTREAM_CONNECT_FAILED"))
+                    .await
+                    .map_err(|error| Error::NotaryServer {
+                        detail: format!("send connection rejection: {error}"),
+                    })?;
+                handle.close();
+                return Ok(Err(Error::NotaryServer { detail }));
+            }
+        };
 
         let verifier = proxy_verifier
             .accept()
@@ -1041,23 +567,18 @@ where
         })?;
         handle.close();
 
-        Ok((server_name, transcript, transcript_commitments))
+        Ok::<_, Error>(Ok((server_name, transcript, transcript_commitments)))
     };
-    tokio::pin!(setup);
-
-    // Race setup against the driver. The driver only finishes early when the
-    // connection died under the session (e.g. a client that connected and
-    // immediately closed) — a protocol request already submitted to it may
-    // then never resolve, so fail instead of pending forever.
-    let (server_name, transcript, transcript_commitments) = tokio::select! {
-        biased;
-        res = &mut setup => res?,
-        driver_res = driver_task.handle_mut() => {
-            return Err(driver_finished_early(driver_res));
+    let setup_outcome = setup.await?;
+    let (server_name, transcript, transcript_commitments) = match setup_outcome {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = driver_task.into_inner().await;
+            return Err(error);
         }
     };
 
-    driver_task
+    let io = driver_task
         .into_inner()
         .await
         .map_err(|e| Error::NotaryServer {
@@ -1065,20 +586,33 @@ where
         })?
         .map_err(|e| Error::NotaryServer {
             detail: format!("driver: {e}"),
-        })?;
+        })?
+        .into_inner();
+    drop(io);
 
-    // Both sessions reveal authed sent bytes: /token the `client_id=` slice,
-    // /me the request prefix + CRLF end anchor (H1) plus the recv username.
+    // What the prover chose to reveal is not read here and not judged here.
+    // Which ranges a profile expects belongs to the Platform Verifier
+    // (REQ-COMMON-51), and this used to name them -- one endpoint's shape
+    // written into the notary, which is the profile-specific decision
+    // REQ-COMMON-33 forbids it from making.
     let server_name = server_name.ok_or_else(|| Error::NotaryServer {
         detail: "prover did not reveal server name".into(),
     })?;
     let ServerName::Dns(ref dns_name) = server_name;
     let domain = dns_name.as_str().to_string();
 
-    // The digest attests `platform_name`, but the prover picks the server_name
-    // and any WebPKI-valid cert passes. Pin the cert-verified server identity
-    // to the platform, else a prover attests api.x.com from an attacker server.
-    check_server_identity(&domain, &state.platform_name)?;
+    // Which host answered is attested, not restricted. The record carries the
+    // cert-verified server name as `authorityId`, and each Platform Verifier
+    // compares that against the authority its own profile pins -- so an
+    // attestation naming an attacker's server is refused on chain, by the
+    // contract that knows which host the session was supposed to reach.
+    //
+    // Pinning one hostname here would add nothing to that and would cost
+    // something real: GitHub alone needs two authorities (`github.com` for the
+    // exchange, `api.github.com` for the identity session), so a single
+    // platform identity cannot serve even one platform, let alone a notary
+    // shared by X and GitHub. Limiting who may use a public notary is access
+    // control, and belongs where access control lives.
 
     let partial_transcript = transcript;
     if let Some(ref pt) = partial_transcript {
@@ -1093,397 +627,31 @@ where
 
     // ── Extract the single hash commit per session ──
     //
-    // Convention (X hash-commit flow, token-only circuit):
-    //   /token: ONE recv hash commit — bearer-value bytes of the
-    //           `"access_token":"..."` JSON range.
-    //   /me:    ONE sent hash commit — bearer bytes only. Username is
-    //           REVEALED on recv (not committed).
-    //
-    // We extract range positions (start/end) from the commit's RangeSet
-    // and stash them in `RawAttestationData`; the typed attestation digest
-    // is signed on demand by `proxy_attestation_handler` when the browser
-    // fetches `GET /zk/proxy/attestation/{session_id}?session_type=`.
-    let mut sent_bearer: Option<([u8; 32], u32, u32)> = None;
-    let mut recv_commit: Option<([u8; 32], u32, u32)> = None;
-    for commit in &transcript_commitments {
-        let tlsn::transcript::TranscriptCommitment::Hash(plaintext_hash) = commit else {
-            continue;
-        };
-        let value: [u8; 32] =
-            plaintext_hash
-                .hash
-                .value
-                .as_bytes()
-                .try_into()
-                .map_err(|_| Error::NotaryServer {
-                    detail: "hash commitment value is not 32 bytes".into(),
-                })?;
-        let start =
-            u32::try_from(plaintext_hash.idx.min().unwrap_or(0)).map_err(|_| {
-                Error::NotaryServer {
-                    detail: "commit range start exceeds u32".into(),
-                }
-            })?;
-        let total_len =
-            u32::try_from(plaintext_hash.idx.len()).map_err(|_| Error::NotaryServer {
-                detail: "commit range length exceeds u32".into(),
-            })?;
-        let end = start
-            .checked_add(total_len)
-            .ok_or_else(|| Error::NotaryServer {
-                detail: "commit range end overflow".into(),
-            })?;
-        // Reject multiple commits per direction: the browser ZK flow emits
-        // exactly one bearer commit per session (/me: Sent, /token: Recv).
-        // Silently taking the last one would yield a notarized hash that
-        // doesn't match what the prover reveals on-chain, surfacing as an
-        // opaque `bearer_hash` mismatch at the verifier instead of an
-        // actionable notary-side error.
-        match plaintext_hash.direction {
-            tlsn::transcript::Direction::Sent => {
-                if sent_bearer.is_some() {
-                    return Err(Error::NotaryServer {
-                        detail: "unexpected extra Sent hash commit \
-                            (browser ZK flow emits exactly one)"
-                            .into(),
-                    });
-                }
-                sent_bearer = Some((value, start, end));
-            }
-            tlsn::transcript::Direction::Received => {
-                if recv_commit.is_some() {
-                    return Err(Error::NotaryServer {
-                        detail: "unexpected extra Recv hash commit \
-                            (browser ZK flow emits exactly one)"
-                            .into(),
-                    });
-                }
-                recv_commit = Some((value, start, end));
-            }
-        }
-    }
-
-    // `bearer_from_sent` = endpoint shape (/me: Sent header, /token: Recv body).
-    // Used below to bind the sent-range count to the endpoint.
-    let (bearer_hash, bearer_start, bearer_end, bearer_from_sent) =
-        match (sent_bearer, recv_commit) {
-            // /me: sent bearer commit only (username is REVEALED on recv).
-            (Some((bh, bs, be)), None) => (bh, bs, be, true),
-            // /token: recv-only commit (the bearer).
-            (None, Some((rh, rs, re))) => (rh, rs, re, false),
-            _ => {
-                return Err(Error::NotaryServer {
-                    detail: "expected /me (sent-only) or /token (recv-only) commit shape"
-                        .into(),
-                });
-            }
-        };
-
-    // Capture sent + recv revealed bytes SEPARATELY so the on-demand
-    // attestation builder can sign either a TokenAttestation (sent body
-    // with client_id) or a MeAttestation (sent prefix + recv handle chunk).
-    //
-    // SECURITY: enforce a single contiguous sent revealed range. Multiple
-    // ranges would let a prover skip arbitrary middle bytes from the
-    // signed digest while the on-chain prefix/suffix structural check
-    // still passes.
-    // /token reveals exactly 1 sent range (client_id substring). /me reveals
-    // exactly 2 sent ranges: the request prefix ending in `authorization:
-    // Bearer ` AND the 2-byte CRLF after the bearer (H1 end anchor). Anything
-    // else is rejected here so a malformed prover cannot smuggle skipped
-    // middle bytes.
-    let mut sent_revealed: Vec<u8> = Vec::new();
-    let mut recv_revealed: Vec<u8> = Vec::new();
-    let mut sent_prefix_end: u32 = 0;
-    let mut sent_suffix_end: u32 = 0;
-    if let Some(ref pt) = partial_transcript {
-        let sent = pt.sent_unsafe();
-        let recv = pt.received_unsafe();
-        let sent_ranges: Vec<_> = pt.sent_authed().iter().collect();
-        // Range count is tied to the endpoint shape: /token reveals exactly 1
-        // sent range (client_id); /me reveals exactly 2 (prefix + CRLF anchor).
-        match (bearer_from_sent, sent_ranges.len()) {
-            // /token: single client_id range.
-            (false, 1) => {
-                let r = &sent_ranges[0];
-                sent_revealed.extend_from_slice(&sent[r.clone()]);
-                sent_prefix_end =
-                    u32::try_from(r.end).map_err(|_| Error::NotaryServer {
-                        detail: "revealed range end exceeds u32".into(),
-                    })?;
-            }
-            // /me: prefix range + 2-byte CRLF end anchor (H1).
-            (true, 2) => {
-                let r0 = &sent_ranges[0];
-                let r1 = &sent_ranges[1];
-                sent_revealed.extend_from_slice(&sent[r0.clone()]);
-                sent_revealed.extend_from_slice(&sent[r1.clone()]);
-                sent_prefix_end =
-                    u32::try_from(r0.end).map_err(|_| Error::NotaryServer {
-                        detail: "revealed range end exceeds u32".into(),
-                    })?;
-                sent_suffix_end =
-                    u32::try_from(r1.end).map_err(|_| Error::NotaryServer {
-                        detail: "revealed range end exceeds u32".into(),
-                    })?;
-            }
-            (false, n) => {
-                return Err(Error::NotaryServer {
-                    detail: format!("/token expects 1 sent revealed range, got {n}"),
-                });
-            }
-            (true, n) => {
-                return Err(Error::NotaryServer {
-                    detail: format!("/me expects 2 sent revealed ranges, got {n}"),
-                });
-            }
-        }
-        for range in pt.received_authed().iter() {
-            recv_revealed.extend_from_slice(&recv[range.clone()]);
-        }
-    }
-
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let raw_attest = RawAttestationData {
-        bearer_hash,
-        bearer_range_start: bearer_start,
-        bearer_range_end: bearer_end,
-        sent_revealed,
-        sent_prefix_end,
-        sent_suffix_end,
-        recv_revealed,
-        timestamp,
+    // Keep the session's own output rather than flattening it. Which ranges a
+    // profile expects, and what their bytes must contain, is the Platform
+    // Verifier's business (REQ-COMMON-51); the notary answers only for what it
+    // observed. The range-count rules that used to live here encoded one
+    // endpoint's shape into the notary, which is exactly the profile-specific
+    // decision REQ-COMMON-33 forbids it from making.
+    let Some(partial) = partial_transcript else {
+        return Err(Error::NotaryServer {
+            detail: "session revealed no transcript".into(),
+        });
     };
 
-    if let Some(ref sid) = session_id {
-        let notify = {
-            let mut sessions = state.sessions.write().await;
-            match sessions.get_mut(sid) {
-                Some(entry) => {
-                    entry.raw_attest = Some(raw_attest);
-                    info!("ProxyMode: stored raw attestation data for session {sid}");
-                    Some(entry.ready.clone())
-                }
-                None => {
-                    warn!(
-                        "ProxyMode: session {sid} gone before raw attestation could be stored (evicted/abandoned) — proof dropped"
-                    );
-                    None
-                }
-            }
-        };
-        if let Some(n) = notify {
-            n.notify_one();
-        }
-    }
-
-    info!("ProxyMode: hash-commit attestation built for {domain}");
-    Ok(())
-}
-
-// ─── WebSocket proxy ─────────────────────────────────────────────────────────
-//
-// Forwards browser WebSocket connections to a remote HTTPS/TLS server.
-// tlsn-js sends raw TLS bytes over this proxy to reach the platform API.
-// Query: ?token=<hostname>  (e.g. ?token=api.x.com)
-
-#[derive(Deserialize)]
-struct ProxyQuery {
-    token: Option<String>,
-}
-
-async fn ws_proxy_handler(
-    ws: WebSocketUpgrade,
-    Query(query): Query<ProxyQuery>,
-    State(state): State<NotaryState>,
-) -> impl IntoResponse {
-    let host = query.token.unwrap_or_else(|| state.platform_name.clone());
-    ws.on_upgrade(move |socket| proxy_ws_to_tcp(socket, host))
-}
-
-async fn proxy_ws_to_tcp(socket: WebSocket, host: String) {
-    let addr = format!("{host}:443");
-    let tcp = match tokio::net::TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Proxy: failed to connect to {}: {}", addr, e);
-            return;
-        }
-    };
-
-    info!("Proxy: forwarding WS ↔ TCP to {}", addr);
-
-    let (mut ws_tx, mut ws_rx) = socket.split();
-    let (mut tcp_rx, mut tcp_tx) = tokio::io::split(tcp);
-
-    let ws_to_tcp = async {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                Message::Binary(data) if tcp_tx.write_all(&data).await.is_err() => {
-                    break;
-                }
-                Message::Close(_) => break,
-                _ => {}
-            }
-        }
-    };
-
-    let tcp_to_ws = async {
-        let mut buf = vec![0u8; 65536];
-        loop {
-            match tcp_rx.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if ws_tx
-                        .send(Message::Binary(buf[..n].to_vec().into()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    };
-
-    tokio::join!(ws_to_tcp, tcp_to_ws);
-    info!("Proxy: connection to {} closed", addr);
-}
-
-// ─── WebSocket handlers ──────────────────────────────────────────────────────
-
-async fn notarize_ws_handler(
-    ws: WebSocketUpgrade,
-    Query(query): Query<NotarizeQuery>,
-    State(state): State<NotaryState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_prover(socket, state, query.session_id))
-}
-
-/// Legacy `/notary` endpoint (for the old Rust TCP-over-WS path).
-async fn notary_legacy_ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<NotaryState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_prover(socket, state, None))
-}
-
-async fn handle_ws_prover(
-    socket: WebSocket,
-    state: NotaryState,
-    session_id: Option<String>,
-) {
-    let (io_a, io_b) = tokio::io::duplex(1 << 17); // 128 KB buffer
-
-    let (mut ws_tx, mut ws_rx) = socket.split();
-
-    // Guarded: when this handler returns, the pump is aborted with it —
-    // otherwise a client that keeps the WebSocket open after the session
-    // failed would pin the pump task (and the socket) indefinitely.
-    let _pump_task = AbortOnDrop::new(tokio::spawn(async move {
-        let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
-
-        let ws_to_pipe = async {
-            while let Some(Ok(msg)) = ws_rx.next().await {
-                match msg {
-                    Message::Binary(data)
-                        if pipe_writer.write_all(&data).await.is_err() =>
-                    {
-                        break;
-                    }
-                    Message::Close(_) => break,
-                    _ => {}
-                }
-            }
-        };
-
-        let pipe_to_ws = async {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                match pipe_reader.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if ws_tx
-                            .send(Message::Binary(buf[..n].to_vec().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-        };
-
-        tokio::join!(ws_to_pipe, pipe_to_ws);
-    }));
-
-    let session = handle_notary_session(io_b, &state, session_id);
-    match tokio::time::timeout(CONNECTION_DEADLINE, session).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("WS notary handler error: {}", e),
-        Err(_) => error!(
-            "WS notary session exceeded the {}s connection deadline; aborting",
-            CONNECTION_DEADLINE.as_secs()
-        ),
-    }
-}
-
-// ─── tlsn attestation signing ────────────────────────────────────────────────
-//
-// tlsn's `Signer` trait is NOT ours to change — it lives in the pinned tlsn
-// crate and is synchronous, while KMS signing is a network call. Rather than
-// bridge sync→async inside the trait (runtime hacks), the sign step is lifted
-// OUT of tlsn entirely:
-//
-//   1. `build()` runs with a capture-only signer: pure computation, no IO.
-//      It records the serialized attestation header — the exact bytes tlsn
-//      would have signed — and returns a placeholder signature.
-//   2. The real signature is produced by an ordinary `.await` on
-//      ManagedSigner, in the async handler.
-//   3. `Attestation`'s fields are public; the placeholder is replaced.
-//
-// This is sound because the header does not depend on the signature (it is
-// id + version + body root), and the verifying key embedded in the body is
-// the REAL key — the capture signer reports it truthfully. The format matches
-// tlsn's own `Secp256k1EthSigner`: keccak256 the message, sign the bare
-// digest, 65 bytes r || s || v with v ∈ {27, 28}.
-
-/// Captures the header bytes `AttestationBuilder::build` asks it to sign.
-struct HeaderCaptureSigner {
-    /// Real compressed public key — embedded in the attestation body, so it
-    /// must be truthful even though this signer never really signs.
-    public_key: [u8; 33],
-    /// The serialized header, recorded for the async signer.
-    captured: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
-}
-
-impl TlsnSigner for HeaderCaptureSigner {
-    fn alg_id(&self) -> SignatureAlgId {
-        SignatureAlgId::SECP256K1ETH
-    }
-
-    fn sign(&self, msg: &[u8]) -> std::result::Result<TlsnSignature, TlsnSignatureError> {
-        *self.captured.lock().expect("capture mutex") = Some(msg.to_vec());
-        // Placeholder, overwritten immediately after build(). 65 zero bytes is
-        // structurally a signature but can never verify — if a bug ever ships
-        // it, verification fails loudly rather than accepting a forgery.
-        Ok(TlsnSignature {
-            alg: SignatureAlgId::SECP256K1ETH,
-            data: vec![0u8; 65],
-        })
-    }
-
-    fn verifying_key(&self) -> TlsnVerifyingKey {
-        TlsnVerifyingKey {
-            alg: KeyAlgId::K256,
-            data: self.public_key.to_vec(),
-        }
-    }
+    let attestation = sign_ceremony_attestation(
+        &state.signer,
+        &partial,
+        dns_name.as_str(),
+        &transcript_commitments,
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .await?;
+    info!("ProxyMode: ceremony attestation ready for {domain}");
+    Ok(attestation)
 }
 
 // ─── Core notary logic (transport-agnostic) ─────────────────────────────────
@@ -1495,28 +663,31 @@ where
 {
     // Deadline on the WHOLE connection, not any single step: no TCP client —
     // however broken — may pin this handler task past [`CONNECTION_DEADLINE`].
-    tokio::time::timeout(
-        CONNECTION_DEADLINE,
-        handle_notary_session(socket, state, None),
-    )
-    .await
-    .map_err(|_| Error::NotaryServer {
-        detail: format!(
-            "connection exceeded the {}s deadline",
-            CONNECTION_DEADLINE.as_secs()
-        ),
-    })?
+    tokio::time::timeout(CONNECTION_DEADLINE, handle_notary_session(socket, state))
+        .await
+        .map_err(|_| Error::NotaryServer {
+            detail: format!(
+                "connection exceeded the {}s deadline",
+                CONNECTION_DEADLINE.as_secs()
+            ),
+        })?
 }
 
-async fn handle_notary_session<T>(
-    socket: T,
-    state: &NotaryState,
-    session_id: Option<String>,
-) -> Result<()>
+async fn handle_notary_session<T>(socket: T, state: &NotaryState) -> Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
 {
     let result = libid_tlsn::verifier(socket).await?;
+    handle_verified_session(result, state).await
+}
+
+async fn handle_verified_session<T>(
+    result: libid_tlsn::VerifierResult<T>,
+    state: &NotaryState,
+) -> Result<()>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+{
     let transcript = &result.partial_transcript;
     let sent = transcript.sent_unsafe();
     let recv = transcript.received_unsafe();
@@ -1530,432 +701,505 @@ where
     let domain = dns_name.as_str().to_string();
     info!("Domain from SNI: {}", domain);
 
-    // ── JWKS duty dispatch ──
-    //
-    // Same listener, same MPC-TLS verification, same signing identity: a
-    // session whose TLS-cert-verified server name is the JWKS host is a
-    // notarized JWKS reading. Its wire response is a signed
-    // `JwksRotationProof` (no attestation-request round trip — the JWKS
-    // prover protocol ends with the verifier's response).
-    if state.jwks_enabled && domain.eq_ignore_ascii_case(jwks::JWKS_DOMAIN) {
-        let handshake = libid_tlsn::extract_handshake_data(&result.tls_transcript)?;
-        let response =
-            jwks::build_rotation_response(sent, recv, &handshake, &state.signer).await?;
-        let mut io = result.recovered_io;
-        write_msg(&mut io, &response).await?;
-        info!("JWKS rotation proof sent to prover");
-        return Ok(());
-    }
+    // The ceremony record is transport-agnostic and session-agnostic. It is
+    // built from what the session revealed, the server the notary
+    // authenticated, the commitments over the rest, and the notary's own clock
+    // -- an MPC-TLS session produces all four exactly as a ProxyMode one does,
+    // and the keeper's JWKS reading exactly as a platform session does. This
+    // used to dispatch on the server name and answer `www.googleapis.com` with
+    // a Merkle proof of its own shape; that was the notary deciding what a
+    // session was for, which is the profile-specific decision REQ-COMMON-33
+    // forbids it from making. The record names the host; the contract that
+    // reads the record decides whether it wanted that host.
+    let ceremony_attestation = sign_ceremony_attestation(
+        &state.signer,
+        &result.partial_transcript,
+        &domain,
+        &result.transcript_commitments,
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .await?;
 
     let mut io = result.recovered_io;
-    let att_request: Request = read_msg(&mut io).await?;
-    info!("Received attestation request from prover");
-
-    // See the "tlsn attestation signing" section: build() runs with a
-    // capture-only signer, then the real (possibly KMS) signature is applied
-    // with an ordinary await — no sync-over-async bridging.
-    let captured_header: Arc<std::sync::Mutex<Option<Vec<u8>>>> = Arc::default();
-    let mut provider = CryptoProvider::default();
-    provider.signer.set_signer(Box::new(HeaderCaptureSigner {
-        public_key: state.signer.compressed_public_key(),
-        captured: Arc::clone(&captured_header),
-    }));
-
-    let mut att_config = AttestationConfig::builder();
-    att_config.supported_signature_algs(vec![SignatureAlgId::SECP256K1ETH]);
-    let att_config = att_config.build().map_err(|e| Error::NotaryServer {
-        detail: format!("attestation config: {e}"),
-    })?;
-
-    let tls_tx = &result.tls_transcript;
-    let sent_len = u32::try_from(sent.len()).map_err(|_| Error::NotaryServer {
-        detail: "sent transcript too large for u32".into(),
-    })?;
-    let recv_len = u32::try_from(recv.len()).map_err(|_| Error::NotaryServer {
-        detail: "recv transcript too large for u32".into(),
-    })?;
-
-    let mut att_builder = Attestation::builder(&att_config)
-        .accept_request(att_request)
-        .map_err(|e| Error::NotaryServer {
-            detail: format!("accept attestation request: {e}"),
-        })?;
-    att_builder
-        .connection_info(ConnectionInfo {
-            time: tls_tx.time(),
-            version: *tls_tx.version(),
-            transcript_length: TranscriptLength {
-                sent: sent_len,
-                received: recv_len,
-            },
-        })
-        .server_ephemeral_key(tls_tx.server_ephemeral_key().clone())
-        .transcript_commitments(result.transcript_commitments);
-
-    let mut attestation =
-        att_builder
-            .build(&provider)
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("attestation build: {e}"),
-            })?;
-
-    // Sign the captured header for real — an actual async call, KMS or local.
-    let header_bytes = captured_header
-        .lock()
-        .expect("capture mutex")
-        .take()
-        .ok_or_else(|| Error::NotaryServer {
-            detail: "attestation build never requested a signature".into(),
-        })?;
-    let digest = keccak256(&header_bytes);
-    attestation.signature = TlsnSignature {
-        alg: SignatureAlgId::SECP256K1ETH,
-        data: state.signer.sign_prehash(&digest).await?,
-    };
-    let attestation_bytes = serde_json::to_vec(&attestation)?;
-    info!("Attestation built");
-
-    let handshake = libid_tlsn::extract_handshake_data(tls_tx)?;
-
-    let request_line = &sent[find_request_line_range(sent)];
-    let request_line_str =
-        std::str::from_utf8(request_line).map_err(|e| Error::MalformedRequestLine {
-            detail: format!("not valid UTF-8: {e}"),
-        })?;
-    let (method_path, _version) =
-        request_line_str
-            .rsplit_once(' ')
-            .ok_or_else(|| Error::MalformedRequestLine {
-                detail: "missing HTTP version".into(),
-            })?;
-    let request_path = method_path
-        .split_once(' ')
-        .map_or(method_path, |(_, path)| path);
-    info!("Endpoint from transcript: {}", request_path);
-
-    let mut leaves = vec![
-        double_hash_leaf("domain:", domain.as_bytes()),
-        double_hash_leaf("endpoint:", request_path.as_bytes()),
-    ];
-    let recv_authed = transcript.received_authed();
-    let recv_data = transcript.received_unsafe();
-    let mut recv_segments: Vec<Vec<u8>> = Vec::new();
-    for range in recv_authed.iter() {
-        let segment = &recv_data[range.clone()];
-        leaves.push(double_hash_leaf("recv:", segment));
-        recv_segments.push(segment.to_vec());
-    }
-
-    let transcript_root = libid_crypto::build_merkle_tree(&leaves);
-
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let notary_digest = compute_notary_digest(
-        state.chain_id,
-        &state.mpc_verifying_contract,
-        &domain,
-        &handshake.client_random,
-        &handshake.server_random,
-        &handshake.server_ephemeral_key,
-        &transcript_root,
-        timestamp,
-    );
-    let notary_signature = state.signer.sign_claim(&notary_digest).await?;
-
-    let evm_proof = EvmProof {
-        domain: domain.clone(),
-        endpoint: request_path.to_string(),
-        client_random: handshake.client_random,
-        server_random: handshake.server_random,
-        server_ephemeral_key: handshake.server_ephemeral_key,
-        transcript_root,
-        leaves,
-        timestamp,
-        notary_signature,
-        recv_segments,
-        explicit_nonce: Vec::new(),
-        app_ciphertext: Vec::new(),
-    };
-
-    let notary_response = NotaryResponse {
-        attestation: attestation_bytes,
-        evm_proof,
-    };
-
-    // Store EVM proof for browser retrieval via REST if sessionId is provided
-    if let Some(ref sid) = session_id {
-        let notify = {
-            let mut sessions = state.sessions.write().await;
-            match sessions.get_mut(sid) {
-                Some(entry) => {
-                    entry.evm_proof_result = Some(notary_response.clone());
-                    info!("Stored EVM proof for session {}", sid);
-                    Some(entry.ready.clone())
-                }
-                None => {
-                    warn!(
-                        "session {sid} gone before EVM proof could be stored (evicted/abandoned) — proof dropped"
-                    );
-                    None
-                }
-            }
-        };
-        if let Some(n) = notify {
-            n.notify_one();
-        }
-    }
-
-    // For TCP/legacy connections: send over the wire (Rust client protocol)
-    write_msg(&mut io, &notary_response).await?;
-    info!("NotaryResponse sent to prover");
+    write_msg(&mut io, &ceremony_attestation).await?;
+    info!("Ceremony attestation sent to prover");
 
     Ok(())
 }
 
-/// Test-only helper: run one ProxyMode verifier session over `socket`
-/// and return the captured `RawAttestationData`. Caller is responsible
-/// for signing the typed token or /me attestation digest via
-/// `libid_attestations::compute_*_attest_digest`.
-///
-/// The browser path runs this implicitly via the `/notarize-proxy` WS
-/// handler + `GET /zk/proxy/attestation/{sid}` HTTP fetch; this helper
-/// short-circuits both for in-process e2e tests.
-#[doc(hidden)]
-pub async fn run_proxy_verifier_for_test<T>(
-    socket: T,
-    signer: Arc<ManagedSigner>,
-    chain_id: u64,
-    zk_verifying_contract: [u8; 20],
-    mpc_verifying_contract: [u8; 20],
-    platform_name: String,
-) -> Result<RawAttestationData>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-{
-    let state = NotaryState {
-        signer,
-        sessions: Arc::new(RwLock::new(HashMap::new())),
-        max_sessions: 1024,
-        public_key_hex: String::new(),
-        chain_id,
-        zk_verifying_contract,
-        mpc_verifying_contract,
-        platform_name,
-        jwks_enabled: false,
-    };
-    let session_id = "test-session".to_string();
-    {
-        let mut sessions = state.sessions.write().await;
-        sessions.insert(session_id.clone(), SessionEntry::default());
-    }
-    run_proxy_verifier_session(socket, &state, Some(session_id.clone())).await?;
-    let sessions = state.sessions.read().await;
-    let entry = sessions
-        .get(&session_id)
-        .ok_or_else(|| Error::NotaryServer {
-            detail: "session entry missing".into(),
-        })?;
-    entry.raw_attest.clone().ok_or_else(|| Error::NotaryServer {
-        detail: "raw attestation not populated".into(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::check_server_identity;
-
-    /// Pins the lifted-out attestation signing (HeaderCaptureSigner +
-    /// ManagedSigner::sign_prehash) byte-identical to tlsn's own
-    /// Secp256k1EthSigner. Both sides use RFC 6979 deterministic ECDSA, so
-    /// equal inputs MUST give equal signatures — any divergence in hashing,
-    /// s-normalisation or v encoding fails this test instead of surfacing as
-    /// attestations the prover rejects.
     #[tokio::test]
-    async fn lifted_signing_matches_tlsn_secp256k1eth_signer() {
-        use libid_signer::SignerSource;
-        use tlsn::attestation::signing::{
-            Secp256k1EthSigner,
-            Signer as _,
+    async fn attestation_is_one_length_prefixed_frame_then_eof() {
+        use libid_transcript::read_msg;
+        use tokio::io::AsyncReadExt;
+
+        use super::{
+            attestation_frame,
+            AttestationWire,
         };
 
-        // anvil #0 — public test key.
-        let key_hex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        let key_bytes = hex::decode(key_hex).unwrap();
+        let frame = attestation_frame(&AttestationWire {
+            attested_data: vec![1, 2, 3],
+            notary_signature: vec![4; 65],
+        })
+        .unwrap();
+        let mut browser = frame.as_slice();
 
-        let tlsn_signer = Secp256k1EthSigner::new(&key_bytes).unwrap();
-        let managed = SignerSource::from_spec(key_hex)
+        let frame: serde_json::Value = read_msg(&mut browser).await.unwrap();
+        assert_eq!(frame["attested_data"], serde_json::json!([1, 2, 3]));
+        assert_eq!(frame["notary_signature"].as_array().unwrap().len(), 65);
+        assert_eq!(browser.read(&mut [0]).await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mpc_protocol_returns_attestation_on_the_recovered_socket() {
+        use std::{
+            sync::Arc,
+            time::Duration,
+        };
+
+        use libid_signer::SignerSource;
+        use libid_transcript::read_msg;
+        use tlsn::{
+            config::verifier::VerifierConfig,
+            verifier::{
+                VerifierCommitStart,
+                VerifierOutput,
+            },
+            webpki::{
+                CertificateDer,
+                RootCertStore,
+            },
+            Session,
+        };
+        use tlsn_sdk_core::{
+            HttpRequest,
+            ProverConfig,
+            Reveal,
+            SdkProver,
+        };
+        use tlsn_server_fixture_certs::{
+            CA_CERT_DER,
+            SERVER_DOMAIN,
+        };
+        use tokio::io::AsyncReadExt;
+        use tokio_util::compat::{
+            FuturesAsyncReadCompatExt,
+            TokioAsyncReadCompatExt,
+        };
+
+        use super::{
+            handle_verified_session,
+            AttestationWire,
+            NotaryState,
+        };
+
+        const TEST_KEY: &str =
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+        let signer = SignerSource::from_spec(TEST_KEY)
             .unwrap()
             .build_managed(None)
             .await
             .unwrap();
-
-        // Arbitrary "serialized header" bytes of various shapes.
-        for msg in [&b"header"[..], &[0u8; 97], &[0xFF; 32]] {
-            let reference = tlsn_signer.sign(msg).expect("tlsn sign");
-            let digest = libid_crypto::keccak256(msg);
-            let lifted = managed.sign_prehash(&digest).await.expect("managed sign");
-            assert_eq!(reference.data, lifted, "msg {msg:02x?}");
-            // And the verifying key the capture signer embeds matches tlsn's.
-            assert_eq!(
-                tlsn_signer.verifying_key().data,
-                managed.compressed_public_key().to_vec()
-            );
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn session_cap_rejects_when_full_then_reclaims_stale() {
-        use tokio::time::Duration;
-
-        use super::{
-            admit_session,
-            SessionEntry,
-            SESSION_TTL,
+        let expected_pubkey = signer.compressed_public_key().to_vec();
+        let state = NotaryState {
+            signer: Arc::new(signer),
+            proxy_sessions: Arc::new(tokio::sync::Semaphore::new(1)),
+            proxy_root_store: Arc::new(libid_tlsn::root_store()),
+            proxy_server_addr: None,
+            public_key_hex: String::new(),
         };
 
-        const MAX: usize = 3;
-        let mut map = std::collections::HashMap::new();
-        for i in 0..MAX {
-            map.insert(format!("s{i}"), SessionEntry::default());
-        }
-        // Full of LIVE sessions → a new session is rejected (burst bound).
-        assert!(
-            !admit_session(&mut map, MAX),
-            "cap must reject when full of live sessions"
-        );
-        assert_eq!(map.len(), MAX);
+        let (prover_io, notary_io) = tokio::io::duplex(2 << 23);
+        let (target_io, fixture_io) = tokio::io::duplex(1 << 17);
+        let fixture_task = tokio::spawn(async move {
+            tlsn_server_fixture::bind(fixture_io.compat())
+                .await
+                .unwrap();
+        });
 
-        // Age every entry past the TTL → the at-capacity path reclaims them
-        // inline → the next session is admitted again.
-        tokio::time::advance(SESSION_TTL + Duration::from_secs(1)).await;
-        assert!(
-            admit_session(&mut map, MAX),
-            "stale entries reclaimed at capacity → admit"
-        );
-        assert!(map.is_empty(), "all stale entries evicted");
-    }
+        let notary_task = tokio::spawn(async move {
+            let session = Session::new(notary_io.compat());
+            let (driver, mut handle) = session.split();
+            let driver_task = tokio::spawn(driver);
+            let verifier = handle
+                .new_verifier(
+                    VerifierConfig::builder()
+                        .root_store(RootCertStore {
+                            roots: vec![CertificateDer(CA_CERT_DER.to_vec())],
+                        })
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
+            let verifier = verifier.commit().await.unwrap();
+            let VerifierCommitStart::Mpc(verifier) = verifier else {
+                panic!("expected MPC mode");
+            };
+            let verifier = verifier.accept().await.unwrap().run().await.unwrap();
+            let tls_transcript = verifier.tls_transcript().clone();
+            let (output, verifier) =
+                verifier.verify().await.unwrap().accept().await.unwrap();
+            verifier.close().await.unwrap();
+            handle.close();
 
-    #[tokio::test(start_paused = true)]
-    async fn sweep_evicts_stale_sessions_by_monotonic_age() {
-        use std::sync::Arc;
-
-        use tokio::{
-            sync::RwLock,
-            time::Duration,
-        };
-
-        use super::{
-            sweep_stale_sessions,
-            RawAttestationData,
-            SessionEntry,
-            SESSION_TTL,
-        };
-
-        let sessions = Arc::new(RwLock::new(std::collections::HashMap::new()));
-        // Two entries at T=0: one abandoned (no result), one that produced an
-        // attestation but was never fetched. BOTH must be bounded by the TTL —
-        // a produced-but-unfetched entry retained forever is the memory DoS.
-        {
-            let mut m = sessions.write().await;
-            m.insert("abandoned".to_string(), SessionEntry::default());
-            m.insert(
-                "produced".to_string(),
-                SessionEntry {
-                    raw_attest: Some(RawAttestationData::default()),
-                    ..SessionEntry::default()
+            let VerifierOutput {
+                server_name,
+                transcript,
+                transcript_commitments,
+                ..
+            } = output;
+            let recovered_io = driver_task.await.unwrap().unwrap().into_inner();
+            handle_verified_session(
+                libid_tlsn::VerifierResult {
+                    partial_transcript: transcript.unwrap(),
+                    server_name: server_name.unwrap(),
+                    tls_transcript,
+                    transcript_commitments,
+                    recovered_io,
                 },
+                &state,
+            )
+            .await
+            .unwrap();
+        });
+
+        let protocol = async {
+            let mut prover = SdkProver::new(
+                ProverConfig::builder(SERVER_DOMAIN)
+                    .root_certs(vec![CA_CERT_DER.to_vec()])
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+            prover.setup(prover_io.compat()).await.unwrap();
+            let response = prover
+                .send_request_mpc(
+                    target_io.compat(),
+                    HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
+                        .header("Host", SERVER_DOMAIN)
+                        .header("Connection", "close"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+
+            let transcript = prover.transcript().unwrap();
+            prover
+                .reveal(
+                    Reveal::new()
+                        .sent(0..transcript.sent.len())
+                        .recv(0..transcript.recv.len())
+                        .server_identity(true),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let mut io = prover.finish().await.unwrap().compat();
+            let attestation: AttestationWire = read_msg(&mut io).await.unwrap();
+            assert_eq!(
+                &attestation.attested_data[..32],
+                &libid_crypto::keccak256(SERVER_DOMAIN.as_bytes())
             );
-        }
+            let recovered = libid_crypto::recover_eth_claim(
+                &attestation.notary_signature,
+                &libid_crypto::keccak256(&attestation.attested_data),
+            )
+            .unwrap();
+            assert_eq!(recovered.to_encoded_point(true).as_bytes(), expected_pubkey);
+            assert_eq!(io.read(&mut [0]).await.unwrap(), 0);
+        };
 
-        // Advance a monotonic clock past the TTL, then add a fresh entry.
-        tokio::time::advance(SESSION_TTL + Duration::from_secs(60)).await;
-        {
-            let mut m = sessions.write().await;
-            m.insert("fresh".to_string(), SessionEntry::default());
-        }
-
-        let evicted = sweep_stale_sessions(&sessions).await;
-        assert_eq!(
-            evicted, 2,
-            "both stale entries evicted regardless of result"
-        );
-        let m = sessions.read().await;
-        assert!(m.contains_key("fresh"), "young entry kept");
-        assert!(
-            !m.contains_key("abandoned"),
-            "abandoned stale entry evicted"
-        );
-        assert!(
-            !m.contains_key("produced"),
-            "produced-but-unfetched entry is still bounded by the TTL"
-        );
+        tokio::time::timeout(Duration::from_secs(60), protocol)
+            .await
+            .expect("local MPC smoke timed out");
+        notary_task.await.unwrap();
+        fixture_task.await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn sweep_wakes_waiters_on_eviction() {
-        use std::sync::Arc;
-
-        use tokio::{
-            sync::RwLock,
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_protocol_returns_attestation_on_the_reclaimed_websocket() {
+        use std::{
+            sync::Arc,
             time::Duration,
         };
 
+        use axum::{
+            routing::get,
+            Router,
+        };
+        use futures_util::{
+            SinkExt,
+            StreamExt,
+        };
+        use libid_signer::SignerSource;
+        use libid_transcript::read_msg;
+        use tlsn_sdk_core::{
+            HttpRequest,
+            ProverConfig,
+            ProverMode,
+            Reveal,
+            SdkProver,
+        };
+        use tlsn_server_fixture_certs::{
+            CA_CERT_DER,
+            SERVER_DOMAIN,
+        };
+        use tokio::{
+            io::{
+                AsyncReadExt,
+                AsyncWriteExt,
+            },
+            net::TcpListener,
+            sync::{
+                mpsc,
+                Semaphore,
+            },
+        };
+        use tokio_tungstenite::{
+            connect_async,
+            tungstenite::Message as WsMessage,
+        };
+        use tokio_util::compat::{
+            FuturesAsyncReadCompatExt,
+            TokioAsyncReadCompatExt,
+        };
+
         use super::{
-            sweep_stale_sessions,
-            SessionEntry,
-            SESSION_TTL,
+            notarize_proxy_ws_handler,
+            NotaryState,
         };
 
-        let sessions = Arc::new(RwLock::new(std::collections::HashMap::new()));
-        let ready = {
-            let mut m = sessions.write().await;
-            let entry = SessionEntry::default();
-            let ready = entry.ready.clone();
-            m.insert("stale".to_string(), entry);
-            ready
-        };
+        const TEST_KEY: &str =
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
-        // A handler is blocked on this session's readiness.
-        let waiter = tokio::spawn(async move { ready.notified().await });
-        tokio::task::yield_now().await; // let the waiter register on the Notify
+        let prover_config = ProverConfig::builder(SERVER_DOMAIN)
+            .mode(ProverMode::Proxy)
+            .root_certs(vec![CA_CERT_DER.to_vec()])
+            .build()
+            .unwrap();
 
-        tokio::time::advance(SESSION_TTL + Duration::from_secs(60)).await;
-        let evicted = sweep_stale_sessions(&sessions).await;
-        assert_eq!(evicted, 1);
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_task = tokio::spawn(async move {
+            let (socket, _) = target_listener.accept().await.unwrap();
+            tlsn_server_fixture::bind(socket.compat()).await.unwrap();
+        });
 
-        // Eviction woke the waiter — it completes instead of sleeping to timeout.
-        tokio::time::timeout(Duration::from_secs(1), waiter)
+        let signer = SignerSource::from_spec(TEST_KEY)
+            .unwrap()
+            .build_managed(None)
             .await
-            .expect("eviction should wake the blocked waiter")
-            .expect("waiter task panicked");
-    }
+            .unwrap();
+        let expected_pubkey = signer.compressed_public_key().to_vec();
+        let state = NotaryState {
+            signer: Arc::new(signer),
+            proxy_sessions: Arc::new(Semaphore::new(1)),
+            proxy_root_store: Arc::new(prover_config.root_store.clone()),
+            proxy_server_addr: Some(target_addr),
+            public_key_hex: String::new(),
+        };
+        let notary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let notary_addr = notary_listener.local_addr().unwrap();
+        let notary_task = tokio::spawn(async move {
+            axum::serve(
+                notary_listener,
+                Router::new()
+                    .route("/notarize-proxy", get(notarize_proxy_ws_handler))
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
 
-    #[test]
-    fn server_identity_accepts_exact_platform() {
-        assert!(check_server_identity("api.x.com", "api.x.com").is_ok());
-    }
+        let (websocket, _) = connect_async(format!("ws://{notary_addr}/notarize-proxy"))
+            .await
+            .unwrap();
+        let (mut ws_tx, mut ws_rx) = websocket.split();
+        let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+        let pump_task = tokio::spawn(async move {
+            let (mut pipe_reader, mut pipe_writer) = tokio::io::split(pump_io);
+            let ws_to_pipe = async {
+                while let Some(message) = ws_rx.next().await {
+                    match message.unwrap() {
+                        WsMessage::Binary(data) => {
+                            frame_tx.send(data.to_vec()).unwrap();
+                            pipe_writer.write_all(&data).await.unwrap();
+                        }
+                        WsMessage::Close(_) => {
+                            pipe_writer.shutdown().await.unwrap();
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            let pipe_to_ws = async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match pipe_reader.read(&mut buf).await.unwrap() {
+                        0 => break,
+                        n => ws_tx
+                            .send(WsMessage::Binary(buf[..n].to_vec().into()))
+                            .await
+                            .unwrap(),
+                    }
+                }
+            };
+            tokio::select! {
+                _ = ws_to_pipe => {}
+                _ = pipe_to_ws => {}
+            }
+        });
 
-    #[test]
-    fn server_identity_accepts_case_insensitive() {
-        // DNS names are case-insensitive; a cert SAN may differ in case.
-        assert!(check_server_identity("API.X.COM", "api.x.com").is_ok());
-    }
+        let protocol = async {
+            let mut prover = SdkProver::new(prover_config.clone()).unwrap();
+            prover.setup(browser_io.compat()).await.unwrap();
+            let response = prover
+                .send_request_proxy(
+                    HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
+                        .header("Host", SERVER_DOMAIN)
+                        .header("Connection", "close"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
 
-    #[test]
-    fn server_identity_rejects_attacker_host() {
-        // Core of the critical fix: a WebPKI-valid attacker server must not be
-        // attested as the configured platform.
-        assert!(check_server_identity("evil.example", "api.x.com").is_err());
-    }
+            let transcript = prover.transcript().unwrap();
+            prover
+                .reveal(
+                    Reveal::new()
+                        .sent(0..transcript.sent.len())
+                        .recv(0..transcript.recv.len())
+                        .server_identity(true),
+                    None,
+                )
+                .await
+                .unwrap();
 
-    #[test]
-    fn server_identity_rejects_subdomain_lookalike() {
-        // No suffix/substring leniency: only an exact (case-insensitive) match.
-        assert!(check_server_identity("api.x.com.evil.example", "api.x.com").is_err());
-        assert!(check_server_identity("notapi.x.com", "api.x.com").is_err());
+            let mut io = prover.finish().await.unwrap().compat();
+            let attestation: serde_json::Value = read_msg(&mut io).await.unwrap();
+            let attested_data: Vec<u8> = attestation["attested_data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|byte| byte.as_u64().unwrap() as u8)
+                .collect();
+            let signature: Vec<u8> = attestation["notary_signature"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|byte| byte.as_u64().unwrap() as u8)
+                .collect();
+
+            assert_eq!(
+                &attested_data[..32],
+                &libid_crypto::keccak256(SERVER_DOMAIN.as_bytes())
+            );
+            assert_eq!(signature.len(), 65);
+            let recovered = libid_crypto::recover_eth_claim(
+                &signature,
+                &libid_crypto::keccak256(&attested_data),
+            )
+            .unwrap();
+            assert_eq!(recovered.to_encoded_point(true).as_bytes(), expected_pubkey);
+            assert_eq!(io.read(&mut [0]).await.unwrap(), 0);
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), protocol)
+            .await
+            .expect("local ProxyMode smoke timed out");
+        pump_task.await.unwrap();
+        let mut frames = Vec::new();
+        while let Ok(frame) = frame_rx.try_recv() {
+            frames.push(frame);
+        }
+        let attestation_frame = frames.last().expect("missing attestation message");
+        let declared_len =
+            u32::from_be_bytes(attestation_frame[..4].try_into().unwrap()) as usize;
+        assert_eq!(declared_len, attestation_frame.len() - 4);
+        serde_json::from_slice::<super::AttestationWire>(&attestation_frame[4..])
+            .expect("the final WebSocket message is not an attestation");
+        target_task.await.unwrap();
+
+        // The target listener is now gone. A second session exercises the
+        // same TcpStream::connect error path as a DNS failure and must close
+        // the browser transport promptly instead of waiting five minutes.
+        let (websocket, _) = connect_async(format!("ws://{notary_addr}/notarize-proxy"))
+            .await
+            .unwrap();
+        let (mut ws_tx, mut ws_rx) = websocket.split();
+        let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
+        let failed_pump = tokio::spawn(async move {
+            let (mut pipe_reader, mut pipe_writer) = tokio::io::split(pump_io);
+            let ws_to_pipe = async {
+                while let Some(message) = ws_rx.next().await {
+                    match message.unwrap() {
+                        WsMessage::Binary(data) => {
+                            pipe_writer.write_all(&data).await.unwrap();
+                        }
+                        WsMessage::Close(_) => {
+                            pipe_writer.shutdown().await.unwrap();
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            let pipe_to_ws = async {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match pipe_reader.read(&mut buf).await.unwrap() {
+                        0 => break,
+                        n => {
+                            if ws_tx
+                                .send(WsMessage::Binary(buf[..n].to_vec().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            };
+            tokio::select! {
+                _ = ws_to_pipe => {}
+                _ = pipe_to_ws => {}
+            }
+        });
+        let mut prover = SdkProver::new(prover_config).unwrap();
+        let failed_session = async {
+            prover
+                .setup(browser_io.compat())
+                .await
+                .map_err(|error| error.to_string())?;
+            prover
+                .send_request_proxy(
+                    HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
+                        .header("Host", SERVER_DOMAIN)
+                        .header("Connection", "close"),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+        let result = tokio::time::timeout(Duration::from_secs(3), failed_session)
+            .await
+            .expect("server connect failure was not propagated to the prover");
+        assert!(
+            result.unwrap_err().contains("UPSTREAM_CONNECT_FAILED"),
+            "server connect failure lost its public diagnostic"
+        );
+        failed_pump.await.unwrap();
+        notary_task.abort();
     }
 
     /// A client that connects and then goes silent forever must not pin the
@@ -1965,13 +1209,10 @@ mod tests {
     /// moment everything is blocked, so the test finishes in milliseconds.
     #[tokio::test(start_paused = true)]
     async fn silent_connection_hits_the_deadline() {
-        use std::{
-            collections::HashMap,
-            sync::Arc,
-        };
+        use std::sync::Arc;
 
         use libid_signer::SignerSource;
-        use tokio::sync::RwLock;
+        use tokio::sync::Semaphore;
 
         use super::{
             handle_tcp_prover,
@@ -1989,13 +1230,9 @@ mod tests {
         let state = NotaryState {
             public_key_hex: hex::encode(signer.compressed_public_key()),
             signer: Arc::new(signer),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            max_sessions: 8,
-            chain_id: 1,
-            zk_verifying_contract: [0x11; 20],
-            mpc_verifying_contract: [0x22; 20],
-            platform_name: "api.x.com".to_string(),
-            jwks_enabled: false,
+            proxy_sessions: Arc::new(Semaphore::new(8)),
+            proxy_root_store: Arc::new(libid_tlsn::root_store()),
+            proxy_server_addr: None,
         };
 
         // The client half stays open and never writes a byte.

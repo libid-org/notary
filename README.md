@@ -4,50 +4,42 @@ libID does not implement notarization itself. It relies on
 [TLSNotary](https://tlsnotary.org/) and its upstream
 [`tlsn`](https://github.com/tlsnotary/tlsn) implementation for the
 notarization protocol and cryptography. This repository is a thin integration
-wrapper that retains completed attestations for retrieval and exposes the
-HTTP/WebSocket server used by browser clients, including ProxyMode support. We
+wrapper that runs the verifier side and exposes it to backend provers over
+MPC-TLS and to browser clients over HTTP/WebSocket, including ProxyMode. We
 are grateful to the TLSNotary contributors for building and sharing the
 excellent protocol that makes this service possible.
 
-The libID notary service. One binary, one signing identity, two duties:
+The libID notary service. One binary, one signing identity, one record.
 
-* **Platform session notarization** — the notary acts as the MPC-TLS or
-  ProxyMode (zkTLS) verifier for a prover's HTTPS session with a platform API
-  (X, GitHub, …) and signs what was proven: tlsn attestations, EVM-ready
-  transcript proofs, and on-demand token / user-identity attestations whose
-  digests on-chain verifiers recover.
-* **Notarized JWKS readings** — the notary co-fetches Google's OIDC signing
-  keys (`https://www.googleapis.com/oauth2/v3/certs`) over MPC-TLS and signs a
-  `JwksRotationProof` that a `JwksOracle` contract accepts, so an on-chain
-  OIDC verifier can rotate Google's keys without trusting the submitter.
-
-Both duties share one TCP listener: the notary verifies the MPC-TLS session
-first, then dispatches on the TLS-certificate-verified server name. A session
-with `www.googleapis.com` is answered with the JWKS proof shape; every other
-session with the platform proof shape. The notary's signature alone registers
-nothing — on-chain verifiers recover it against the notary public key served
-at `/info`.
+The notary acts as the MPC-TLS or ProxyMode (zkTLS) verifier for a prover's
+HTTPS session and signs the canonical ceremony section 9.1 attested data for
+the authenticated transcript. Every session gets the same record —
+`{ attested_data, notary_signature }` — whether it is a prover's request to a
+platform API (X, GitHub, …), read on chain by that platform's Platform
+Verifier, or the keeper's reading of Google's OIDC signing keys, read on chain
+by `GoogleJwtRoots`. The notary does not tell them apart and does not need to:
+the record carries the TLS-certificate-verified server name (`authorityId`),
+and the contract that reads it compares that against the authority it pins.
+What differs is only what the prover reveals. Every contract authenticates the
+signature through the on-chain `NotaryService`; the notary's signature alone
+registers nothing, and its public key is served at `/info`.
 
 ## Endpoints
 
 TCP wire protocol on `NOTARY_PORT` (default **7047**) — length-prefixed JSON
 after MPC-TLS, for Rust backend provers.
 
-HTTP / WebSocket on `NOTARY_WS_PORT` (default **7048**) — tlsn-js compatible:
+HTTP / WebSocket on `NOTARY_WS_PORT` (default **7048**) — browser TLSNotary:
 
 | Route | What it does |
 |---|---|
 | `GET /info` | `{version, publicKey}` — compressed SEC1 notary public key, hex |
-| `POST /session` | Create a session → `{sessionId}` (503 above `NOTARY_MAX_SESSIONS`) |
-| `WS /notarize-proxy?sessionId=` | ProxyMode (zkTLS) verifier session — the primary browser path |
-| `WS /notarize?sessionId=` | MPC-TLS verifier session (tlsn-js fallback path) |
-| `GET /evm-proof/{sessionId}` | Long-poll the finished session's `NotaryResponse` |
-| `GET /zk/proxy/attestation/{sessionId}?session_type=token\|me&…` | On-demand signed token / user-identity attestation |
-| `WS /proxy?token=<host>` | Raw WS↔TCP relay for the tlsn-js MPC path |
-| `WS /notary` | Legacy TCP-over-WS path |
+| `WS /notarize-proxy` | ProxyMode session, then one WebSocket binary message containing the length-prefixed section 9.1 attestation |
 
-Sessions live at most 30 minutes; a background sweep evicts anything older,
-fetched or not.
+A server-side MPC-TLS prover needs no route: it opens the TCP listener itself,
+and the same record is written back down that socket.
+
+The live WebSocket carries the TLSNotary session and its final attestation.
 
 ## Configuration
 
@@ -59,16 +51,10 @@ Flags or environment variables:
 | `--port` | `NOTARY_PORT` | `7047` | TCP wire port |
 | `--ws-port` | `NOTARY_WS_PORT` | `7048` | HTTP/WS port (`0` disables) |
 | `--signing-key` | `SIGNING_KEY` | — | Hex secp256k1 key, or `kms:<key-id-or-alias>` for AWS KMS |
-| `--chain-id` | `CHAIN_ID` | `31337` | Chain the attestations target (digest domain separator) |
-| `--x-zk-verifier-address` | `X_ZK_VERIFIER_ADDRESS` | — | ZK verifier contract recovering token/me attestations |
-| `--verifying-contract` | `VERIFYING_CONTRACT_ADDRESS` | zero address | Contract recovering the MPC-TLS digest (`Registry`, or `GitHubIdentityVerifier` in identity deployments). Legacy alias: `--registry-contract-address` / `REGISTRY_CONTRACT_ADDRESS` |
-| `--platform-name` | `NOTARY_PLATFORM_NAME` | `api.x.com` | TLS server identity ProxyMode sessions must present |
-| `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent-session cap |
-| `--jwks-enabled` | `NOTARY_JWKS_ENABLED` | `true` | Serve JWKS notarization sessions on the TCP listener |
+| `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent browser ProxyMode session cap |
 
 With a KMS key the private material never enters the process: every signature
-is a `kms:Sign` call, including tlsn attestations (the sign step is lifted out
-of tlsn and applied asynchronously, byte-identical to tlsn's own signer).
+is a `kms:Sign` call.
 
 ## Docker
 
@@ -79,25 +65,53 @@ docker run --rm \
   -p 7047:7047 -p 7048:7048 \
   -e NOTARY_HOST=0.0.0.0 \
   -e SIGNING_KEY=<hex-or-kms:…> \
-  -e CHAIN_ID=1 \
-  -e X_ZK_VERIFIER_ADDRESS=0x… \
-  -e VERIFYING_CONTRACT_ADDRESS=0x… \
   ghcr.io/libid-org/notary:latest
 ```
 
-Tags: `<version>` and `latest` on every release; `custom-<suffix>` images can
-be built from any ref via the *Custom Docker image* workflow (inputs: `ref`,
-`tag-suffix`).
+The image runs as uid 10001, not root, and its `HEALTHCHECK` connects to
+`NOTARY_PORT` on loopback.
+
+### Tags
+
+| Tag | Moves? | Use it for |
+| --- | --- | --- |
+| `<version>` | never | deployments, and other repos' CI — **pin this** |
+| `latest` | every final release | a quick local try; never pin it |
+| `custom-<suffix>` | never | one ref under review, built via the *Custom Docker image* workflow (inputs: `ref`, `tag-suffix`) |
+
+A `custom-` tag is a build artefact, not a release channel: it is fine to pin
+while a PR is open, and it should be replaced by a `<version>` tag once that PR
+merges and a release is published.
+
+### Pulling from another repository's CI
+
+The `notary` package is **public**. A GitHub Actions job in any repository can
+
+```yaml
+- run: docker pull ghcr.io/libid-org/notary:<version>
+```
+
+with no `docker/login-action` step, no `packages: read` permission and no PAT —
+`GITHUB_TOKEN` is not involved. Nothing is needed on the consumer side beyond
+the pull itself.
+
+Every tag these workflows publish is a manifest list covering `linux/amd64`
+and `linux/arm64`, so one reference runs on GitHub's `ubuntu-latest` and
+`ubuntu-24.04-arm` runners, on x86 and Graviton nodes, and on Apple Silicon —
+no `--platform` flag, no emulation. Tags published up to `0.3.0-rc.3` are
+amd64 only.
 
 ## Browser wasm bundle
 
 Each release also ships `tlsn-wasm-<version>.tar.gz` as a release asset:
-`tlsn_wasm.js`, `tlsn_wasm_bg.wasm` and `spawn.js`, built from upstream
-TLSNotary's `crates/wasm` at the **exact tlsn revision this server pins** —
-prover and notary can never drift onto different protocol versions. Serve the
-three files side by side (with a rewrite of `/:path+/spawn.js` to the root
-copy) and the bundle is a drop-in for tlsn-js-style workers; unlike the npm
-`tlsn-js` build it includes `set_progress_callback`.
+`tlsn_wasm.js`, `tlsn_wasm_bg.wasm` and the generated
+`snippets/web-spawn-*/js/spawn.js`, built from TLSNotary's `crates/wasm` at the
+**exact tlsn revision this server pins** — prover and notary cannot drift onto
+different protocol versions. Mount the archive tree unchanged below any
+immutable asset path: the wrapper and worker resolve each other through their
+generated relative imports, without a root rewrite or generated-source edit.
+Unlike the npm `tlsn-js` build, this bundle includes `set_progress_callback`
+and reclaimed-channel `finish()`.
 
 To build locally: `./scripts/build-tlsn-wasm.sh --out <dir>` (needs rustup,
 wasm-pack 0.15.0, and a clang with a wasm32 backend — the script explains
@@ -105,13 +119,12 @@ exactly what is missing if something is).
 
 ## Library use
 
-The crate also builds as a library. `notary::jwks` exposes the prover-side
-helpers a backend rotation listener needs:
-
-* `jwks::prover::notarize_jwks(socket)` — run the MPC-TLS JWKS prover against
-  a notary's TCP port and get back the signed `JwksRotationProof`.
-* `jwks::mock::MockProver` — build a structurally identical proof without MPC
-  (zeroed handshake fields, real signature) for contract testing.
+The crate also builds as a library: `notary::run` starts the server from a
+`NotaryServerConfig` (port `0` binds an ephemeral port, reported back through
+`NotaryServerHandle::local_addr`), which is how the smoke tests embed it. It
+carries no prover-side code. The keeper's JWKS prover and its mock live in the keeper, on
+libid-rs's primitives (`libid_tlsn::prover_generic` for the session,
+`libid_transcript` for the layout and the wire frame).
 
 Shared primitives (digests, wire protocol, transcript math, signers) come
 from [libID-rs](https://github.com/libid-org/libID-rs).
