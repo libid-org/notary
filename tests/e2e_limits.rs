@@ -548,6 +548,11 @@ impl Outcome {
 /// every byte over the WebSocket is counted so a caller can size a window
 /// from a measurement.
 async fn session(socket: Socket) -> Outcome {
+    session_of(socket, 16).await
+}
+
+/// [`session`], asking the fixture for `response_bytes` bytes.
+async fn session_of(socket: Socket, response_bytes: usize) -> Outcome {
     let prover_config = ProverConfig::builder(SERVER_DOMAIN)
         .mode(ProverMode::Proxy)
         .root_certs(vec![CA_CERT_DER.to_vec()])
@@ -612,9 +617,11 @@ async fn session(socket: Socket) -> Outcome {
             .map_err(|e| format!("setup: {e}"))?;
         let response = prover
             .send_request_proxy(
-                HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
-                    .header("Host", SERVER_DOMAIN)
-                    .header("Connection", "close"),
+                HttpRequest::get(format!(
+                    "https://{SERVER_DOMAIN}/bytes?size={response_bytes}"
+                ))
+                .header("Host", SERVER_DOMAIN)
+                .header("Connection", "close"),
             )
             .await
             .map_err(|e| format!("request: {e}"))?;
@@ -920,6 +927,48 @@ async fn the_upgrades_window_holds_across_two_replicas() {
     drop(three);
     drop(two);
     drop(one);
+}
+
+/// `--proxy-max-bytes` on the real binary: a response five times the cap is
+/// cut at the cap, closed with 1008 naming the count, attests nothing, and
+/// is charged what it really relayed -- the cap plus at most one read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_over_the_data_cap_is_cut_on_the_real_binary() {
+    let Some(lab) = Lab::open().await else { return };
+    const CAP: usize = 200_000;
+    let notary = lab
+        .spawn(
+            "capped",
+            &[
+                "--per-ip-upgrades",
+                "",
+                "--proxy-max-bytes",
+                &CAP.to_string(),
+            ],
+        )
+        .await;
+    let client = fresh_client();
+
+    let socket = upgrade(&notary.public(), &xff(&client))
+        .await
+        .expect("admitted");
+    let outcome = session_of(socket, 5 * CAP).await;
+    let Outcome::Closed { code, reason } = outcome else {
+        panic!("the session was not cut: {outcome:?}");
+    };
+    assert_eq!(code, u16::from(CloseCode::Policy), "{reason}");
+    assert!(
+        reason.starts_with("PROXY_DATA_CAP_EXCEEDED: relayed "),
+        "{reason}"
+    );
+    assert!(reason.ends_with(&format!(", cap {CAP}")), "{reason}");
+
+    let charged = until_charged(&lab.pool, &client, 0).await;
+    assert!(charged >= CAP as i64, "charged {charged}, cap {CAP}");
+    assert!(
+        charged <= (CAP + 2 * notary::limits::RELAY_READ_BYTES) as i64,
+        "charged {charged}: more than one read past the cap"
+    );
 }
 
 /// `--per-ip-bytes` is charged with what a session really relayed. One
