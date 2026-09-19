@@ -73,35 +73,19 @@ const SESSION_OPTIONS: [(&str, &str); 3] = [
 /// `default_transaction_isolation` is settable per role, per database and
 /// per server, and under `REPEATABLE READ` the advisory lock no longer
 /// orders the reads (see the module docs).
-const BEGIN_READ_COMMITTED: &str = "BEGIN ISOLATION LEVEL READ COMMITTED";
+const BEGIN_READ_COMMITTED: &str = include_str!("sql/begin_read_committed.sql");
 
-macro_rules! window_end {
-    () => {
-        "((window_start AT TIME ZONE 'UTC') + make_interval(secs => window_secs))"
-    };
-}
-
-/// The sweep's half for windows: every row whose window has ended. The
-/// predicate is the indexed expression verbatim, so the planner can use
-/// `notary_windows_ends_at` rather than scan the table.
-const SWEEP_WINDOWS: &str = concat!(
-    "DELETE FROM notary_windows WHERE ",
-    window_end!(),
-    " < (now() AT TIME ZONE 'UTC')"
-);
-
-// The start of the window `$3` seconds long that the database's `now()`
-// falls in: fixed windows, so a count is one upsert on a key every replica
-// computes the same way.
-const READ_WINDOW: &str = "SELECT units FROM notary_windows
-    WHERE client_key = $1 AND dimension = $2 AND window_secs = $3
-      AND window_start = to_timestamp(floor(extract(epoch FROM now()) / $3) * $3)";
-
-const UPSERT_WINDOW: &str = "INSERT INTO notary_windows
-        (client_key, dimension, window_secs, window_start, units)
-    VALUES ($1, $2, $3, to_timestamp(floor(extract(epoch FROM now()) / $3) * $3), $4)
-    ON CONFLICT (client_key, dimension, window_secs, window_start)
-    DO UPDATE SET units = notary_windows.units + EXCLUDED.units";
+/// Every statement is a file under `sql/`, one per file, so a query change
+/// is a diff of that query. `sweep_windows.sql` carries the expression the
+/// migration indexes, verbatim; the EXPLAIN test holds them together.
+const LOCK_CLIENT: &str = include_str!("sql/lock_client.sql");
+const COUNT_LIVE_LEASES: &str = include_str!("sql/count_live_leases.sql");
+const INSERT_LEASE: &str = include_str!("sql/insert_lease.sql");
+const DELETE_LEASE: &str = include_str!("sql/delete_lease.sql");
+const SWEEP_LEASES: &str = include_str!("sql/sweep_leases.sql");
+const READ_WINDOW: &str = include_str!("sql/read_window.sql");
+const UPSERT_WINDOW: &str = include_str!("sql/upsert_window.sql");
+const SWEEP_WINDOWS: &str = include_str!("sql/sweep_windows.sql");
 
 impl From<sqlx::Error> for StoreError {
     fn from(e: sqlx::Error) -> Self {
@@ -164,7 +148,7 @@ async fn lock_client(
     tx: &mut Transaction<'_, Postgres>,
     client: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+    sqlx::query(LOCK_CLIENT)
         .bind(client)
         .execute(&mut **tx)
         .await?;
@@ -228,32 +212,27 @@ impl LimitStore for PostgresStore {
         let client = client.to_string();
         let mut tx = self.begin().await?;
         lock_client(&mut tx, &client).await?;
-        let live: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM notary_leases WHERE client_key = $1 AND expires_at > now()",
-        )
-        .bind(&client)
-        .fetch_one(&mut *tx)
-        .await?;
+        let live: i64 = sqlx::query_scalar(COUNT_LIVE_LEASES)
+            .bind(&client)
+            .fetch_one(&mut *tx)
+            .await?;
         if live >= i64::try_from(limit).unwrap_or(i64::MAX) {
             tx.commit().await?;
             return Ok(None);
         }
         let id = LeaseId::new();
-        sqlx::query(
-            "INSERT INTO notary_leases (lease_id, client_key, expires_at)
-             VALUES ($1, $2, now() + make_interval(secs => $3))",
-        )
-        .bind(id.0)
-        .bind(&client)
-        .bind(ttl.as_secs_f64())
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query(INSERT_LEASE)
+            .bind(id.0)
+            .bind(&client)
+            .bind(ttl.as_secs_f64())
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(Some(id))
     }
 
     async fn release(&self, lease: &LeaseId) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM notary_leases WHERE lease_id = $1")
+        sqlx::query(DELETE_LEASE)
             .bind(lease.0)
             .execute(&self.pool)
             .await?;
@@ -330,7 +309,7 @@ impl LimitStore for PostgresStore {
     }
 
     async fn sweep(&self) -> Result<u64, StoreError> {
-        let leases = sqlx::query("DELETE FROM notary_leases WHERE expires_at <= now()")
+        let leases = sqlx::query(SWEEP_LEASES)
             .execute(&self.pool)
             .await?
             .rows_affected();
