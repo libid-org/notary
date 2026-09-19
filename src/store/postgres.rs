@@ -75,49 +75,11 @@ const SESSION_OPTIONS: [(&str, &str); 3] = [
 /// orders the reads (see the module docs).
 const BEGIN_READ_COMMITTED: &str = "BEGIN ISOLATION LEVEL READ COMMITTED";
 
-/// The advisory lock the schema is created under. Replicas start together,
-/// and two `CREATE TABLE IF NOT EXISTS` racing on one name fail on the
-/// catalog's unique index instead of one of them winning.
-const SCHEMA_LOCK: i64 = 0x6e6f_7461_7279_5f6c; // "notary_l"
-
-/// When a window row ends, as the sweep's index and its predicate both
-/// spell it. `timestamptz + interval` is only STABLE -- it reads the
-/// session time zone -- so it cannot be indexed; the same sum on the
-/// UTC-naive timestamp is IMMUTABLE, and for a whole number of seconds
-/// means the same instant.
 macro_rules! window_end {
     () => {
         "((window_start AT TIME ZONE 'UTC') + make_interval(secs => window_secs))"
     };
 }
-
-/// Created at connect time, in this order, and never migrated: a column that
-/// has to change gets a new table. An index may go: nothing reads one.
-const SCHEMA: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS notary_leases (
-        lease_id uuid PRIMARY KEY,
-        client_key text NOT NULL,
-        expires_at timestamptz NOT NULL
-    )",
-    "CREATE INDEX IF NOT EXISTS notary_leases_client_key_expires_at
-        ON notary_leases (client_key, expires_at)",
-    "CREATE TABLE IF NOT EXISTS notary_windows (
-        client_key text NOT NULL,
-        dimension text NOT NULL,
-        window_secs bigint NOT NULL,
-        window_start timestamptz NOT NULL,
-        units bigint NOT NULL DEFAULT 0,
-        PRIMARY KEY (client_key, dimension, window_secs, window_start)
-    )",
-    // Superseded: the sweep's predicate is on the window's end, which a
-    // start-only index cannot serve, and nothing else queried it.
-    "DROP INDEX IF EXISTS notary_windows_window_start",
-    concat!(
-        "CREATE INDEX IF NOT EXISTS notary_windows_ends_at ON notary_windows (",
-        window_end!(),
-        ")"
-    ),
-];
 
 /// The sweep's half for windows: every row whose window has ended. The
 /// predicate is the indexed expression verbatim, so the planner can use
@@ -168,7 +130,9 @@ impl PostgresStore {
         let connect = async {
             let options = PgConnectOptions::from_str(url)?.options(SESSION_OPTIONS);
             let mut conn = PgConnection::connect_with(&options).await?;
-            create_schema(&mut conn).await?;
+            // migrations/: each file once, under sqlx's own advisory lock, so
+            // replicas starting together do not race on the schema.
+            sqlx::migrate!().run_direct(&mut conn).await?;
             conn.close().await?;
             let pool = PgPoolOptions::new()
                 .max_connections(MAX_CONNECTIONS)
@@ -192,18 +156,6 @@ impl PostgresStore {
     async fn begin(&self) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
         self.pool.begin_with(BEGIN_READ_COMMITTED).await
     }
-}
-
-async fn create_schema(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
-    let mut tx = conn.begin_with(BEGIN_READ_COMMITTED).await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(SCHEMA_LOCK)
-        .execute(&mut *tx)
-        .await?;
-    for statement in SCHEMA {
-        sqlx::query(statement).execute(&mut *tx).await?;
-    }
-    tx.commit().await
 }
 
 /// Serialise every read-then-write for `client` across all replicas, for

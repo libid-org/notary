@@ -28,6 +28,7 @@ RUN rm -rf src \
 
 # ── Layer 2: real source — only rebuilds this crate ────────────────────────
 COPY src/ src/
+COPY migrations/ migrations/
 RUN cargo build --locked --release
 
 # === Runtime ===
