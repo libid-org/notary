@@ -342,7 +342,7 @@ mod tests {
         let slots = state.mpc_sessions.available_permits();
 
         // The client half stays open and never writes a byte.
-        let (_client, server) = tokio::io::duplex(1 << 16);
+        let (client, server) = tokio::io::duplex(1 << 16);
 
         let started = tokio::time::Instant::now();
         let connection = {
@@ -375,6 +375,7 @@ mod tests {
             started.elapsed() < state.connection_deadline,
             "an idle socket must not be held for the whole connection deadline"
         );
+        drop(client);
     }
 
     /// The limits an operator sets, tripped for real: the MPC-TLS session

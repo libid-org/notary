@@ -261,7 +261,7 @@ async fn a_silent_upgrade_holds_no_session_slot() {
     );
 
     // Upgraded and held open, but never a byte of session data.
-    let (_silent, _) = connect_async(upgrade_from(&url, A_CLIENT))
+    let (silent, _) = connect_async(upgrade_from(&url, A_CLIENT))
         .await
         .expect("first upgrade");
 
@@ -289,6 +289,7 @@ async fn a_silent_upgrade_holds_no_session_slot() {
         panic!("expected an HTTP refusal, got: {refused}");
     };
     assert_eq!(response.status(), 503);
+    drop(silent);
 
     handle.shutdown();
 }
@@ -526,10 +527,11 @@ async fn an_unattributable_request_is_refused_at_the_upgrade() {
     };
     assert_eq!(response.status(), 400);
 
-    let (_named, response) = connect_async(upgrade_from(&url, A_CLIENT))
+    let (named, response) = connect_async(upgrade_from(&url, A_CLIENT))
         .await
         .expect("the same upgrade with the header is admitted");
     assert_eq!(response.status(), 101);
+    drop(named);
 
     handle.shutdown();
 }

@@ -356,7 +356,7 @@ impl NotaryState {
         };
 
         // Held for the session lifetime; dropping it returns the slot.
-        let Ok(_permit) = Arc::clone(pool).try_acquire_owned() else {
+        let Ok(permit) = Arc::clone(pool).try_acquire_owned() else {
             info!(%peer, "ProxyMode: all session slots busy; session refused with 1013");
             let _ = ws_tx
                 .send(Message::Close(Some(CloseFrame {
@@ -498,6 +498,7 @@ impl NotaryState {
             accounting.settle().await;
         }
         drop(inbound_task);
+        drop(permit);
     }
 
     /// The verifier's half of one ProxyMode session on `socket`; every byte

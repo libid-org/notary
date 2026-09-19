@@ -125,7 +125,9 @@ fn pg_url() -> Option<String> {
 /// What every test needs: its turn, the database, the TLS fixture every
 /// notary dials, and the fixture's CA on disk for `--upstream-ca`.
 struct Lab {
-    _turn: tokio::sync::MutexGuard<'static, ()>,
+    /// The serialising lock, released last in `Drop`, after the lab's own
+    /// cleanup, so the next lab starts on a quiet database.
+    turn: Option<tokio::sync::MutexGuard<'static, ()>>,
     pg_url: String,
     pool: PgPool,
     fixture: Fixture,
@@ -142,7 +144,7 @@ impl Lab {
             .join(format!("notary-e2e-{}-fixture-ca.der", std::process::id()));
         std::fs::write(&ca_path, CA_CERT_DER).expect("the CA file");
         Some(Self {
-            _turn: turn,
+            turn: Some(turn),
             pg_url,
             pool,
             fixture: Fixture::start().await,
@@ -253,6 +255,7 @@ impl Fixture {
 impl Drop for Lab {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.ca_path);
+        drop(self.turn.take());
     }
 }
 
