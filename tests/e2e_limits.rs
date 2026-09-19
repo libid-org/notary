@@ -293,6 +293,10 @@ struct Notary {
 }
 
 impl Notary {
+    fn mpc_port(&self) -> u16 {
+        self.ports.mpc
+    }
+
     fn public(&self) -> String {
         format!("ws://127.0.0.1:{}/notarize-proxy", self.ports.public)
     }
@@ -927,6 +931,73 @@ async fn the_upgrades_window_holds_across_two_replicas() {
     drop(three);
     drop(two);
     drop(one);
+}
+
+/// MPC-TLS on the real binary: a prover of the keeper's kind, over TCP to
+/// the internal port, reads a live host the notary's verifier trusts through
+/// the public roots, and the record comes back down the same socket, signed
+/// over what the session really received. Needs egress to
+/// `www.googleapis.com`, as the keeper's own e2e does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mpc_session_completes_on_the_real_binary() {
+    const HOST: &str = "www.googleapis.com";
+    let Some(lab) = Lab::open().await else { return };
+    let notary = lab.spawn("mpc", &[]).await;
+
+    let socket = tokio::net::TcpStream::connect(("127.0.0.1", notary.mpc_port()))
+        .await
+        .expect("MPC connect");
+    let request = libid_tlsn::HttpRequest::builder()
+        .method("GET")
+        .uri(format!("https://{HOST}/oauth2/v3/certs"))
+        .header("Host", HOST)
+        .header("Connection", "close")
+        .header("Accept", "application/json")
+        .header("User-Agent", "notary-e2e")
+        .body(libid_tlsn::HttpBody::new(libid_tlsn::Bytes::new()))
+        .unwrap();
+    let whole = |bytes: &[u8]| libid_transcript::ceremony::Layout {
+        reveal: std::iter::once(0..bytes.len()).collect(),
+        commit: Vec::new(),
+    };
+    let session = async {
+        let result = libid_tlsn::prover_generic(
+            socket,
+            request,
+            |sent, recv| Ok((whole(sent), whole(recv))),
+            |_| {},
+        )
+        .await
+        .expect("the MPC-TLS session completes");
+        let body: serde_json::Value =
+            serde_json::from_slice(&result.response_body).expect("the JWKS is JSON");
+        assert!(
+            body["keys"].as_array().is_some_and(|keys| !keys.is_empty()),
+            "the session read Google's keys: {body}"
+        );
+        let mut io = result.recovered_io;
+        let attestation: AttestationWire =
+            read_msg(&mut io).await.expect("the attestation frame");
+        attestation
+    };
+    let attestation = tokio::time::timeout(Duration::from_secs(180), session)
+        .await
+        .expect("MPC-TLS took longer than three minutes");
+
+    assert_eq!(
+        &attestation.attested_data[..32],
+        &libid_crypto::keccak256(HOST.as_bytes()),
+        "the record names the host the session reached"
+    );
+    let recovered = libid_crypto::recover_eth_claim(
+        &attestation.notary_signature,
+        &libid_crypto::keccak256(&attestation.attested_data),
+    )
+    .expect("the signature recovers");
+    assert_eq!(
+        hex::encode(recovered.to_encoded_point(true).as_bytes()),
+        TEST_PUBKEY
+    );
 }
 
 /// `--proxy-max-bytes` on the real binary: a response five times the cap is
