@@ -183,8 +183,8 @@ impl NotaryState {
         };
 
         ws.on_upgrade(move |socket| async move {
-            let _in_flight = in_flight;
             self.handle_ws_proxy_notarize(socket, peer, client).await;
+            drop(in_flight);
         })
     }
 
@@ -376,7 +376,7 @@ impl NotaryState {
         // Keep inbound and outbound ownership separate. Whichever direction ends
         // first must not cancel a write already accepted in the other direction.
         let (end_tx, end_rx) = tokio::sync::oneshot::channel::<SessionEnd>();
-        let _inbound_task = AbortOnDrop::new(tokio::spawn(async move {
+        let inbound_task = AbortOnDrop::new(tokio::spawn(async move {
             // The frame that started the session, put back in front of the rest.
             if pipe_writer.write_all(&first).await.is_ok() {
                 while let Some(Ok(msg)) = ws_rx.next().await {
@@ -497,6 +497,7 @@ impl NotaryState {
         if let Some(accounting) = accounting {
             accounting.settle().await;
         }
+        drop(inbound_task);
     }
 
     /// The verifier's half of one ProxyMode session on `socket`; every byte
@@ -908,7 +909,7 @@ mod tests {
         const TEST_KEY: &str =
             "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
-        let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
+        let session_slot = ONE_SESSION_AT_A_TIME.lock().await;
         let prover_config = ProverConfig::builder(SERVER_DOMAIN)
             .mode(ProverMode::Proxy)
             .root_certs(vec![CA_CERT_DER.to_vec()])
@@ -1129,6 +1130,7 @@ mod tests {
         );
         failed_pump.await.unwrap();
         notary_task.abort();
+        drop(session_slot);
     }
 
     /// The limits an operator sets, tripped for real: the ProxyMode data cap.
@@ -1454,7 +1456,7 @@ mod tests {
         /// per session on both tiers; the internal route needs no client.
         #[tokio::test(flavor = "multi_thread")]
         async fn proxy_session_over_the_data_cap_is_aborted_without_attestation() {
-            let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
+            let session_slot = ONE_SESSION_AT_A_TIME.lock().await;
             let prover_config = ProverConfig::builder(SERVER_DOMAIN)
                 .mode(ProverMode::Proxy)
                 .root_certs(vec![CA_CERT_DER.to_vec()])
@@ -1531,6 +1533,7 @@ mod tests {
 
             notary_task.abort();
             target_task.await.unwrap();
+            drop(session_slot);
         }
 
         /// A public WebSocket upgrade as an HTTP client sends it, so a
@@ -1620,7 +1623,7 @@ mod tests {
         /// off, so nothing else can be what refuses.
         #[tokio::test(flavor = "multi_thread")]
         async fn the_bytes_window_is_charged_when_a_session_ends() {
-            let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
+            let session_slot = ONE_SESSION_AT_A_TIME.lock().await;
             let mut state = NotaryState::for_tests(test_signer().await);
             state.per_ip_bytes = "1KB/1h".parse::<WindowLimits>().unwrap();
             state.per_ip_upgrades = WindowLimits::default();
@@ -1652,6 +1655,7 @@ mod tests {
             assert!(body.contains("bytes"), "{body}");
 
             notary_task.abort();
+            drop(session_slot);
         }
 
         /// A store that answers nothing but errors.
@@ -1832,7 +1836,7 @@ mod tests {
         /// every call.
         #[tokio::test(flavor = "multi_thread")]
         async fn the_internal_route_never_touches_the_store() {
-            let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
+            let session_slot = ONE_SESSION_AT_A_TIME.lock().await;
             let mut state = NotaryState::for_tests(test_signer().await);
             state.limits = Store::from(PanickingStore);
             let (_, seen, notary_task) = complete_session(Tier::Internal, state).await;
@@ -1842,6 +1846,7 @@ mod tests {
                 seen.close
             );
             notary_task.abort();
+            drop(session_slot);
         }
     }
 }

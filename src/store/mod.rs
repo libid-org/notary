@@ -471,7 +471,7 @@ mod tests {
         // slot: the other lease keeps its own.
         let c = fresh_client();
         let a = store.try_lease(&c, 2, long).await?.expect("first lease");
-        let _b = store.try_lease(&c, 2, long).await?.expect("second lease");
+        store.try_lease(&c, 2, long).await?.expect("second lease");
         assert!(
             store.try_lease(&c, 2, long).await?.is_none(),
             "over the cap"

@@ -388,7 +388,7 @@ async fn the_per_ip_cap_counts_the_rightmost_forwarded_address() {
     let first = session_from(&url, "203.0.113.7")
         .await
         .expect("first session");
-    let _second = session_from(&url, "203.0.113.7")
+    let second = session_from(&url, "203.0.113.7")
         .await
         .expect("second session");
 
@@ -410,7 +410,7 @@ async fn the_per_ip_cap_counts_the_rightmost_forwarded_address() {
 
     // Another client is unaffected -- the cap is per client, and the key is
     // the forwarded address rather than the peer every one of these shares.
-    let _other = session_from(&url, "198.51.100.4")
+    let other = session_from(&url, "198.51.100.4")
         .await
         .expect("a different client must not share the budget");
 
@@ -426,11 +426,14 @@ async fn the_per_ip_cap_counts_the_rightmost_forwarded_address() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     };
-    let _reopened = tokio::time::timeout(Duration::from_secs(5), reopened)
+    let reopened = tokio::time::timeout(Duration::from_secs(5), reopened)
         .await
         .expect("the lease was not released when its session ended");
 
     handle.shutdown();
+    drop(reopened);
+    drop(other);
+    drop(second);
 }
 
 /// `--per-ip-upgrades` counts sessions started per window, at the upgrade:
@@ -458,7 +461,7 @@ async fn the_upgrades_window_refuses_the_next_upgrade_with_429() {
         .await
         .expect("first session");
     drop(first);
-    let _second = session_from(&url, "203.0.113.7")
+    let second = session_from(&url, "203.0.113.7")
         .await
         .expect("second session");
 
@@ -477,11 +480,13 @@ async fn the_upgrades_window_refuses_the_next_upgrade_with_429() {
         Some("60")
     );
 
-    let _other = session_from(&url, "198.51.100.4")
+    let other = session_from(&url, "198.51.100.4")
         .await
         .expect("a different client has its own window");
 
     handle.shutdown();
+    drop(other);
+    drop(second);
 }
 
 /// A public upgrade that names no client is refused with 400, never counted
