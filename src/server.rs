@@ -85,6 +85,7 @@ use crate::{
     },
 };
 
+mod accounting;
 mod attestation;
 mod mpc;
 mod routes;
