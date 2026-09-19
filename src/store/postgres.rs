@@ -69,6 +69,19 @@ const SESSION_OPTIONS: [(&str, &str); 3] = [
     ("idle_in_transaction_session_timeout", "5000"),
 ];
 
+/// The migration connection's timeouts: a minute to wait for another
+/// replica's migration under sqlx's lock, ten minutes for one statement,
+/// which is an index on a full table. A request's timeouts would fail a
+/// startup that is merely waiting its turn.
+const MIGRATION_OPTIONS: [(&str, &str); 3] = [
+    ("lock_timeout", "60000"),
+    ("statement_timeout", "600000"),
+    ("idle_in_transaction_session_timeout", "600000"),
+];
+
+/// How long startup gives the migrations, all of them, after connecting.
+const MIGRATION_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// How every transaction here begins. Pinned rather than inherited:
 /// `default_transaction_isolation` is settable per role, per database and
 /// per server, and under `REPEATABLE READ` the advisory lock no longer
@@ -111,28 +124,39 @@ impl PostgresStore {
     /// short for a cold start. The pool itself connects on first use.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let description = format!("postgres ({})", PostgresUrl::new(url));
-        let connect = async {
-            let options = PgConnectOptions::from_str(url)?.options(SESSION_OPTIONS);
-            let mut conn = PgConnection::connect_with(&options).await?;
-            // migrations/: each file once, under sqlx's own advisory lock, so
-            // replicas starting together do not race on the schema.
-            sqlx::migrate!().run_direct(&mut conn).await?;
-            conn.close().await?;
-            let pool = PgPoolOptions::new()
-                .max_connections(MAX_CONNECTIONS)
-                .acquire_timeout(ACQUIRE_TIMEOUT)
-                .connect_lazy_with(options);
-            Ok::<_, sqlx::Error>(pool)
-        };
-        let pool = tokio::time::timeout(CONNECT_TIMEOUT, connect)
+        let base = PgConnectOptions::from_str(url)
+            .map_err(|e| StoreError(format!("{description}: {e}")))?;
+        let mut conn = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            PgConnection::connect_with(&base.clone().options(MIGRATION_OPTIONS)),
+        )
+        .await
+        .map_err(|_| {
+            StoreError(format!(
+                "{description}: no answer within {}s",
+                CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| StoreError(format!("{description}: {e}")))?;
+        // migrations/: every replica runs this at startup; sqlx's advisory
+        // lock serialises them, the first applies what is pending and the
+        // rest find nothing to do. The pod is not ready until it returns.
+        tokio::time::timeout(MIGRATION_TIMEOUT, sqlx::migrate!().run_direct(&mut conn))
             .await
             .map_err(|_| {
                 StoreError(format!(
-                    "{description}: no answer within {}s",
-                    CONNECT_TIMEOUT.as_secs()
+                    "{description}: migrations did not finish within {}s",
+                    MIGRATION_TIMEOUT.as_secs()
                 ))
             })?
+            .map_err(|e| StoreError(format!("{description}: migrations: {e}")))?;
+        conn.close()
+            .await
             .map_err(|e| StoreError(format!("{description}: {e}")))?;
+        let pool = PgPoolOptions::new()
+            .max_connections(MAX_CONNECTIONS)
+            .acquire_timeout(ACQUIRE_TIMEOUT)
+            .connect_lazy_with(base.options(SESSION_OPTIONS));
         Ok(Self { pool, description })
     }
 

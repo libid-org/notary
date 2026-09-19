@@ -142,9 +142,18 @@ carries either header is refused, because it came through a proxy.
 ### Where the counts live
 
 The Postgres schema is `migrations/`, applied by the notary at startup through
-sqlx's migrator: each file runs once, recorded in `_sqlx_migrations`, under an
-advisory lock so replicas starting together do not race. A schema change is a
-new numbered file, never an edit to an old one.
+sqlx's migrator: each file runs once, recorded in `_sqlx_migrations`. A schema
+change is a new numbered file, never an edit to an old one.
+
+With several replicas, every one runs the migrator when it starts; sqlx's
+advisory lock serialises them, the first applies what is pending and the rest
+find nothing to do. The migration connection has its own timeouts (a minute
+to wait for the lock, ten minutes per statement) and startup gives the
+migrations ten minutes in all; a pod is not ready until they return, so a
+`startupProbe` must allow that long. During a rolling update the old version
+keeps serving while the new one migrates, so a migration must be one the
+previous release can live with: add, never drop or rename in the same
+release.
 
 The per-client counts — sessions held now, sessions started and bytes relayed
 per window — are kept in `--limits-store`, which takes one of two forms:
