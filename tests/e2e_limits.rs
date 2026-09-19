@@ -38,6 +38,7 @@ use std::{
     },
     time::Duration,
 };
+use tungstenite::protocol::frame::coding::CloseCode;
 
 use futures_util::{
     SinkExt,
@@ -553,7 +554,7 @@ async fn session(socket: Socket) -> Outcome {
         .build()
         .unwrap();
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
+    let (browser_io, pump_io) = tokio::io::duplex(notary::limits::RELAY_PIPE_BYTES);
     let wire = Arc::new(AtomicU64::new(0));
     let pump_wire = Arc::clone(&wire);
     let pump = tokio::spawn(async move {
@@ -562,7 +563,7 @@ async fn session(socket: Socket) -> Outcome {
         // read of the attestation and close that follow.
         let out_wire = Arc::clone(&pump_wire);
         let outbound = tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
+            let mut buf = vec![0u8; notary::limits::RELAY_READ_BYTES];
             loop {
                 match pipe_reader.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
@@ -868,7 +869,7 @@ async fn the_concurrency_cap_holds_across_two_replicas() {
         .await
         .expect("the upgrade itself is not refused");
     let (code, reason) = close_reason(&mut third).await;
-    assert_eq!(code, 1013, "{reason}");
+    assert_eq!(code, u16::from(CloseCode::Again), "{reason}");
     assert!(reason.contains("this client"), "{reason}");
 
     drop(first);
@@ -1123,7 +1124,7 @@ async fn a_missing_header_is_400_and_cf_mode_switches_the_source() {
         .await
         .expect("the upgrade itself is not refused");
     let (code, reason) = close_reason(&mut again).await;
-    assert_eq!(code, 1013, "{reason}");
+    assert_eq!(code, u16::from(CloseCode::Again), "{reason}");
     drop(other);
     drop(same);
 }
@@ -1209,7 +1210,10 @@ async fn limits_recover_when_a_replica_dies_holding_leases() {
     let mut third = held_session(&b.public(), &xff(&client))
         .await
         .expect("the upgrade itself is not refused");
-    assert_eq!(close_reason(&mut third).await.0, 1013);
+    assert_eq!(
+        close_reason(&mut third).await.0,
+        u16::from(CloseCode::Again)
+    );
 
     let url = b.public();
     let client = client.as_str();

@@ -28,6 +28,16 @@ use tokio::io::{
 };
 use tracing::warn;
 
+/// Bytes one relay read takes from a socket at a time: a few TLS records.
+pub const RELAY_READ_BYTES: usize = 1 << 16;
+
+/// Capacity of the in-memory pipe between a WebSocket pump and the verifier:
+/// two reads, so one side can fill it while the other drains.
+pub const RELAY_PIPE_BYTES: usize = 2 * RELAY_READ_BYTES;
+
+/// Concurrent ProxyMode sessions a pool admits unless configured otherwise.
+pub const DEFAULT_MAX_SESSIONS: usize = 1024;
+
 /// A concurrency limit: an absolute count (`16`) or a multiple of the cores
 /// the process may use (`4x`). A multiplier is resolved once, at startup, so a
 /// container that is later resized keeps the number it started with.

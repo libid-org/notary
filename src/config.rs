@@ -6,7 +6,10 @@ use clap::{
 };
 
 use crate::{
-    limits::Concurrency,
+    limits::{
+        Concurrency,
+        DEFAULT_MAX_SESSIONS,
+    },
     store::{
         PostgresUrl,
         WindowLimits,
@@ -59,12 +62,12 @@ pub struct NotaryServerConfig {
     /// session is one relay task plus its transcript, bounded by
     /// `--proxy-max-bytes`, so this can stay large.
     /// `--connection-deadline-secs` bounds how long one slot stays taken.
-    #[arg(long, env = "NOTARY_MAX_SESSIONS", default_value_t = 1024)]
+    #[arg(long, env = "NOTARY_MAX_SESSIONS", default_value_t = DEFAULT_MAX_SESSIONS)]
     pub max_sessions: usize,
 
     /// Max concurrent ProxyMode sessions on the internal route. Its own
     /// pool, so public load can never queue our own services behind it.
-    #[arg(long, env = "NOTARY_INTERNAL_MAX_SESSIONS", default_value_t = 1024)]
+    #[arg(long, env = "NOTARY_INTERNAL_MAX_SESSIONS", default_value_t = DEFAULT_MAX_SESSIONS)]
     pub internal_max_sessions: usize,
 
     /// Bytes one ProxyMode session may relay in total, both directions
