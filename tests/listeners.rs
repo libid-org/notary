@@ -23,7 +23,13 @@ use notary::{
     server,
     NotaryServerConfig,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::{
+    io::{
+        AsyncReadExt,
+        AsyncWriteExt,
+    },
+    net::TcpStream,
+};
 use tokio_tungstenite::{
     connect_async,
     tungstenite,
@@ -293,6 +299,65 @@ async fn healthcheck_is_ok_with_and_without_the_internal_route() {
         assert_eq!(body["status"], "ok", "{flags:?}");
         handle.shutdown();
     }
+}
+
+/// Everything `socket` receives until the server closes it. A socket still
+/// open after `wait` fails the test.
+async fn until_closed(socket: &mut TcpStream, wait: Duration) -> String {
+    let mut received = Vec::new();
+    tokio::time::timeout(wait, socket.read_to_end(&mut received))
+        .await
+        .expect("the server must close the connection")
+        .unwrap();
+    String::from_utf8_lossy(&received).into_owned()
+}
+
+/// A connection that has not sent its request headers by the setup deadline
+/// is closed, whether it sent nothing or half a request. Until then it holds
+/// nothing a limit counts, so the deadline is its only bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_without_a_request_is_closed_at_the_setup_deadline() {
+    let deadline = Duration::from_secs(1);
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&[
+            "--ws-port",
+            &ws_port.to_string(),
+            "--setup-deadline-secs",
+            &deadline.as_secs().to_string(),
+        ])
+    })
+    .await;
+    let addr = handle.ws_local_addr().unwrap();
+
+    for opening in ["", "GET /info HTTP/1.1\r\nHost: notary\r\n"] {
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        socket.write_all(opening.as_bytes()).await.unwrap();
+        let started = std::time::Instant::now();
+        let reply = until_closed(&mut socket, deadline * 5).await;
+        assert!(
+            started.elapsed() >= deadline,
+            "closed before the deadline on {opening:?}"
+        );
+        assert_eq!(reply, "", "opening {opening:?}");
+    }
+    handle.shutdown();
+}
+
+/// The public port speaks HTTP/1.1 only: the HTTP/2 preface ends the
+/// connection without a reply, at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_http2_preface_is_refused() {
+    let (handle, _) =
+        common::start_server(|ws_port| parse(&["--ws-port", &ws_port.to_string()])).await;
+    let mut socket = TcpStream::connect(handle.ws_local_addr().unwrap())
+        .await
+        .unwrap();
+    socket
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(until_closed(&mut socket, Duration::from_secs(5)).await, "");
+    handle.shutdown();
 }
 
 /// The two listeners of a spawned notary, on ports reserved up front: its

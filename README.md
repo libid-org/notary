@@ -97,8 +97,10 @@ startup as `resource limits in force`.
 A session slot is taken when a session starts — the prover's first byte on the
 TCP port, the browser's first binary frame on the WebSocket — and not when the
 connection is accepted. Opening sockets therefore reserves nothing: an idle
-connection costs a socket until `--setup-deadline-secs` drops it, and the
-session limits bound sessions rather than connection attempts.
+connection costs a socket until `--setup-deadline-secs` drops it, whether
+it never sent its request headers or sent them and then went quiet, and
+the session limits bound sessions rather than connection attempts. The
+public port speaks HTTP/1.1 only, which is all the ALB sends a target.
 
 ### Who a session counts against
 
