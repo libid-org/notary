@@ -134,8 +134,8 @@ impl NotaryServerHandle {
     }
 
     /// Stops every listener now, without waiting for the sessions in
-    /// flight. For tests; a deployment calls [`NotaryServerHandle::drain`].
-    pub fn shutdown(self) {
+    /// flight: what a second stop signal asks for while a drain is running.
+    pub fn shutdown(&self) {
         self.draining.store(true, Ordering::SeqCst);
         let _ = self.phase.send(Phase::Stopped);
     }
@@ -150,7 +150,7 @@ impl NotaryServerHandle {
     /// together elapse, because a closed port looks like a crash to the
     /// balancer and a 503 looks like what it is. Then it closes too, and
     /// this returns.
-    pub async fn drain(self) {
+    pub async fn drain(&self) {
         self.draining.store(true, Ordering::SeqCst);
         let _ = self.phase.send(Phase::Draining);
         self.in_flight.close();

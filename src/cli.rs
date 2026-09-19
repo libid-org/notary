@@ -45,7 +45,8 @@ pub fn serve(
             tokio::select! {
                 () = handle.drain() => {}
                 signal = signals.next() => {
-                    info!(signal, "second signal: exiting without waiting");
+                    info!(signal, "second signal: stopping without waiting");
+                    handle.shutdown();
                 }
             }
             Ok(())
