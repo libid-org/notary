@@ -38,6 +38,7 @@
 
 use std::{
     net::SocketAddr,
+    pin::pin,
     sync::{
         atomic::{
             AtomicBool,
@@ -48,7 +49,19 @@ use std::{
     time::Duration,
 };
 
-use axum::Router;
+use axum::{
+    extract::ConnectInfo,
+    middleware::AddExtension,
+    Router,
+};
+use hyper::server::conn::http1;
+use hyper_util::{
+    rt::{
+        TokioIo,
+        TokioTimer,
+    },
+    service::TowerToHyperService,
+};
 use libid_signer::{
     ManagedSigner,
     SignerSource,
@@ -62,6 +75,7 @@ use tokio::{
     },
 };
 use tokio_util::task::TaskTracker;
+use tower::Service;
 use tracing::{
     debug,
     error,
@@ -480,6 +494,7 @@ pub async fn run_with(
             listener,
             router(state.clone(), config.internal_proxy_route),
             phase_rx.clone(),
+            state.setup_deadline,
         );
     }
 
@@ -513,30 +528,110 @@ pub async fn run_with(
     })
 }
 
+/// How long the accept loop waits after an accept fails for a reason that
+/// is the host's, such as running out of file descriptors, before it tries
+/// again.
+const ACCEPT_RETRY: Duration = Duration::from_secs(1);
+
 /// Serve `app` on `listener` until the phase reaches `Stopped`. Draining
 /// keeps the listener open on purpose: the health check has to be reachable
 /// to say 503.
+///
+/// HTTP/1.1 only: the balancer speaks nothing else to a target and the
+/// WebSocket upgrade is HTTP/1.1. A connection that has not sent its
+/// request headers within `header_deadline` is closed; until it has, it
+/// holds no token, no slot and no client, so this is its only bound.
 fn spawn_http_server(
     listener: TcpListener,
     app: Router,
     mut phase: watch::Receiver<Phase>,
+    header_deadline: Duration,
 ) {
     tokio::spawn(async move {
         // Connect info so a session's log lines can name the peer.
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            while *phase.borrow_and_update() != Phase::Stopped {
-                if phase.changed().await.is_err() {
-                    break;
+        let mut make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+        let connections = TaskTracker::new();
+        loop {
+            let (stream, peer) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) if is_peer_error(&error) => continue,
+                    Err(error) => {
+                        error!(%error, "HTTP accept failed");
+                        tokio::time::sleep(ACCEPT_RETRY).await;
+                        continue;
+                    }
+                },
+                changed = phase.changed() => {
+                    if changed.is_err() || *phase.borrow_and_update() == Phase::Stopped {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let service = make_service
+                .call(peer)
+                .await
+                .unwrap_or_else(|never| match never {});
+            connections.spawn(serve_connection(
+                stream,
+                peer,
+                service,
+                phase.clone(),
+                header_deadline,
+            ));
+        }
+        drop(listener);
+        connections.close();
+        connections.wait().await;
+    });
+}
+
+/// One HTTP/1.1 connection, served until the peer is done with it or the
+/// phase reaches `Stopped`, when it is told to finish the request in
+/// progress and close. A WebSocket upgrade hands the stream to its session
+/// and ends the connection here.
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    service: AddExtension<Router, ConnectInfo<SocketAddr>>,
+    mut phase: watch::Receiver<Phase>,
+    header_deadline: Duration,
+) {
+    let mut connection = pin!(http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_deadline)
+        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
+        .with_upgrades());
+    let served = loop {
+        tokio::select! {
+            served = connection.as_mut() => break served,
+            changed = phase.changed() => {
+                if changed.is_err() || *phase.borrow_and_update() == Phase::Stopped {
+                    connection.as_mut().graceful_shutdown();
+                    break connection.await;
                 }
             }
-        })
-        .await
-        .unwrap_or_else(|e| error!("HTTP server error: {}", e));
-    });
+        }
+    };
+    if let Err(error) = served {
+        debug!(%peer, %error, "HTTP connection ended");
+    }
+}
+
+/// Whether an accept failed because of the peer, which hung up before it
+/// was accepted, rather than the host. A peer's failure is nothing to
+/// wait out.
+fn is_peer_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{
+        ConnectionAborted,
+        ConnectionRefused,
+        ConnectionReset,
+    };
+    matches!(
+        error.kind(),
+        ConnectionRefused | ConnectionAborted | ConnectionReset
+    )
 }
 
 #[cfg(test)]
