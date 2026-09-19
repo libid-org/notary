@@ -33,10 +33,7 @@ use async_trait::async_trait;
 use bytesize::ByteSize;
 use url::Url;
 
-use crate::{
-    client_ip::ClientKey,
-    config::LimitsStoreSpec,
-};
+use crate::client_ip::ClientKey;
 
 mod memory;
 mod postgres;
@@ -255,6 +252,42 @@ pub trait LimitStore: Send + Sync + 'static {
 /// The store `spec` names, ready to use. A Postgres store connects and
 /// creates its tables here, so a database that cannot be reached is a
 /// startup error rather than a limit that fails closed on every request.
+/// Where the shared counts live: `memory`, or a Postgres URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LimitsStoreSpec {
+    /// In this process only. Correct for one replica; a multiplier otherwise.
+    Memory,
+    /// A Postgres URL.
+    Postgres(PostgresUrl),
+}
+
+impl FromStr for LimitsStoreSpec {
+    type Err = String;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        let spec = spec.trim();
+        if spec == "memory" {
+            return Ok(Self::Memory);
+        }
+        if spec.starts_with("postgres://") || spec.starts_with("postgresql://") {
+            return Ok(Self::Postgres(PostgresUrl::new(spec)));
+        }
+        Err(format!(
+            "expected \"memory\" or a postgres:// URL, got '{}'",
+            PostgresUrl::new(spec)
+        ))
+    }
+}
+
+impl fmt::Display for LimitsStoreSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Memory => f.write_str("memory"),
+            Self::Postgres(url) => write!(f, "postgres ({url})"),
+        }
+    }
+}
+
 /// Where the counts live, as `--limits-store` says: this process, or a
 /// Postgres every replica shares. One handle, cloned into every session.
 #[derive(Clone)]
