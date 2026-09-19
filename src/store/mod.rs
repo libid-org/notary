@@ -29,7 +29,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use bytesize::ByteSize;
 use url::Url;
 
@@ -196,8 +195,7 @@ impl Default for LeaseId {
 pub struct StoreError(pub String);
 
 /// Shared per-client limits. See the module docs for the two kinds.
-#[async_trait]
-pub trait LimitStore: Send + Sync + 'static {
+pub(crate) trait LimitStore: Send + Sync + 'static {
     /// A lease for `client` if fewer than `limit` are live; `None` if not.
     /// The lease expires by itself after `ttl`.
     async fn try_lease(
@@ -289,9 +287,16 @@ impl fmt::Display for LimitsStoreSpec {
 }
 
 /// Where the counts live, as `--limits-store` says: this process, or a
-/// Postgres every replica shares. One handle, cloned into every session.
+/// Postgres every replica shares. One handle, cloned into every session;
+/// each call goes to the backend the variant names.
 #[derive(Clone)]
-pub struct Store(Arc<dyn LimitStore>);
+pub enum Store {
+    Memory(Arc<MemoryStore>),
+    Postgres(Arc<PostgresStore>),
+    /// A test double, chosen at run time, so it is boxed.
+    #[cfg(test)]
+    Fake(Arc<dyn FakeStore>),
+}
 
 impl Store {
     /// Connect as `spec` says. A store that cannot be reached is an error
@@ -300,35 +305,169 @@ impl Store {
         Ok(match spec {
             LimitsStoreSpec::Memory => Self::memory(),
             LimitsStoreSpec::Postgres(url) => {
-                Self(Arc::new(PostgresStore::connect(url.as_str()).await?))
+                Self::Postgres(Arc::new(PostgresStore::connect(url.as_str()).await?))
             }
         })
     }
 
     /// Counts kept in this process only.
     pub fn memory() -> Self {
-        Self(Arc::new(MemoryStore::new()))
+        Self::Memory(Arc::new(MemoryStore::new()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake(store: impl FakeStore) -> Self {
+        Self::Fake(Arc::new(store))
     }
 }
 
-impl<S: LimitStore> From<S> for Store {
-    fn from(store: S) -> Self {
-        Self(Arc::new(store))
+impl LimitStore for Store {
+    async fn try_lease(
+        &self,
+        client: &ClientKey,
+        limit: usize,
+        ttl: Duration,
+    ) -> Result<Option<LeaseId>, StoreError> {
+        match self {
+            Self::Memory(store) => store.try_lease(client, limit, ttl).await,
+            Self::Postgres(store) => store.try_lease(client, limit, ttl).await,
+            #[cfg(test)]
+            Self::Fake(store) => store.try_lease(client, limit, ttl).await,
+        }
     }
-}
+    async fn release(&self, lease: &LeaseId) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(store) => store.release(lease).await,
+            Self::Postgres(store) => store.release(lease).await,
+            #[cfg(test)]
+            Self::Fake(store) => store.release(lease).await,
+        }
+    }
+    async fn count(
+        &self,
+        client: &ClientKey,
+        dimension: Dimension,
+        units: u64,
+        limits: &WindowLimits,
+    ) -> Result<bool, StoreError> {
+        match self {
+            Self::Memory(store) => store.count(client, dimension, units, limits).await,
+            Self::Postgres(store) => store.count(client, dimension, units, limits).await,
+            #[cfg(test)]
+            Self::Fake(store) => store.count(client, dimension, units, limits).await,
+        }
+    }
+    async fn would_fit(
+        &self,
+        client: &ClientKey,
+        dimension: Dimension,
+        units: u64,
+        limits: &WindowLimits,
+    ) -> Result<bool, StoreError> {
+        match self {
+            Self::Memory(store) => {
+                store.would_fit(client, dimension, units, limits).await
+            }
+            Self::Postgres(store) => {
+                store.would_fit(client, dimension, units, limits).await
+            }
+            #[cfg(test)]
+            Self::Fake(store) => store.would_fit(client, dimension, units, limits).await,
+        }
+    }
+    async fn charge(
+        &self,
+        client: &ClientKey,
+        dimension: Dimension,
+        units: u64,
+        limits: &WindowLimits,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(store) => store.charge(client, dimension, units, limits).await,
+            Self::Postgres(store) => store.charge(client, dimension, units, limits).await,
+            #[cfg(test)]
+            Self::Fake(store) => store.charge(client, dimension, units, limits).await,
+        }
+    }
+    async fn sweep(&self) -> Result<u64, StoreError> {
+        match self {
+            Self::Memory(store) => store.sweep().await,
+            Self::Postgres(store) => store.sweep().await,
+            #[cfg(test)]
+            Self::Fake(store) => store.sweep().await,
+        }
+    }
 
-impl std::ops::Deref for Store {
-    type Target = dyn LimitStore;
-
-    fn deref(&self) -> &Self::Target {
-        &*self.0
+    fn describe(&self) -> String {
+        match self {
+            Self::Memory(store) => store.describe(),
+            Self::Postgres(store) => store.describe(),
+            #[cfg(test)]
+            Self::Fake(store) => store.describe(),
+        }
     }
 }
 
 impl fmt::Debug for Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0.describe())
+        f.write_str(&self.describe())
     }
+}
+
+/// [`LimitStore`] for a test double: the same calls, boxed, because which
+/// double a test wants is decided at run time.
+#[cfg(test)]
+#[async_trait::async_trait]
+pub trait FakeStore: Send + Sync + 'static {
+    /// A lease for `client` if fewer than `limit` are live; `None` if not.
+    /// The lease expires by itself after `ttl`.
+    async fn try_lease(
+        &self,
+        client: &ClientKey,
+        limit: usize,
+        ttl: Duration,
+    ) -> Result<Option<LeaseId>, StoreError>;
+
+    /// Give a lease back. Releasing an expired or unknown lease is not an
+    /// error.
+    async fn release(&self, lease: &LeaseId) -> Result<(), StoreError>;
+
+    /// Count `units` of `dimension` for `client` if every window in `limits`
+    /// still has room for them; `Ok(false)` and nothing counted otherwise.
+    /// Empty `limits` always fits.
+    async fn count(
+        &self,
+        client: &ClientKey,
+        dimension: Dimension,
+        units: u64,
+        limits: &WindowLimits,
+    ) -> Result<bool, StoreError>;
+
+    /// Whether `units` more of `dimension` would fit, counting nothing.
+    async fn would_fit(
+        &self,
+        client: &ClientKey,
+        dimension: Dimension,
+        units: u64,
+        limits: &WindowLimits,
+    ) -> Result<bool, StoreError>;
+
+    /// Record `units` of `dimension` whether or not they fit. For what has
+    /// already happened -- bytes a finished session relayed.
+    async fn charge(
+        &self,
+        client: &ClientKey,
+        dimension: Dimension,
+        units: u64,
+        limits: &WindowLimits,
+    ) -> Result<(), StoreError>;
+
+    /// Drop expired leases and windows nothing will read again. Returns how
+    /// many rows went. Safe to run from every replica at once.
+    async fn sweep(&self) -> Result<u64, StoreError>;
+
+    /// One line for the startup log.
+    fn describe(&self) -> String;
 }
 
 /// A Postgres URL that prints with its password masked: the one in the user
@@ -496,7 +635,7 @@ mod tests {
     /// What every store must do. Written once; each implementation's tests
     /// run it against a store of their own. Clients are fresh per step so a
     /// shared database can run this from several checkouts at once.
-    pub(super) async fn conformance(store: &dyn LimitStore) -> Result<(), StoreError> {
+    pub(super) async fn conformance<S: LimitStore>(store: &S) -> Result<(), StoreError> {
         let long = Duration::from_secs(60);
         let hour = "10/1h".parse::<WindowLimits>().unwrap();
 

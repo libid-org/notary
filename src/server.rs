@@ -80,6 +80,7 @@ use crate::{
     },
     limits::available_cores,
     store::{
+        LimitStore,
         Store,
         WindowLimits,
     },
