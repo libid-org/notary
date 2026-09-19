@@ -5,10 +5,10 @@ edition = "2021"
 # The real floor, inherited from libid-rs (and the original monorepo before it):
 #   * TLSNotary alpha.15's `mpz` graph declares Rust 1.95;
 #   * the AWS SDK crates (via libid-signer) declare 1.94.1.
-rust-version = "1.95"
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/libid-org/notary"
-description = "The libID notary service: MPC-TLS / zkTLS notarization of a prover's HTTPS session into one signed ceremony attestation, under one notary identity."
+description = "The libID notary service: MPC-TLS / zkTLS notarization of a prover's HTTPS session into one signed attestation, under one notary identity."
 # A binary + companion library, never a registry crate: it names `tlsn`
 # (git-only upstream) in its manifest, which cargo refuses to publish.
 publish = false
@@ -21,22 +21,35 @@ path = "src/lib.rs"
 name = "notary"
 path = "src/main.rs"
 
+[[bin]]
+name = "notary-e2e"
+path = "src/bin/notary-e2e.rs"
+required-features = ["e2e"]
+
+[profile.release]
+# The MPC verifier is CPU-bound; whole-program optimisation is worth the
+# longer release build.
+lto = "fat"
+codegen-units = 1
+
+[features]
+# The binary the e2e suite runs: the production configuration plus where
+# ProxyMode dials. Never in a release build; `cargo test --features e2e`.
+e2e = []
+
 [dependencies]
 # ── libid-rs shared crates ──────────────────────────────────────────────────
 # All five ride the same git source, at the same tag, so their intra-workspace
 # `path` deps unify. libid-tlsn is git-only (upstream tlsn is not on crates.io)
 # and exposes sibling-crate types, so mixing the crates.io copies with the git
 # copy would put two incompatible versions of the same types in the graph.
-# libid-ceremony is direct because the notary constructs its attested record;
-# libid-tlsn also reaches the same crate through the workspace tag.
 # The upstream `tlsn` git rev is pinned by libid-tlsn and arrives the same way;
 # the direct `tlsn` entry below MUST name the same rev.
 #
-libid-ceremony = { git = "https://github.com/libid-org/libID-rs", tag = "v0.4.0" }
-libid-crypto = { git = "https://github.com/libid-org/libID-rs", tag = "v0.4.0" }
-libid-signer = { git = "https://github.com/libid-org/libID-rs", tag = "v0.4.0" }
-libid-tlsn = { git = "https://github.com/libid-org/libID-rs", tag = "v0.4.0" }
-libid-transcript = { git = "https://github.com/libid-org/libID-rs", tag = "v0.4.0" }
+libid-crypto = { git = "https://github.com/libid-org/libID-rs", tag = "v0.5.0" }
+libid-signer = { git = "https://github.com/libid-org/libID-rs", tag = "v0.5.0" }
+libid-tlsn = { git = "https://github.com/libid-org/libID-rs", tag = "v0.5.0" }
+libid-transcript = { git = "https://github.com/libid-org/libID-rs", tag = "v0.5.0" }
 
 # Upstream TLSNotary. The pin MUST equal libid-tlsn's (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible
@@ -51,9 +64,17 @@ axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 hex = "0.4"
+# The accept loop is ours: HTTP/1.1 only, with a header read timeout,
+# neither of which `axum::serve` can set.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
+# The shared limits store. Postgres because it is already deployed; rustls
+# because RDS speaks TLS and the image has no OpenSSL.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate", "macros"] }
+uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -63,12 +84,21 @@ tokio = { version = "1", features = [
     "signal",
     "time",
 ] }
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
+tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.7", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tungstenite = { version = "0.29", default-features = false }
+ipnet = "2"
+url = "2"
+humantime = "2"
+bytesize = "1"
+forwarded-header-value = "0.1.1"
 
 [dev-dependencies]
+# Boxes the test doubles' store calls; production dispatches statically.
+async-trait = "0.1"
 # Test-only HTTP client: it GETs the notary's own /info over plain HTTP on
 # loopback, so it needs no TLS backend. Leaving rustls on would pull
 # rustls-platform-verifier and its Android JNI tree into the lockfile for
@@ -78,7 +108,11 @@ tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8
 tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
 tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
 tokio = { version = "1", features = ["test-util"] }
-tokio-tungstenite = "0.30"
+# The same tungstenite axum uses, so the test graph carries one copy.
+tokio-tungstenite = "0.29"
+# The drain test sends the real binary a SIGTERM. Already in the graph
+# through tokio.
+libc = "0.2"
 
 # libid-org/tlsn#3 (merged) moved that branch onto libid-org/mpz 4db9454 and the
 # typed KOS `InstanceId` from libid-org/mpz#1; this pin is the merge commit on

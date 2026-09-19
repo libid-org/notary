@@ -3,7 +3,7 @@
 # Pin the builder to bookworm so its glibc matches the bookworm-slim runtime
 # stage below. A bare `-slim` tag floats to newer Debian (trixie), producing
 # binaries that need GLIBC_2.38+ and fail on bookworm (glibc 2.36) at runtime.
-FROM rust:1.95-slim-bookworm AS builder
+FROM rust:1.97-slim-bookworm AS builder
 
 # git: the libid-rs and tlsn dependencies are git sources. Nothing else is
 # needed — the TLS stack is rustls (aws-lc-sys/ring), so there is no openssl-sys
@@ -28,13 +28,16 @@ RUN rm -rf src \
 
 # ── Layer 2: real source — only rebuilds this crate ────────────────────────
 COPY src/ src/
+COPY migrations/ migrations/
 RUN cargo build --locked --release
 
 # === Runtime ===
 FROM debian:bookworm-slim
 
 # ca-certificates: outbound TLS to AWS KMS when SIGNING_KEY is `kms:<id>`.
-# netcat: the HEALTHCHECK probes the TCP wire port.
+# netcat: the HEALTHCHECK's HTTP client. The image has no curl or wget, and
+# none is added for a one-line probe; nc speaks enough HTTP/1.0 to GET
+# /healthcheck and read the status line.
 # libssl3 is deliberately not named: nothing links it -- `ldd` on the binary
 # lists libc, libm and libgcc_s only. ca-certificates still pulls it in through
 # openssl, so dropping the explicit install does not shrink the image; it stops
@@ -50,20 +53,31 @@ RUN groupadd --system --gid 10001 notary \
     && useradd --system --uid 10001 --gid notary --no-create-home --shell /usr/sbin/nologin notary
 USER 10001:10001
 
-# 7047: TCP wire protocol (Rust backend provers).
-# 7048: HTTP/WebSocket (browser tlsn-js / tlsn_wasm clients).
+# The port a connection arrives on is its policy; see README "Listeners".
+# 7047: MPC-TLS wire, internal (Rust provers in the cluster). Off unless
+#       NOTARY_PORT is set; no per-client limits, so never behind the balancer.
+# 7048: HTTP/WebSocket, public (browser tlsn_wasm clients, behind the load
+#       balancer, every per-client limit in force). On by default. With
+#       NOTARY_INTERNAL_PROXY_ROUTE=true it also serves the internal ProxyMode
+#       route /internal/notarize-proxy (no per-client limits), which the load
+#       balancer must answer 403 for -- there is no separate internal port.
 EXPOSE 7047 7048
 
-# The TCP wire listener accepts as soon as the signer is ready — a connect
-# proves the service is up without needing HTTP inside the container.
-# NOTARY_PORT, not a literal 7047: `--port`/NOTARY_PORT moves the listener, and
-# a hard-coded probe would report a healthy server as permanently unhealthy.
+# GET /healthcheck on the public port: 200 while serving, 503 from SIGTERM
+# until the in-flight sessions have drained, so an unhealthy container is one
+# that should get no new traffic. The public port is the one listener that is
+# on by default, which is why it is the probe target: `--port` is off unless
+# set, and a probe on it would report a correctly configured server as
+# permanently unhealthy. NOTARY_WS_PORT, not a literal 7048, for the same
+# reason. With NOTARY_WS_PORT=0 there is nothing to probe and the check fails.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD nc -z 127.0.0.1 "${NOTARY_PORT:-7047}" || exit 1
+    CMD printf 'GET /healthcheck HTTP/1.0\r\n\r\n' \
+        | nc -w 3 127.0.0.1 "${NOTARY_WS_PORT:-7048}" \
+        | head -n 1 | grep -q ' 200 ' || exit 1
 
 # Links the ghcr package to this repo and records what the image came from.
 LABEL org.opencontainers.image.source="https://github.com/libid-org/notary" \
-      org.opencontainers.image.description="libID notary service: MPC-TLS / zkTLS notarization into one signed ceremony attestation." \
+      org.opencontainers.image.description="libID notary service: MPC-TLS / zkTLS notarization into one signed attestation." \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 ENTRYPOINT ["notary"]

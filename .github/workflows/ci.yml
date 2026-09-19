@@ -40,6 +40,22 @@ jobs:
     name: Rust
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # The Postgres limits-store tests run only when NOTARY_TEST_DATABASE_URL
+    # is set and skip themselves otherwise, so a checkout without a database
+    # still passes; this service makes CI the place they always run. Pinned
+    # by digest like the actions, for the same reason.
+    services:
+      postgres:
+        image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94 # postgres:16, 2026-09-16
+        env:
+          POSTGRES_PASSWORD: notary
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -67,7 +83,13 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test --all
+        env:
+          # Under CI (which GitHub sets) the Postgres store tests panic when
+          # this is unset (src/store/postgres.rs), so losing this line fails
+          # the job instead of skipping them. The user is a superuser: one
+          # test ALTERs the database's default isolation and resets it.
+          NOTARY_TEST_DATABASE_URL: postgres://postgres:notary@localhost:5432/postgres
+        run: cargo test --all --features e2e
 
   # ---------------------------------------------------------------------------
   # DCO: every commit carries a Signed-off-by trailer, as CONTRIBUTING.md

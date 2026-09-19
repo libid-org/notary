@@ -2,13 +2,26 @@
 //!
 //! # Endpoints
 //!
-//! - **TCP** (port `NOTARY_PORT`): MPC-TLS verifier for Rust backend provers.
-//!   The section 9.1 ceremony attestation is written back down the socket the
-//!   prover opened. Nothing here dispatches on the server name: the record
-//!   carries it, and the contract that reads the record pins it.
+//! - **TCP** (`--port`): MPC-TLS verifier for Rust backend provers. The section
+//!   9.1 attestation is written back down the socket the prover
+//!   opened. Nothing here dispatches on the server name: the record carries
+//!   it, and the contract that reads the record pins it.
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
+//! - **GET  /healthcheck**: `{"status":"ok"}`, or 503 `{"status":"draining"}`
+//!   once the process has been told to stop.
 //! - **GET /notarize-proxy** (WS upgrade): ProxyMode session followed by one
-//!   length-prefixed ceremony attestation in its own WebSocket message.
+//!   length-prefixed attestation in its own WebSocket message.
+//! - **GET /internal/notarize-proxy** (WS upgrade, `--internal-proxy-route`
+//!   only): the same session for our own in-cluster services, with no
+//!   per-client limit and its own session pool. It exists for the load
+//!   balancer to block; a request that arrived through one -- it carries
+//!   `X-Forwarded-For` or `CF-Connecting-IP` -- is refused with 403.
+//!
+//! The HTTP routes are served on one listener (`--ws-port`), and the route
+//! is the whole classification: every per-client limit applies on
+//! `/notarize-proxy` and none on `/internal/notarize-proxy`. Nothing a
+//! request carries moves it from one tier to the other; the only thing a
+//! header can do on the internal route is get the request refused.
 //!
 //! # Trust model
 //!
@@ -19,175 +32,330 @@
 //! describes.
 //!
 //! Its signature alone registers nothing. A contract on the Consumer Chain
-//! authenticates it -- the Notary Service of ceremony-common section 9.1 --
+//! authenticates it -- the Notary Service, spec section 9.1 --
 //! and NOT the proving circuit: an attestation is authenticated on chain, and
 //! the circuit proves only what cannot be read from authenticated evidence.
 
 use std::{
     net::SocketAddr,
-    sync::Arc,
-    time::SystemTime,
+    pin::pin,
+    sync::{
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+        Arc,
+    },
+    time::Duration,
 };
 
 use axum::{
-    extract::{
-        ws::{
-            Message,
-            WebSocket,
-            WebSocketUpgrade,
-        },
-        State,
-    },
-    http::StatusCode,
-    response::{
-        IntoResponse,
-        Json,
-    },
-    routing::get,
+    extract::ConnectInfo,
+    middleware::AddExtension,
     Router,
 };
-use futures_util::{
-    SinkExt,
-    StreamExt,
+use hyper::server::conn::http1;
+use hyper_util::{
+    rt::{
+        TokioIo,
+        TokioTimer,
+    },
+    service::TowerToHyperService,
 };
-use libid_ceremony::AttestedData;
 use libid_signer::{
     ManagedSigner,
     SignerSource,
 };
-use libid_tlsn::attest::{
-    FromObserved,
-    ObservedSession,
-};
-use libid_transcript::{
-    write_msg,
-    AttestationWire,
-};
-use serde::Serialize;
-use tlsn::{
-    config::verifier::VerifierConfig,
-    connection::ServerName,
-    transcript::{
-        PartialTranscript,
-        TranscriptCommitment,
-    },
-    verifier::{
-        VerifierCommitStart,
-        VerifierOutput,
-    },
-    Session,
-};
+use tlsn::webpki::CertificateDer;
 use tokio::{
-    io::{
-        AsyncReadExt,
-        AsyncWriteExt,
-    },
     net::TcpListener,
-    sync::Semaphore,
+    sync::{
+        watch,
+        Semaphore,
+    },
 };
-use tokio_util::compat::TokioAsyncReadCompatExt;
-use tower_http::cors::{
-    Any,
-    CorsLayer,
-};
+use tokio_util::task::TaskTracker;
+use tower::Service;
 use tracing::{
+    debug,
     error,
     info,
+    warn,
 };
 
 use crate::{
-    config::NotaryServerConfig,
+    config::{
+        ClientIpHeader,
+        NotaryServerConfig,
+    },
     error::{
         Error,
         Result,
     },
+    limits::available_cores,
+    store::{
+        LimitStore,
+        Store,
+        WindowLimits,
+    },
 };
+
+mod accounting;
+mod attestation;
+mod mpc;
+mod routes;
+mod ws;
+
+use routes::router;
+
+/// How far along the server is in stopping. The listeners watch this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Accepting everything.
+    Running,
+    /// Told to stop: the MPC listener is closed, the HTTP listener answers
+    /// only to say so (503), and the sessions already running finish.
+    Draining,
+    /// Every session is done or out of time; the HTTP listener closes.
+    Stopped,
+}
 
 /// Handle for controlling the running notary server.
 pub struct NotaryServerHandle {
-    local_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     ws_local_addr: Option<SocketAddr>,
-    shutdown: tokio::sync::watch::Sender<bool>,
+    phase: watch::Sender<Phase>,
+    draining: Arc<AtomicBool>,
+    /// One token per connection, from admission to the handler's return, so
+    /// a drain knows when it is done.
+    in_flight: TaskTracker,
+    /// How long a drain waits for the sessions in flight: the setup
+    /// deadline plus the connection deadline, because a connection counts
+    /// from its handler's first moment and is bounded by both in turn.
+    drain_deadline: Duration,
 }
 
 impl NotaryServerHandle {
-    /// Returns the address the TCP wire listener is bound to.
-    pub fn local_addr(&self) -> SocketAddr {
+    /// Returns the address the internal MPC-TLS listener is bound to, if
+    /// enabled.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
         self.local_addr
     }
 
-    /// Returns the address the HTTP/WebSocket server is bound to, if enabled.
+    /// Returns the address the public HTTP/WebSocket server is bound to, if
+    /// enabled.
     pub fn ws_local_addr(&self) -> Option<SocketAddr> {
         self.ws_local_addr
     }
 
-    /// Signals every background task (TCP accept loop and WS server) to stop.
-    pub fn shutdown(self) {
-        let _ = self.shutdown.send(true);
+    /// Stops every listener now, without waiting for the sessions in
+    /// flight: what a second stop signal asks for while a drain is running.
+    pub fn shutdown(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+        let _ = self.phase.send(Phase::Stopped);
+    }
+
+    /// Stop taking work, finish what is running, then stop the listeners.
+    ///
+    /// The health check answers 503 from the first moment, so the load
+    /// balancer stops routing here while the sessions already running
+    /// finish; the MPC listener closes at once and its queue empties with an
+    /// error. The HTTP listener keeps answering -- 503 to every upgrade --
+    /// until the last session ends or the setup and connection deadlines
+    /// together elapse, because a closed port looks like a crash to the
+    /// balancer and a 503 looks like what it is. Then it closes too, and
+    /// this returns.
+    pub async fn drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+        let _ = self.phase.send(Phase::Draining);
+        self.in_flight.close();
+        let open = self.in_flight.len();
+        info!(
+            sessions = open,
+            deadline_secs = self.drain_deadline.as_secs(),
+            "draining: no new sessions; waiting for the ones in flight"
+        );
+        match tokio::time::timeout(self.drain_deadline, self.in_flight.wait()).await {
+            Ok(()) => info!("drained: every session finished"),
+            Err(_) => warn!(
+                sessions = self.in_flight.len(),
+                "drain deadline reached with sessions still running; stopping anyway"
+            ),
+        }
+        let _ = self.phase.send(Phase::Stopped);
     }
 }
 
-/// Overall deadline for one prover connection (TCP or WebSocket), covering
-/// the whole MPC-TLS/ProxyMode session plus the attestation exchange. A real
-/// session completes in well under a minute even on a slow link; 5 minutes is
-/// generous headroom. This is defense in depth:
-/// whatever future bug makes a session pend, no connection can pin a handler
-/// task (and its MPC buffers) forever.
-const CONNECTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Owns a spawned task and aborts it on drop unless the handle was taken back
-/// out with [`AbortOnDrop::into_inner`].
-///
-/// Dropping a bare [`tokio::task::JoinHandle`] DETACHES the task rather than
-/// cancelling it, so every `?` early return below would leave the spawned
-/// driver (or WS pump) running unsupervised — each aborted connection then
-/// retains the task and its buffers. With this guard, cancellation is the
-/// default on every exit path, including panics and the caller dropping the
-/// future; the success path opts out by taking the handle back to join it.
-/// (Same shape as the guard inside `libid-tlsn`'s session functions.)
-struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
-
-impl<T> AbortOnDrop<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
-        Self(Some(handle))
-    }
-
-    /// Disarm the guard and hand the handle back for joining.
-    fn into_inner(mut self) -> tokio::task::JoinHandle<T> {
-        self.0.take().expect("handle present until into_inner")
-    }
+/// Which ProxyMode route a request arrived on. This, and nothing else about
+/// the request, decides whether the per-client limits apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tier {
+    /// `/notarize-proxy`: browsers behind the load balancer; every limit
+    /// applies.
+    Public,
+    /// `/internal/notarize-proxy`, with `--internal-proxy-route`: our own
+    /// services; no per-client limit, no client address header keyed on,
+    /// and its own session pool.
+    Internal,
 }
 
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            handle.abort();
+impl Tier {
+    /// The path a ProxyMode session on this tier is opened on.
+    fn route(self) -> &'static str {
+        match self {
+            Self::Public => "/notarize-proxy",
+            Self::Internal => "/internal/notarize-proxy",
         }
     }
 }
+
+/// The headers a load balancer adds to name the client that connected to
+/// it. The public route keys its limits on one of them; the internal route
+/// refuses a request carrying either, because our own services reach it
+/// inside the cluster and never through the balancer.
+const PROXIED_BY: [&str; 2] = ["x-forwarded-for", "cf-connecting-ip"];
 
 #[derive(Clone)]
 struct NotaryState {
     /// Notary signing identity (local hex key or AWS KMS).
     signer: Arc<ManagedSigner>,
+    /// Public ProxyMode slots: an upgrade that finds none is refused with
+    /// 503.
     proxy_sessions: Arc<Semaphore>,
+    /// Internal ProxyMode slots: their own pool, so public load never
+    /// queues our own services behind it.
+    internal_proxy_sessions: Arc<Semaphore>,
+    /// ProxyMode slots each public client may hold at once; `0` disables
+    /// the cap.
+    max_sessions_per_ip: usize,
+    /// Where the public route's per-client counts live. Never consulted for
+    /// the internal route.
+    limits: Store,
+    /// Sessions one public client may start per window.
+    per_ip_upgrades: WindowLimits,
+    /// Bytes one public client may relay per window.
+    per_ip_bytes: WindowLimits,
+    /// Which header names the client on the public route. Never keyed on
+    /// for the internal route.
+    client_ip_header: ClientIpHeader,
+    /// Bytes one ProxyMode session may relay, both directions combined.
+    proxy_max_bytes: usize,
     proxy_root_store: Arc<tlsn::webpki::RootCertStore>,
-    /// `None` connects to the TLS-authenticated server name on port 443.
+    /// `None` connects to the TLS-authenticated server name on port 443;
+    /// The upstream override `run_with` was given; `None` dials
+    /// `<server name>:443`.
     proxy_server_addr: Option<SocketAddr>,
+    /// MPC-TLS slots: a prover that finds none waits for one. Closed on
+    /// shutdown, so the queue drains with an error instead of hanging.
+    mpc_sessions: Arc<Semaphore>,
+    /// Overall deadline for one session on either transport, from the moment
+    /// it starts: the session itself plus the attestation exchange, and for
+    /// MPC-TLS the wait for a slot. Defense in depth: whatever future bug
+    /// makes a session pend, no connection can pin a handler task (and its
+    /// MPC buffers) forever. Reaching a session is `setup_deadline`'s job.
+    connection_deadline: Duration,
+    /// How long a connection may sit before it starts its session. Until it
+    /// does it holds no slot, so an idle socket costs a socket and nothing
+    /// else.
+    setup_deadline: Duration,
     public_key_hex: String,
+    /// Set once the process has been told to stop: the health check says
+    /// so, and no upgrade is accepted.
+    draining: Arc<AtomicBool>,
+    /// The connections a drain waits for.
+    /// One token per connection, from admission to the handler's return, so
+    /// a drain knows when it is done.
+    in_flight: TaskTracker,
 }
 
-#[derive(Serialize)]
-struct InfoResponse {
-    version: String,
-    #[serde(rename = "publicKey")]
-    public_key: String,
+#[cfg(test)]
+impl NotaryState {
+    /// A state around `signer` with every limit at its default; a test
+    /// overrides the one field it exercises.
+    fn for_tests(signer: ManagedSigner) -> Self {
+        Self {
+            public_key_hex: hex::encode(signer.compressed_public_key()),
+            signer: Arc::new(signer),
+            proxy_sessions: Arc::new(Semaphore::new(crate::limits::DEFAULT_MAX_SESSIONS)),
+            internal_proxy_sessions: Arc::new(Semaphore::new(
+                crate::limits::DEFAULT_MAX_SESSIONS,
+            )),
+            max_sessions_per_ip: 4,
+            limits: Store::memory(),
+            per_ip_upgrades: "10/1m,60/30m,100/1h".parse::<WindowLimits>().unwrap(),
+            per_ip_bytes: "100MB/1m,600MB/30m,1GB/1h".parse::<WindowLimits>().unwrap(),
+            client_ip_header: ClientIpHeader::XForwardedFor,
+            proxy_max_bytes: 10_000_000,
+            proxy_root_store: Arc::new(libid_tlsn::root_store()),
+            proxy_server_addr: None,
+            mpc_sessions: Arc::new(Semaphore::new(4)),
+            connection_deadline: Duration::from_secs(300),
+            setup_deadline: Duration::from_secs(15),
+            draining: Arc::new(AtomicBool::new(false)),
+            in_flight: TaskTracker::new(),
+        }
+    }
 }
 
 // ─── Server startup ──────────────────────────────────────────────────────────
 
-/// Start the notary server (TCP + optional browser TLSNotary WebSocket).
+/// How often expired leases and dead windows are swept from the store.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
+
+/// Where every ProxyMode session dials instead of `<server name>:443`, and
+/// the root its certificate may chain to besides the public ones. Not a
+/// configuration: the release binary passes none, and only the binary the
+/// e2e suite builds (`--features e2e`) can supply one.
+#[derive(Clone, Debug)]
+pub struct Upstream {
+    pub addr: SocketAddr,
+    pub ca: Option<CertificateDer>,
+}
+
+/// Start the notary server: the MPC-TLS listener and the HTTP/WebSocket
+/// server, each only if configured.
 pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
+    run_with(config, None).await
+}
+
+/// [`run`], with every ProxyMode session dialling `upstream` instead of the
+/// server it authenticates.
+pub async fn run_with(
+    config: NotaryServerConfig,
+    upstream: Option<Upstream>,
+) -> Result<NotaryServerHandle> {
+    if config.internal_proxy_route && config.ws_port == 0 {
+        return Err(Error::NotaryServer {
+            detail: "--internal-proxy-route mounts on the public port, which \
+                     --ws-port 0 disables"
+                .into(),
+        });
+    }
+    let per_ip_upgrades = config.per_ip_upgrades.clone();
+    let per_ip_bytes = config.per_ip_bytes.clone();
+    let limits_store = config
+        .limits_store()
+        .map_err(|detail| Error::NotaryServer { detail })?;
+    let mut proxy_root_store = libid_tlsn::root_store();
+    let proxy_upstream = upstream.map(|upstream| {
+        warn!(
+            addr = %upstream.addr,
+            extra_root = upstream.ca.is_some(),
+            "every ProxyMode session dials the upstream override"
+        );
+        proxy_root_store.roots.extend(upstream.ca);
+        upstream.addr
+    });
+
+    // A store that cannot be reached is a startup error, not a limit that
+    // refuses every client once the process is up.
+    let limits =
+        Store::connect(&limits_store)
+            .await
+            .map_err(|e| Error::NotaryServer {
+                detail: e.to_string(),
+            })?;
+
     // SIGNING_KEY accepts `kms:<key-id-or-alias>` or a hex key.
     let signer = SignerSource::from_spec(&config.signing_key)?
         .build_managed(None)
@@ -198,1057 +366,296 @@ pub async fn run(config: NotaryServerConfig) -> Result<NotaryServerHandle> {
         "notary signer ready"
     );
     let public_key_hex = hex::encode(signer.compressed_public_key());
+
+    // Every limit in force, in one line, so an operator never has to read
+    // another crate to learn one of them. The MPC-TLS data limits are
+    // libid-tlsn's: the verifier rejects a session configured above them
+    // before any MPC work is done, and they are not tunable from here.
+    let cores = available_cores();
+    let mpc_max_sessions = config.mpc_max_sessions.resolve(cores);
+    info!(
+        proxy_max_sessions = config.max_sessions,
+        internal_max_sessions = config.internal_max_sessions,
+        proxy_max_bytes = config.proxy_max_bytes,
+        mpc_max_sessions,
+        mpc_max_sessions_setting = %config.mpc_max_sessions,
+        cores = cores.map(std::num::NonZeroUsize::get),
+        mpc_max_sent_data = libid_tlsn::MAX_SENT_DATA,
+        mpc_max_recv_data = libid_tlsn::MAX_RECV_DATA,
+        connection_deadline_secs = config.connection_deadline_secs,
+        setup_deadline_secs = config.setup_deadline_secs,
+        max_sessions_per_ip = config.max_sessions_per_ip,
+        per_ip_upgrades = %per_ip_upgrades,
+        per_ip_bytes = %per_ip_bytes,
+        client_ip_header = %config.client_ip_header,
+        limits_store = %limits.describe(),
+        "resource limits in force"
+    );
     let state = NotaryState {
         signer: Arc::new(signer),
         proxy_sessions: Arc::new(Semaphore::new(config.max_sessions)),
-        proxy_root_store: Arc::new(libid_tlsn::root_store()),
-        proxy_server_addr: None,
+        internal_proxy_sessions: Arc::new(Semaphore::new(config.internal_max_sessions)),
+        max_sessions_per_ip: config.max_sessions_per_ip,
+        limits,
+        per_ip_upgrades,
+        per_ip_bytes,
+        client_ip_header: config.client_ip_header,
+        proxy_max_bytes: config.proxy_max_bytes,
+        proxy_root_store: Arc::new(proxy_root_store),
+        proxy_server_addr: proxy_upstream,
+        mpc_sessions: Arc::new(Semaphore::new(mpc_max_sessions)),
+        connection_deadline: config.connection_deadline(),
+        setup_deadline: config.setup_deadline(),
         public_key_hex,
+        draining: Arc::new(AtomicBool::new(false)),
+        in_flight: TaskTracker::new(),
     };
 
-    // Broadcast shutdown to the TCP and WebSocket servers.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Broadcast the phase to the listeners and the sweeper.
+    let (phase_tx, phase_rx) = watch::channel(Phase::Running);
 
-    // ── TCP listener (Rust client) ────────────────────────────────────
-    let tcp_listener =
-        TcpListener::bind(format!("{}:{}", config.host, config.port)).await?;
-    let local_addr = tcp_listener.local_addr()?;
-    info!("Notary TCP listening on {}", local_addr);
+    // ── Internal MPC-TLS listener (Rust provers in the cluster) ───────
+    // Off unless configured: it has no per-client limits.
+    let tcp_listener = match config.port {
+        Some(port) => Some(TcpListener::bind(format!("{}:{port}", config.host)).await?),
+        None => None,
+    };
+    let local_addr = tcp_listener.as_ref().and_then(|l| l.local_addr().ok());
+    match local_addr {
+        Some(addr) => info!("Notary MPC-TLS listening on {addr} (internal)"),
+        None => info!("Notary MPC-TLS port off (--port not set)"),
+    }
 
-    // ── WebSocket HTTP server (browser / tlsn-js) ─────────────────────
+    // ── Public HTTP/WebSocket server (browser / tlsn-js) ──────────────
     let ws_listener = if config.ws_port == 0 {
         None
     } else {
         let ws_addr = format!("{}:{}", config.host, config.ws_port);
-        TcpListener::bind(&ws_addr).await.ok()
+        Some(TcpListener::bind(&ws_addr).await?)
     };
     let ws_local_addr = ws_listener.as_ref().and_then(|l| l.local_addr().ok());
-    if let Some(addr) = ws_local_addr {
-        info!("Notary WebSocket listening on {addr} (browser TLSNotary API)");
+    match ws_local_addr {
+        Some(addr) => info!("Notary WebSocket listening on {addr} (public)"),
+        None => info!("Notary public WebSocket port off (--ws-port 0)"),
+    }
+    // The internal route rides the public port; the balancer has to block
+    // it, and this line is what an operator checks against that config.
+    if config.internal_proxy_route {
+        info!(
+            internal_proxy_route = true,
+            route = Tier::Internal.route(),
+            "internal ProxyMode route mounted on the public port; no per-client \
+             limits, the load balancer must answer 403 for /internal/*"
+        );
+    } else {
+        info!(
+            internal_proxy_route = false,
+            "internal ProxyMode route off (--internal-proxy-route not set)"
+        );
     }
 
-    let tcp_state = state.clone();
-    let mut tcp_shutdown = shutdown_rx.clone();
+    if let Some(tcp_listener) = tcp_listener {
+        let tcp_state = state.clone();
+        let mut tcp_phase = phase_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = tcp_listener.accept() => {
+                        match result {
+                            Ok((stream, peer)) => {
+                                info!("TCP connection from {}", peer);
+                                let s = tcp_state.clone();
+                                let in_flight = s.in_flight.token();
+                                tokio::spawn(async move {
+                                    if let Err(e) = s.handle_tcp_prover(stream).await {
+                                        error!("TCP handler error for {}: {}", peer, e);
+                                    }
+                                    drop(in_flight);
+                                });
+                            }
+                            Err(e) => error!("TCP accept failed: {}", e),
+                        }
+                    }
+                    // Any change is at least Draining: stop accepting.
+                    _ = tcp_phase.changed() => {
+                        info!("Notary TCP shutting down");
+                        // Provers still waiting for a slot fail now with a clear
+                        // error; the ones holding a slot keep it to the end.
+                        tcp_state.mpc_sessions.close();
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    if let Some(listener) = ws_listener {
+        spawn_http_server(
+            listener,
+            router(state.clone(), config.internal_proxy_route),
+            phase_rx.clone(),
+            state.setup_deadline,
+        );
+    }
+
+    // Expired leases and dead windows go on their own; the sweep only keeps
+    // the store from growing. Every replica runs one, which is safe.
+    let sweep_store = state.limits.clone();
+    let mut sweep_phase = phase_rx;
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                result = tcp_listener.accept() => {
-                    match result {
-                        Ok((stream, peer)) => {
-                            info!("TCP connection from {}", peer);
-                            let s = tcp_state.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_tcp_prover(stream, &s).await {
-                                    error!("TCP handler error for {}: {}", peer, e);
-                                }
-                            });
-                        }
-                        Err(e) => error!("TCP accept failed: {}", e),
+                () = tokio::time::sleep(SWEEP_EVERY) => {
+                    match sweep_store.sweep().await {
+                        Ok(rows) => debug!(rows, "limits store swept"),
+                        Err(error) => warn!(%error, "limits store sweep failed"),
                     }
                 }
-                _ = tcp_shutdown.changed() => {
-                    info!("Notary TCP shutting down");
-                    break;
-                }
+                _ = sweep_phase.changed() => break,
             }
         }
     });
 
-    if let Some(ws_listener) = ws_listener {
-        let ws_state = state.clone();
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_headers(Any)
-            .allow_methods(Any);
-
-        let app = Router::new()
-            .route("/info", get(info_handler))
-            .route("/notarize-proxy", get(notarize_proxy_ws_handler))
-            .layer(cors)
-            .with_state(ws_state);
-
-        let mut ws_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            axum::serve(ws_listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = ws_shutdown.changed().await;
-                })
-                .await
-                .unwrap_or_else(|e| error!("WS server error: {}", e));
-        });
-    }
-
     Ok(NotaryServerHandle {
         local_addr,
         ws_local_addr,
-        shutdown: shutdown_tx,
+        phase: phase_tx,
+        draining: Arc::clone(&state.draining),
+        in_flight: state.in_flight.clone(),
+        // A token lives from admission to the handler's return: the setup
+        // deadline bounds the first stretch, the connection deadline the second.
+        drain_deadline: state.setup_deadline + state.connection_deadline,
     })
 }
 
-// ─── REST handlers ───────────────────────────────────────────────────────────
+/// How long the accept loop waits after an accept fails for a reason that
+/// is the host's, such as running out of file descriptors, before it tries
+/// again.
+const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 
-async fn info_handler(State(state): State<NotaryState>) -> Json<InfoResponse> {
-    Json(InfoResponse {
-        version: format!("v{}", env!("CARGO_PKG_VERSION")),
-        public_key: state.public_key_hex.clone(),
-    })
-}
-
-// ─── Ceremony attestation ───────────────────────────────────────────────────
-
-// The wire record itself is `libid_transcript::AttestationWire`. It is defined
-// there, beside the `write_msg`/`read_msg` that frame it, because a prover has
-// to read exactly what this writes -- and a copy here would be a second
-// definition of one message, agreeing only for as long as nobody renames a
-// field. What the notary puts in it is still decided here, and it is nothing
-// it derived by applying a profile rule: no handle, no account identifier, no
-// client identifier, no chain address (REQ-COMMON-61). Every one is derivable
-// from the revealed ranges, and a second signed representation can disagree
-// with the bytes it was taken from. That is why this endpoint no longer takes
-// `handle`, `user_id` or `session_addr` -- the Platform Verifier reads them
-// itself, and the notary deciding them would be the profile-specific
-// judgement REQ-COMMON-33 forbids it.
-
-/// Build the section 9.1 attested data for one completed session and sign it.
+/// Serve `app` on `listener` until the phase reaches `Stopped`. Draining
+/// keeps the listener open on purpose: the health check has to be reachable
+/// to say 503.
 ///
-/// Both transports end here and receive the same record on their reclaimed
-/// channel, because transport says nothing about the TLS session it describes.
-async fn sign_ceremony_attestation(
-    signer: &ManagedSigner,
-    partial: &PartialTranscript,
-    authority: &str,
-    commitments: &[TranscriptCommitment],
-    created_at: u64,
-) -> Result<AttestationWire> {
-    let attested = AttestedData::from_observed(ObservedSession {
-        transcript: partial,
-        authority,
-        commitments,
-        created_at,
-    })
-    .map_err(|e| Error::NotaryServer {
-        detail: format!("attested data: {e}"),
-    })?;
-    let encoded = attested.encode().map_err(|e| Error::NotaryServer {
-        detail: format!("encode attested data: {e}"),
-    })?;
-
-    // The notary signs `keccak256(attestedData)` and no other preimage
-    // (REQ-COMMON-47).
-    let notary_signature = signer
-        .sign_claim(&libid_crypto::keccak256(&encoded))
-        .await?;
-    Ok(AttestationWire {
-        attested_data: encoded,
-        notary_signature,
-    })
-}
-
-fn attestation_frame(attestation: &AttestationWire) -> Result<Vec<u8>> {
-    const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
-
-    let json = serde_json::to_vec(attestation)?;
-    if json.len() > MAX_FRAME_BYTES {
-        return Err(Error::NotaryServer {
-            detail: format!("attestation frame is too large: {} bytes", json.len()),
-        });
-    }
-    let len = u32::try_from(json.len())
-        .map_err(|_| Error::NotaryServer {
-            detail: format!("attestation frame is too large: {} bytes", json.len()),
-        })?
-        .to_be_bytes();
-    let mut frame = Vec::with_capacity(len.len() + json.len());
-    frame.extend_from_slice(&len);
-    frame.extend_from_slice(&json);
-    Ok(frame)
-}
-
-// ─── ProxyMode WebSocket handler ─────────────────────────────────────────────
-//
-// The browser (prover) connects here as a WebSocket. The notary runs the
-// ProxyMode verifier: it forwards raw TLS bytes between the browser and the
-// target server, authenticates the transcript against the record layer's own
-// tags, then receives the prover's reveal request and captures what the
-// session disclosed.
-
-async fn notarize_proxy_ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<NotaryState>,
-) -> impl IntoResponse {
-    let Ok(permit) = Arc::clone(&state.proxy_sessions).try_acquire_owned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    ws.on_upgrade(move |socket| handle_ws_proxy_notarize(socket, state, permit))
-        .into_response()
-}
-
-async fn handle_ws_proxy_notarize(
-    socket: WebSocket,
-    state: NotaryState,
-    // Held for the connection lifetime; dropping it returns the session slot.
-    _permit: tokio::sync::OwnedSemaphorePermit,
+/// HTTP/1.1 only: the balancer speaks nothing else to a target and the
+/// WebSocket upgrade is HTTP/1.1. A connection that has not sent its
+/// request headers within `header_deadline` is closed; until it has, it
+/// holds no token, no slot and no client, so this is its only bound.
+fn spawn_http_server(
+    listener: TcpListener,
+    app: Router,
+    mut phase: watch::Receiver<Phase>,
+    header_deadline: Duration,
 ) {
-    let (io_a, io_b) = tokio::io::duplex(1 << 17);
-    let (mut ws_tx, mut ws_rx) = socket.split();
-    let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
-
-    // Keep inbound and outbound ownership separate. Whichever direction ends
-    // first must not cancel a write already accepted in the other direction.
-    let (attestation_tx, attestation_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
-    let _inbound_task = AbortOnDrop::new(tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                Message::Binary(data) if pipe_writer.write_all(&data).await.is_err() => {
-                    break
-                }
-                Message::Close(_) => break,
-                _ => {}
-            }
-        }
-    }));
-    let outbound_task = AbortOnDrop::new(tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
+    tokio::spawn(async move {
+        // Connect info so a session's log lines can name the peer.
+        let mut make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+        let connections = TaskTracker::new();
         loop {
-            match pipe_reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if ws_tx
-                        .send(Message::Binary(buf[..n].to_vec().into()))
-                        .await
-                        .is_err()
-                    {
-                        return;
+            let (stream, peer) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) if is_peer_error(&error) => continue,
+                    Err(error) => {
+                        error!(%error, "HTTP accept failed");
+                        tokio::time::sleep(ACCEPT_RETRY).await;
+                        continue;
                     }
+                },
+                changed = phase.changed() => {
+                    if changed.is_err() || *phase.borrow_and_update() == Phase::Stopped {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let service = make_service
+                .call(peer)
+                .await
+                .unwrap_or_else(|never| match never {});
+            connections.spawn(serve_connection(
+                stream,
+                peer,
+                service,
+                phase.clone(),
+                header_deadline,
+            ));
+        }
+        drop(listener);
+        connections.close();
+        connections.wait().await;
+    });
+}
+
+/// One HTTP/1.1 connection, served until the peer is done with it or the
+/// phase reaches `Stopped`, when it is told to finish the request in
+/// progress and close. A WebSocket upgrade hands the stream to its session
+/// and ends the connection here.
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    service: AddExtension<Router, ConnectInfo<SocketAddr>>,
+    mut phase: watch::Receiver<Phase>,
+    header_deadline: Duration,
+) {
+    let mut connection = pin!(http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_deadline)
+        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
+        .with_upgrades());
+    let served = loop {
+        tokio::select! {
+            served = connection.as_mut() => break served,
+            changed = phase.changed() => {
+                if changed.is_err() || *phase.borrow_and_update() == Phase::Stopped {
+                    connection.as_mut().graceful_shutdown();
+                    break connection.await;
                 }
             }
         }
-
-        // This message boundary is the handoff: TLSNotary may read ahead
-        // within one WebSocket message, but it cannot consume this later one
-        // before its mux has finished.
-        if let Ok(frame) = attestation_rx.await {
-            let _ = ws_tx.send(Message::Binary(frame.into())).await;
-        }
-        let _ = ws_tx.send(Message::Close(None)).await;
-    }));
-
-    let protocol = async {
-        let result = match run_proxy_verifier_session(io_b, &state).await {
-            Ok(attestation) => attestation_frame(&attestation).and_then(|frame| {
-                attestation_tx.send(frame).map_err(|_| Error::NotaryServer {
-                    detail: "browser disconnected before attestation handoff".into(),
-                })
-            }),
-            Err(error) => {
-                drop(attestation_tx);
-                Err(error)
-            }
-        };
-        if let Err(error) = outbound_task.into_inner().await {
-            error!("ProxyMode WebSocket outbound pump join error: {error}");
-        }
-        result
     };
-
-    match tokio::time::timeout(CONNECTION_DEADLINE, protocol).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("ProxyMode verifier error: {}", e),
-        Err(_) => error!(
-            "ProxyMode session exceeded the {}s connection deadline; aborting",
-            CONNECTION_DEADLINE.as_secs()
-        ),
+    if let Err(error) = served {
+        debug!(%peer, %error, "HTTP connection ended");
     }
 }
 
-async fn run_proxy_verifier_session<T>(
-    socket: T,
-    state: &NotaryState,
-) -> Result<AttestationWire>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-{
-    let session = Session::new(socket.compat());
-    let (driver, mut handle) = session.split();
-    // Guarded spawn: every exit path below — each `?`, panics, the caller
-    // dropping this future — aborts the driver instead of detaching it.
-    let driver_task = AbortOnDrop::new(tokio::spawn(driver));
-
-    // An inner error means a rejection was sent and the driver must be joined
-    // before returning; an outer error can abort the guarded driver.
-    let setup = async {
-        let verifier = handle
-            .new_verifier(
-                VerifierConfig::builder()
-                    .root_store(state.proxy_root_store.as_ref().clone())
-                    .build()
-                    .map_err(|e| Error::NotaryServer {
-                        detail: format!("verifier config: {e}"),
-                    })?,
-            )
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("new verifier: {e}"),
-            })?;
-
-        let verifier = verifier.commit().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier commit: {e}"),
-        })?;
-
-        let proxy_verifier = match verifier {
-            VerifierCommitStart::Proxy(v) => v,
-            _ => {
-                return Err(Error::NotaryServer {
-                    detail: "expected ProxyTls protocol, got other".into(),
-                });
-            }
-        };
-
-        let server_name_str = proxy_verifier.config().server_name().as_str().to_string();
-        info!("ProxyMode: connecting to {server_name_str}:443");
-
-        let server_addr = state
-            .proxy_server_addr
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| format!("{server_name_str}:443"));
-        let server_tcp = match tokio::net::TcpStream::connect(server_addr).await {
-            Ok(server_tcp) => server_tcp,
-            Err(error) => {
-                let detail = format!("TCP connect to {server_name_str}: {error}");
-                proxy_verifier
-                    .reject(Some("UPSTREAM_CONNECT_FAILED"))
-                    .await
-                    .map_err(|error| Error::NotaryServer {
-                        detail: format!("send connection rejection: {error}"),
-                    })?;
-                handle.close();
-                return Ok(Err(Error::NotaryServer { detail }));
-            }
-        };
-
-        let verifier = proxy_verifier
-            .accept()
-            .await
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("verifier accept: {e}"),
-            })?
-            .run(server_tcp.compat())
-            .await
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("run_proxy: {e}"),
-            })?;
-
-        let verifier = verifier.verify().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier verify: {e}"),
-        })?;
-
-        if !verifier.request().server_identity() {
-            verifier
-                .reject(Some("server identity is required"))
-                .await
-                .ok();
-            return Err(Error::NotaryServer {
-                detail: "prover did not request server identity reveal".into(),
-            });
-        }
-
-        let (
-            VerifierOutput {
-                server_name,
-                transcript,
-                transcript_commitments,
-            },
-            verifier,
-        ) = verifier.accept().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier output accept: {e}"),
-        })?;
-
-        verifier.close().await.map_err(|e| Error::NotaryServer {
-            detail: format!("verifier close: {e}"),
-        })?;
-        handle.close();
-
-        Ok::<_, Error>(Ok((server_name, transcript, transcript_commitments)))
+/// Whether an accept failed because of the peer, which hung up before it
+/// was accepted, rather than the host. A peer's failure is nothing to
+/// wait out.
+fn is_peer_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{
+        ConnectionAborted,
+        ConnectionRefused,
+        ConnectionReset,
     };
-    let setup_outcome = setup.await?;
-    let (server_name, transcript, transcript_commitments) = match setup_outcome {
-        Ok(output) => output,
-        Err(error) => {
-            let _ = driver_task.into_inner().await;
-            return Err(error);
-        }
-    };
-
-    let io = driver_task
-        .into_inner()
-        .await
-        .map_err(|e| Error::NotaryServer {
-            detail: format!("driver join: {e}"),
-        })?
-        .map_err(|e| Error::NotaryServer {
-            detail: format!("driver: {e}"),
-        })?
-        .into_inner();
-    drop(io);
-
-    // What the prover chose to reveal is not read here and not judged here.
-    // Which ranges a profile expects belongs to the Platform Verifier
-    // (REQ-COMMON-51), and this used to name them -- one endpoint's shape
-    // written into the notary, which is the profile-specific decision
-    // REQ-COMMON-33 forbids it from making.
-    let server_name = server_name.ok_or_else(|| Error::NotaryServer {
-        detail: "prover did not reveal server name".into(),
-    })?;
-    let ServerName::Dns(ref dns_name) = server_name;
-    let domain = dns_name.as_str().to_string();
-
-    // Which host answered is attested, not restricted. The record carries the
-    // cert-verified server name as `authorityId`, and each Platform Verifier
-    // compares that against the authority its own profile pins -- so an
-    // attestation naming an attacker's server is refused on chain, by the
-    // contract that knows which host the session was supposed to reach.
-    //
-    // Pinning one hostname here would add nothing to that and would cost
-    // something real: GitHub alone needs two authorities (`github.com` for the
-    // exchange, `api.github.com` for the identity session), so a single
-    // platform identity cannot serve even one platform, let alone a notary
-    // shared by X and GitHub. Limiting who may use a public notary is access
-    // control, and belongs where access control lives.
-
-    let partial_transcript = transcript;
-    if let Some(ref pt) = partial_transcript {
-        info!(
-            "ProxyMode verified: {} sent, {} recv bytes for {domain}",
-            pt.sent_unsafe().len(),
-            pt.received_unsafe().len()
-        );
-    } else {
-        info!("ProxyMode verified: no transcript revealed for {domain} (commits only)");
-    }
-
-    // ── Extract the single hash commit per session ──
-    //
-    // Keep the session's own output rather than flattening it. Which ranges a
-    // profile expects, and what their bytes must contain, is the Platform
-    // Verifier's business (REQ-COMMON-51); the notary answers only for what it
-    // observed. The range-count rules that used to live here encoded one
-    // endpoint's shape into the notary, which is exactly the profile-specific
-    // decision REQ-COMMON-33 forbids it from making.
-    let Some(partial) = partial_transcript else {
-        return Err(Error::NotaryServer {
-            detail: "session revealed no transcript".into(),
-        });
-    };
-
-    let attestation = sign_ceremony_attestation(
-        &state.signer,
-        &partial,
-        dns_name.as_str(),
-        &transcript_commitments,
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+    matches!(
+        error.kind(),
+        ConnectionRefused | ConnectionAborted | ConnectionReset
     )
-    .await?;
-    info!("ProxyMode: ceremony attestation ready for {domain}");
-    Ok(attestation)
-}
-
-// ─── Core notary logic (transport-agnostic) ─────────────────────────────────
-
-/// TCP client (Rust backend prover) — uses the full custom wire protocol.
-async fn handle_tcp_prover<T>(socket: T, state: &NotaryState) -> Result<()>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
-{
-    // Deadline on the WHOLE connection, not any single step: no TCP client —
-    // however broken — may pin this handler task past [`CONNECTION_DEADLINE`].
-    tokio::time::timeout(CONNECTION_DEADLINE, handle_notary_session(socket, state))
-        .await
-        .map_err(|_| Error::NotaryServer {
-            detail: format!(
-                "connection exceeded the {}s deadline",
-                CONNECTION_DEADLINE.as_secs()
-            ),
-        })?
-}
-
-async fn handle_notary_session<T>(socket: T, state: &NotaryState) -> Result<()>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
-{
-    let result = libid_tlsn::verifier(socket).await?;
-    handle_verified_session(result, state).await
-}
-
-async fn handle_verified_session<T>(
-    result: libid_tlsn::VerifierResult<T>,
-    state: &NotaryState,
-) -> Result<()>
-where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
-{
-    let transcript = &result.partial_transcript;
-    let sent = transcript.sent_unsafe();
-    let recv = transcript.received_unsafe();
-    info!(
-        "Verification complete: {} sent, {} recv bytes",
-        sent.len(),
-        recv.len()
-    );
-
-    let ServerName::Dns(ref dns_name) = result.server_name;
-    let domain = dns_name.as_str().to_string();
-    info!("Domain from SNI: {}", domain);
-
-    // The ceremony record is transport-agnostic and session-agnostic. It is
-    // built from what the session revealed, the server the notary
-    // authenticated, the commitments over the rest, and the notary's own clock
-    // -- an MPC-TLS session produces all four exactly as a ProxyMode one does,
-    // and the keeper's JWKS reading exactly as a platform session does. This
-    // used to dispatch on the server name and answer `www.googleapis.com` with
-    // a Merkle proof of its own shape; that was the notary deciding what a
-    // session was for, which is the profile-specific decision REQ-COMMON-33
-    // forbids it from making. The record names the host; the contract that
-    // reads the record decides whether it wanted that host.
-    let ceremony_attestation = sign_ceremony_attestation(
-        &state.signer,
-        &result.partial_transcript,
-        &domain,
-        &result.transcript_commitments,
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    )
-    .await?;
-
-    let mut io = result.recovered_io;
-    write_msg(&mut io, &ceremony_attestation).await?;
-    info!("Ceremony attestation sent to prover");
-
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn attestation_is_one_length_prefixed_frame_then_eof() {
-        use libid_transcript::read_msg;
-        use tokio::io::AsyncReadExt;
+    use libid_signer::{
+        ManagedSigner,
+        SignerSource,
+    };
 
-        use super::{
-            attestation_frame,
-            AttestationWire,
-        };
+    /// Each session test drives a real MPC-TLS or ProxyMode setup, which is
+    /// CPU-heavy in a debug build. Run at once on a 4-vCPU CI runner they
+    /// starve each other past their timeouts; one at a time they fit easily.
+    pub(super) static ONE_SESSION_AT_A_TIME: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
-        let frame = attestation_frame(&AttestationWire {
-            attested_data: vec![1, 2, 3],
-            notary_signature: vec![4; 65],
-        })
-        .unwrap();
-        let mut browser = frame.as_slice();
+    /// anvil #0 — public test key.
+    const TEST_KEY: &str =
+        "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
-        let frame: serde_json::Value = read_msg(&mut browser).await.unwrap();
-        assert_eq!(frame["attested_data"], serde_json::json!([1, 2, 3]));
-        assert_eq!(frame["notary_signature"].as_array().unwrap().len(), 65);
-        assert_eq!(browser.read(&mut [0]).await.unwrap(), 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mpc_protocol_returns_attestation_on_the_recovered_socket() {
-        use std::{
-            sync::Arc,
-            time::Duration,
-        };
-
-        use libid_signer::SignerSource;
-        use libid_transcript::read_msg;
-        use tlsn::{
-            config::verifier::VerifierConfig,
-            verifier::{
-                VerifierCommitStart,
-                VerifierOutput,
-            },
-            webpki::{
-                CertificateDer,
-                RootCertStore,
-            },
-            Session,
-        };
-        use tlsn_sdk_core::{
-            HttpRequest,
-            ProverConfig,
-            Reveal,
-            SdkProver,
-        };
-        use tlsn_server_fixture_certs::{
-            CA_CERT_DER,
-            SERVER_DOMAIN,
-        };
-        use tokio::io::AsyncReadExt;
-        use tokio_util::compat::{
-            FuturesAsyncReadCompatExt,
-            TokioAsyncReadCompatExt,
-        };
-
-        use super::{
-            handle_verified_session,
-            AttestationWire,
-            NotaryState,
-        };
-
-        const TEST_KEY: &str =
-            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-
-        let signer = SignerSource::from_spec(TEST_KEY)
+    pub(super) async fn test_signer() -> ManagedSigner {
+        SignerSource::from_spec(TEST_KEY)
             .unwrap()
             .build_managed(None)
             .await
-            .unwrap();
-        let expected_pubkey = signer.compressed_public_key().to_vec();
-        let state = NotaryState {
-            signer: Arc::new(signer),
-            proxy_sessions: Arc::new(tokio::sync::Semaphore::new(1)),
-            proxy_root_store: Arc::new(libid_tlsn::root_store()),
-            proxy_server_addr: None,
-            public_key_hex: String::new(),
-        };
-
-        let (prover_io, notary_io) = tokio::io::duplex(2 << 23);
-        let (target_io, fixture_io) = tokio::io::duplex(1 << 17);
-        let fixture_task = tokio::spawn(async move {
-            tlsn_server_fixture::bind(fixture_io.compat())
-                .await
-                .unwrap();
-        });
-
-        let notary_task = tokio::spawn(async move {
-            let session = Session::new(notary_io.compat());
-            let (driver, mut handle) = session.split();
-            let driver_task = tokio::spawn(driver);
-            let verifier = handle
-                .new_verifier(
-                    VerifierConfig::builder()
-                        .root_store(RootCertStore {
-                            roots: vec![CertificateDer(CA_CERT_DER.to_vec())],
-                        })
-                        .build()
-                        .unwrap(),
-                )
-                .unwrap();
-            let verifier = verifier.commit().await.unwrap();
-            let VerifierCommitStart::Mpc(verifier) = verifier else {
-                panic!("expected MPC mode");
-            };
-            let verifier = verifier.accept().await.unwrap().run().await.unwrap();
-            let tls_transcript = verifier.tls_transcript().clone();
-            let (output, verifier) =
-                verifier.verify().await.unwrap().accept().await.unwrap();
-            verifier.close().await.unwrap();
-            handle.close();
-
-            let VerifierOutput {
-                server_name,
-                transcript,
-                transcript_commitments,
-                ..
-            } = output;
-            let recovered_io = driver_task.await.unwrap().unwrap().into_inner();
-            handle_verified_session(
-                libid_tlsn::VerifierResult {
-                    partial_transcript: transcript.unwrap(),
-                    server_name: server_name.unwrap(),
-                    tls_transcript,
-                    transcript_commitments,
-                    recovered_io,
-                },
-                &state,
-            )
-            .await
-            .unwrap();
-        });
-
-        let protocol = async {
-            let mut prover = SdkProver::new(
-                ProverConfig::builder(SERVER_DOMAIN)
-                    .root_certs(vec![CA_CERT_DER.to_vec()])
-                    .build()
-                    .unwrap(),
-            )
-            .unwrap();
-            prover.setup(prover_io.compat()).await.unwrap();
-            let response = prover
-                .send_request_mpc(
-                    target_io.compat(),
-                    HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
-                        .header("Host", SERVER_DOMAIN)
-                        .header("Connection", "close"),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status, 200);
-
-            let transcript = prover.transcript().unwrap();
-            prover
-                .reveal(
-                    Reveal::new()
-                        .sent(0..transcript.sent.len())
-                        .recv(0..transcript.recv.len())
-                        .server_identity(true),
-                    None,
-                )
-                .await
-                .unwrap();
-
-            let mut io = prover.finish().await.unwrap().compat();
-            let attestation: AttestationWire = read_msg(&mut io).await.unwrap();
-            assert_eq!(
-                &attestation.attested_data[..32],
-                &libid_crypto::keccak256(SERVER_DOMAIN.as_bytes())
-            );
-            let recovered = libid_crypto::recover_eth_claim(
-                &attestation.notary_signature,
-                &libid_crypto::keccak256(&attestation.attested_data),
-            )
-            .unwrap();
-            assert_eq!(recovered.to_encoded_point(true).as_bytes(), expected_pubkey);
-            assert_eq!(io.read(&mut [0]).await.unwrap(), 0);
-        };
-
-        tokio::time::timeout(Duration::from_secs(60), protocol)
-            .await
-            .expect("local MPC smoke timed out");
-        notary_task.await.unwrap();
-        fixture_task.await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn proxy_protocol_returns_attestation_on_the_reclaimed_websocket() {
-        use std::{
-            sync::Arc,
-            time::Duration,
-        };
-
-        use axum::{
-            routing::get,
-            Router,
-        };
-        use futures_util::{
-            SinkExt,
-            StreamExt,
-        };
-        use libid_signer::SignerSource;
-        use libid_transcript::read_msg;
-        use tlsn_sdk_core::{
-            HttpRequest,
-            ProverConfig,
-            ProverMode,
-            Reveal,
-            SdkProver,
-        };
-        use tlsn_server_fixture_certs::{
-            CA_CERT_DER,
-            SERVER_DOMAIN,
-        };
-        use tokio::{
-            io::{
-                AsyncReadExt,
-                AsyncWriteExt,
-            },
-            net::TcpListener,
-            sync::{
-                mpsc,
-                Semaphore,
-            },
-        };
-        use tokio_tungstenite::{
-            connect_async,
-            tungstenite::Message as WsMessage,
-        };
-        use tokio_util::compat::{
-            FuturesAsyncReadCompatExt,
-            TokioAsyncReadCompatExt,
-        };
-
-        use super::{
-            notarize_proxy_ws_handler,
-            NotaryState,
-        };
-
-        const TEST_KEY: &str =
-            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-
-        let prover_config = ProverConfig::builder(SERVER_DOMAIN)
-            .mode(ProverMode::Proxy)
-            .root_certs(vec![CA_CERT_DER.to_vec()])
-            .build()
-            .unwrap();
-
-        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_addr = target_listener.local_addr().unwrap();
-        let target_task = tokio::spawn(async move {
-            let (socket, _) = target_listener.accept().await.unwrap();
-            tlsn_server_fixture::bind(socket.compat()).await.unwrap();
-        });
-
-        let signer = SignerSource::from_spec(TEST_KEY)
             .unwrap()
-            .build_managed(None)
-            .await
-            .unwrap();
-        let expected_pubkey = signer.compressed_public_key().to_vec();
-        let state = NotaryState {
-            signer: Arc::new(signer),
-            proxy_sessions: Arc::new(Semaphore::new(1)),
-            proxy_root_store: Arc::new(prover_config.root_store.clone()),
-            proxy_server_addr: Some(target_addr),
-            public_key_hex: String::new(),
-        };
-        let notary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let notary_addr = notary_listener.local_addr().unwrap();
-        let notary_task = tokio::spawn(async move {
-            axum::serve(
-                notary_listener,
-                Router::new()
-                    .route("/notarize-proxy", get(notarize_proxy_ws_handler))
-                    .with_state(state),
-            )
-            .await
-            .unwrap();
-        });
-
-        let (websocket, _) = connect_async(format!("ws://{notary_addr}/notarize-proxy"))
-            .await
-            .unwrap();
-        let (mut ws_tx, mut ws_rx) = websocket.split();
-        let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
-        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
-        let pump_task = tokio::spawn(async move {
-            let (mut pipe_reader, mut pipe_writer) = tokio::io::split(pump_io);
-            let ws_to_pipe = async {
-                while let Some(message) = ws_rx.next().await {
-                    match message.unwrap() {
-                        WsMessage::Binary(data) => {
-                            frame_tx.send(data.to_vec()).unwrap();
-                            pipe_writer.write_all(&data).await.unwrap();
-                        }
-                        WsMessage::Close(_) => {
-                            pipe_writer.shutdown().await.unwrap();
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            };
-            let pipe_to_ws = async {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match pipe_reader.read(&mut buf).await.unwrap() {
-                        0 => break,
-                        n => ws_tx
-                            .send(WsMessage::Binary(buf[..n].to_vec().into()))
-                            .await
-                            .unwrap(),
-                    }
-                }
-            };
-            tokio::select! {
-                _ = ws_to_pipe => {}
-                _ = pipe_to_ws => {}
-            }
-        });
-
-        let protocol = async {
-            let mut prover = SdkProver::new(prover_config.clone()).unwrap();
-            prover.setup(browser_io.compat()).await.unwrap();
-            let response = prover
-                .send_request_proxy(
-                    HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
-                        .header("Host", SERVER_DOMAIN)
-                        .header("Connection", "close"),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status, 200);
-
-            let transcript = prover.transcript().unwrap();
-            prover
-                .reveal(
-                    Reveal::new()
-                        .sent(0..transcript.sent.len())
-                        .recv(0..transcript.recv.len())
-                        .server_identity(true),
-                    None,
-                )
-                .await
-                .unwrap();
-
-            let mut io = prover.finish().await.unwrap().compat();
-            let attestation: serde_json::Value = read_msg(&mut io).await.unwrap();
-            let attested_data: Vec<u8> = attestation["attested_data"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|byte| byte.as_u64().unwrap() as u8)
-                .collect();
-            let signature: Vec<u8> = attestation["notary_signature"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|byte| byte.as_u64().unwrap() as u8)
-                .collect();
-
-            assert_eq!(
-                &attested_data[..32],
-                &libid_crypto::keccak256(SERVER_DOMAIN.as_bytes())
-            );
-            assert_eq!(signature.len(), 65);
-            let recovered = libid_crypto::recover_eth_claim(
-                &signature,
-                &libid_crypto::keccak256(&attested_data),
-            )
-            .unwrap();
-            assert_eq!(recovered.to_encoded_point(true).as_bytes(), expected_pubkey);
-            assert_eq!(io.read(&mut [0]).await.unwrap(), 0);
-        };
-
-        tokio::time::timeout(Duration::from_secs(30), protocol)
-            .await
-            .expect("local ProxyMode smoke timed out");
-        pump_task.await.unwrap();
-        let mut frames = Vec::new();
-        while let Ok(frame) = frame_rx.try_recv() {
-            frames.push(frame);
-        }
-        let attestation_frame = frames.last().expect("missing attestation message");
-        let declared_len =
-            u32::from_be_bytes(attestation_frame[..4].try_into().unwrap()) as usize;
-        assert_eq!(declared_len, attestation_frame.len() - 4);
-        serde_json::from_slice::<super::AttestationWire>(&attestation_frame[4..])
-            .expect("the final WebSocket message is not an attestation");
-        target_task.await.unwrap();
-
-        // The target listener is now gone. A second session exercises the
-        // same TcpStream::connect error path as a DNS failure and must close
-        // the browser transport promptly instead of waiting five minutes.
-        let (websocket, _) = connect_async(format!("ws://{notary_addr}/notarize-proxy"))
-            .await
-            .unwrap();
-        let (mut ws_tx, mut ws_rx) = websocket.split();
-        let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
-        let failed_pump = tokio::spawn(async move {
-            let (mut pipe_reader, mut pipe_writer) = tokio::io::split(pump_io);
-            let ws_to_pipe = async {
-                while let Some(message) = ws_rx.next().await {
-                    match message.unwrap() {
-                        WsMessage::Binary(data) => {
-                            pipe_writer.write_all(&data).await.unwrap();
-                        }
-                        WsMessage::Close(_) => {
-                            pipe_writer.shutdown().await.unwrap();
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            };
-            let pipe_to_ws = async {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match pipe_reader.read(&mut buf).await.unwrap() {
-                        0 => break,
-                        n => {
-                            if ws_tx
-                                .send(WsMessage::Binary(buf[..n].to_vec().into()))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-            };
-            tokio::select! {
-                _ = ws_to_pipe => {}
-                _ = pipe_to_ws => {}
-            }
-        });
-        let mut prover = SdkProver::new(prover_config).unwrap();
-        let failed_session = async {
-            prover
-                .setup(browser_io.compat())
-                .await
-                .map_err(|error| error.to_string())?;
-            prover
-                .send_request_proxy(
-                    HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
-                        .header("Host", SERVER_DOMAIN)
-                        .header("Connection", "close"),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        };
-        let result = tokio::time::timeout(Duration::from_secs(3), failed_session)
-            .await
-            .expect("server connect failure was not propagated to the prover");
-        assert!(
-            result.unwrap_err().contains("UPSTREAM_CONNECT_FAILED"),
-            "server connect failure lost its public diagnostic"
-        );
-        failed_pump.await.unwrap();
-        notary_task.abort();
-    }
-
-    /// A client that connects and then goes silent forever must not pin the
-    /// handler past [`CONNECTION_DEADLINE`] — defense in depth over the
-    /// fail-fast fixes, covering whatever future bug makes a session pend.
-    /// Paused time: the runtime auto-advances the clock to the deadline the
-    /// moment everything is blocked, so the test finishes in milliseconds.
-    #[tokio::test(start_paused = true)]
-    async fn silent_connection_hits_the_deadline() {
-        use std::sync::Arc;
-
-        use libid_signer::SignerSource;
-        use tokio::sync::Semaphore;
-
-        use super::{
-            handle_tcp_prover,
-            NotaryState,
-            CONNECTION_DEADLINE,
-        };
-
-        // anvil #0 — public test key.
-        let key_hex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        let signer = SignerSource::from_spec(key_hex)
-            .unwrap()
-            .build_managed(None)
-            .await
-            .unwrap();
-        let state = NotaryState {
-            public_key_hex: hex::encode(signer.compressed_public_key()),
-            signer: Arc::new(signer),
-            proxy_sessions: Arc::new(Semaphore::new(8)),
-            proxy_root_store: Arc::new(libid_tlsn::root_store()),
-            proxy_server_addr: None,
-        };
-
-        // The client half stays open and never writes a byte.
-        let (_client, server) = tokio::io::duplex(1 << 16);
-
-        let started = tokio::time::Instant::now();
-        let err = handle_tcp_prover(server, &state)
-            .await
-            .expect_err("a silent connection must fail, not pend");
-        assert!(
-            err.to_string().contains("deadline"),
-            "expected the deadline error, got: {err}"
-        );
-        assert!(
-            started.elapsed() >= CONNECTION_DEADLINE,
-            "failed before the deadline — some step errored spuriously"
-        );
     }
 }

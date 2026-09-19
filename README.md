@@ -11,35 +11,48 @@ excellent protocol that makes this service possible.
 
 The libID notary service. One binary, one signing identity, one record.
 
-The notary acts as the MPC-TLS or ProxyMode (zkTLS) verifier for a prover's
-HTTPS session and signs the canonical ceremony section 9.1 attested data for
-the authenticated transcript. Every session gets the same record —
-`{ attested_data, notary_signature }` — whether it is a prover's request to a
-platform API (X, GitHub, …), read on chain by that platform's Platform
-Verifier, or the keeper's reading of Google's OIDC signing keys, read on chain
-by `GoogleJwtRoots`. The notary does not tell them apart and does not need to:
-the record carries the TLS-certificate-verified server name (`authorityId`),
-and the contract that reads it compares that against the authority it pins.
-What differs is only what the prover reveals. Every contract authenticates the
-signature through the on-chain `NotaryService`; the notary's signature alone
-registers nothing, and its public key is served at `/info`.
+The notary is the MPC-TLS or ProxyMode verifier for a prover's HTTPS session
+and signs the section 9.1 attested data of the authenticated transcript. Every
+session gets the same record, `{ attested_data, notary_signature }`, whatever
+the prover talked to: the record carries the certificate-verified server name,
+and the contract that reads it pins the authority it expects. Its signature
+registers nothing by itself; the on-chain `NotaryService` authenticates it, and
+the public key is served at `/info`.
+
+## Listeners
+
+The port a connection arrives on, or the route it asks for, is its policy.
+Nothing a caller sends moves it between the two tiers.
+
+| Port | Flag | Env | Default | Who | Policy |
+|---|---|---|---|---|---|
+| **7047** | `--port` | `NOTARY_PORT` | off unless set | Rust provers inside the cluster, MPC-TLS over TCP | Internal: no per-client limits |
+| **7048** | `--ws-port` | `NOTARY_WS_PORT` | `7048` | Browsers, ProxyMode over WebSocket, behind the load balancer | Public: every per-client limit in force |
+| 7048, `/internal/notarize-proxy` | `--internal-proxy-route` | `NOTARY_INTERNAL_PROXY_ROUTE` | off unless set | Our own services, ProxyMode over WebSocket | Internal: no per-client limits, no client header read |
+
+The internal endpoints are off unless set because they have no limits. The
+MPC-TLS port is published through the cluster Service only, never through the
+load balancer; `0` binds an ephemeral port. The internal route shares the
+public port, so the Ingress must refuse `/internal/*` with a fixed response.
+The notary also refuses it with 403 whenever the request carries
+`X-Forwarded-For` or `CF-Connecting-IP`, which a balancer always adds; that is
+the backstop, not the control. Each internal endpoint has its own session pool
+(`--mpc-max-sessions`, `--internal-max-sessions`), so public load never queues
+our own services.
 
 ## Endpoints
 
-TCP wire protocol on `NOTARY_PORT` (default **7047**) — length-prefixed JSON
-after MPC-TLS, for Rust backend provers.
+On the MPC-TLS port: length-prefixed JSON after MPC-TLS. The prover opens the
+socket and the record comes back down it.
 
-HTTP / WebSocket on `NOTARY_WS_PORT` (default **7048**) — browser TLSNotary:
+On the public port:
 
 | Route | What it does |
 |---|---|
-| `GET /info` | `{version, publicKey}` — compressed SEC1 notary public key, hex |
-| `WS /notarize-proxy` | ProxyMode session, then one WebSocket binary message containing the length-prefixed section 9.1 attestation |
-
-A server-side MPC-TLS prover needs no route: it opens the TCP listener itself,
-and the same record is written back down that socket.
-
-The live WebSocket carries the TLSNotary session and its final attestation.
+| `GET /info` | `{version, publicKey}`: compressed SEC1 notary public key, hex |
+| `GET /healthcheck` | `200` while serving; `503` from SIGTERM until the process exits. Point health checks here, not at `/` |
+| `WS /notarize-proxy` | ProxyMode session, then one binary message carrying the length-prefixed section 9.1 attestation |
+| `WS /internal/notarize-proxy` | The same session for our own services, no per-client limits, its own pool; `404` unless `--internal-proxy-route`, `403` behind a proxy header |
 
 ## Configuration
 
@@ -48,86 +61,157 @@ Flags or environment variables:
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--host` | `NOTARY_HOST` | `127.0.0.1` | Bind address |
-| `--port` | `NOTARY_PORT` | `7047` | TCP wire port |
-| `--ws-port` | `NOTARY_WS_PORT` | `7048` | HTTP/WS port (`0` disables) |
-| `--signing-key` | `SIGNING_KEY` | — | Hex secp256k1 key, or `kms:<key-id-or-alias>` for AWS KMS |
-| `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent browser ProxyMode session cap |
+| `--port` | `NOTARY_PORT` | off unless set | Internal MPC-TLS wire port; conventionally `7047`, `0` binds an ephemeral port |
+| `--ws-port` | `NOTARY_WS_PORT` | `7048` | Public HTTP/WS port (`0` disables) |
+| `--internal-proxy-route` | `NOTARY_INTERNAL_PROXY_ROUTE` | off unless set | Mount `WS /internal/notarize-proxy` on the public port. `true`/`false` |
+| `--signing-key` | `SIGNING_KEY` | — | Hex secp256k1 key, or `kms:<key-id-or-alias>` for AWS KMS; with KMS the private material never enters the process |
+| `--max-sessions` | `NOTARY_MAX_SESSIONS` | `1024` | Concurrent ProxyMode sessions on the public port; past it the upgrade is refused with 503 |
+| `--internal-max-sessions` | `NOTARY_INTERNAL_MAX_SESSIONS` | `1024` | Concurrent ProxyMode sessions on the internal route; its own pool |
+| `--proxy-max-bytes` | `NOTARY_PROXY_MAX_BYTES` | `10000000` | Bytes one ProxyMode session may relay, both directions; crossing it aborts the session with close code 1008, nothing attested |
+| `--mpc-max-sessions` | `NOTARY_MPC_MAX_SESSIONS` | `4x` | Concurrent MPC-TLS sessions: a count (`16`) or per-core multiplier (`4x`); provers past it wait, never refused |
+| `--connection-deadline-secs` | `NOTARY_CONNECTION_DEADLINE_SECS` | `300` | Lifetime of one session on either transport, queue time included |
+| `--setup-deadline-secs` | `NOTARY_SETUP_DEADLINE_SECS` | `15` | How long a connection may sit before its request headers, and then before its session, arrive; until then it holds no slot |
+| `--max-sessions-per-ip` | `NOTARY_MAX_SESSIONS_PER_IP` | `4` | Concurrent public sessions one client may hold; past it close code 1013. One browser identity flow opens two. `0` disables |
+| `--per-ip-upgrades` | `NOTARY_PER_IP_UPGRADES` | `10/1m,60/30m,100/1h` | Sessions one client may start per window, `<count>/<window>`; every window must have room. Empty disables |
+| `--per-ip-bytes` | `NOTARY_PER_IP_BYTES` | `100MB/1m,600MB/30m,1GB/1h` | Bytes one client may relay per window, `<size>/<window>`; charged when a session ends, refused at the next upgrade. Empty disables |
+| `--client-ip-header` | `NOTARY_CLIENT_IP_HEADER` | `x-forwarded-for` | Which header names the client on the public port; a public upgrade without it is refused with 400 |
+| `--limits-store` | `NOTARY_LIMITS_STORE` | — | Where the per-client counts live: a `postgres://` URL, or `memory` for a single replica |
 
-With a KMS key the private material never enters the process: every signature
-is a `kms:Sign` call.
+Windows are `<limit>/<window>` lists: a count, or bytes with a `KB`/`MB`/`GB`
+suffix (powers of ten), per `<n>s`, `<n>m` or `<n>h`. The concurrency cap
+bounds what a client holds now; the windows bound how much of the pool's time
+it consumes by finishing one session and starting the next. Every per-client
+limit applies to the public route only.
+
+The public port speaks HTTP/1.1 only, which is all the ALB sends a target. A
+session slot is taken when a session starts (the prover's first byte, the
+browser's first binary frame), not at accept: an idle connection costs a socket
+until `--setup-deadline-secs` drops it, and nothing else. The MPC-TLS data
+limits are libid-tlsn's (4 KB sent, 32 KB received) and are not tunable here.
+The limits in force are logged once at startup as `resource limits in force`.
+
+### Who a session counts against
+
+Behind a load balancer every request arrives from the balancer, so the socket
+peer is never the key. `--client-ip-header` says what is:
+
+- `x-forwarded-for`: the **rightmost** `X-Forwarded-For` entry, which the
+  balancer appended; everything left of it was written by the caller and is
+  ignored. For a notary directly behind the ALB, with the Cloudflare record
+  DNS-only (grey) or no Cloudflare at all.
+- `cf-connecting-ip`: the `CF-Connecting-IP` Cloudflare sets. Only for a
+  proxied (orange) record; with a grey record every public upgrade becomes a
+  400.
+
+A public upgrade without the header, or with it sent twice, is refused with
+400. Nothing verifies who wrote the header, so the public port must be
+reachable only through the load balancer; that is the deployment's job. IPv6
+clients are keyed by their /48 (a residential allocation is a /56); a
+`::ffff:a.b.c.d` address is keyed as `a.b.c.d`. Our own workloads are not
+exempted by address: they use the MPC-TLS port or the internal route, which
+read no header.
+
+### Where the counts live
+
+The schema is `migrations/`, applied by the notary at startup through sqlx's
+migrator; a schema change is a new numbered file, never an edit. With several
+replicas each one runs the migrator under sqlx's advisory lock, so the first
+applies what is pending and the rest find nothing to do. The migration
+connection waits up to a minute for the lock and ten minutes per statement,
+and startup gives the migrations ten minutes in all; a `startupProbe` must
+allow that. The previous release keeps serving during a rolling update, so a
+migration must be one it can live with: add, never drop or rename in the same
+release.
+
+`--limits-store` takes one of two forms:
+
+- A Postgres URL. Every replica counts in the same place, on the database's
+  clock. A database that cannot be reached is a startup error; unreachable at
+  runtime, the public port refuses, because a limit that fails open is a limit
+  an attacker can switch off.
+- `memory`: counts kept in this process, correct for exactly one replica.
+  Behind a balancer every replica keeps its own copy and each limit is
+  multiplied by the replica count.
+
+On a non-loopback bind the setting is required.
 
 ## Docker
 
-Released images are published to GitHub Container Registry:
+The image runs `cargo build --release` with default features; the e2e suite's
+`notary-e2e` binary, the same server with a ProxyMode dial override, exists only
+under `cargo test --features e2e` and is never in the image.
 
 ```sh
 docker run --rm \
-  -p 7047:7047 -p 7048:7048 \
+  -p 7048:7048 \
   -e NOTARY_HOST=0.0.0.0 \
+  -e NOTARY_LIMITS_STORE=memory \
   -e SIGNING_KEY=<hex-or-kms:…> \
   ghcr.io/libid-org/notary:latest
 ```
 
-The image runs as uid 10001, not root, and its `HEALTHCHECK` connects to
-`NOTARY_PORT` on loopback.
+That is the public port only, expecting a balancer in front: every upgrade
+needs the client header. For local work without one, mount the internal route
+(`-e NOTARY_INTERNAL_PROXY_ROUTE=true`) and use
+`ws://localhost:7048/internal/notarize-proxy`. A Rust prover needs
+`-e NOTARY_PORT=7047 -p 7047:7047`.
+
+The image runs as uid 10001. Its `HEALTHCHECK` GETs `/healthcheck` on
+`NOTARY_WS_PORT` over loopback with `nc` and passes on `200` only; with
+`NOTARY_WS_PORT=0` override it.
 
 ### Tags
 
 | Tag | Moves? | Use it for |
 | --- | --- | --- |
-| `<version>` | never | deployments, and other repos' CI — **pin this** |
+| `<version>` | never | deployments and other repos' CI: **pin this** |
 | `latest` | every final release | a quick local try; never pin it |
-| `custom-<suffix>` | never | one ref under review, built via the *Custom Docker image* workflow (inputs: `ref`, `tag-suffix`) |
+| `custom-<suffix>` | never | one ref under review, from the *Custom Docker image* workflow (`ref`, `tag-suffix`); replace it with a `<version>` once the PR merges |
 
-A `custom-` tag is a build artefact, not a release channel: it is fine to pin
-while a PR is open, and it should be replaced by a `<version>` tag once that PR
-merges and a release is published.
+The package is public: `docker pull ghcr.io/libid-org/notary:<version>` needs
+no login, permission or token. Every tag is a manifest list for `linux/amd64`
+and `linux/arm64`.
 
-### Pulling from another repository's CI
+## Deployment notes
 
-The `notary` package is **public**. A GitHub Actions job in any repository can
-
-```yaml
-- run: docker pull ghcr.io/libid-org/notary:<version>
-```
-
-with no `docker/login-action` step, no `packages: read` permission and no PAT —
-`GITHUB_TOKEN` is not involved. Nothing is needed on the consumer side beyond
-the pull itself.
-
-Every tag these workflows publish is a manifest list covering `linux/amd64`
-and `linux/arm64`, so one reference runs on GitHub's `ubuntu-latest` and
-`ubuntu-24.04-arm` runners, on x86 and Graviton nodes, and on Apple Silicon —
-no `--platform` flag, no emulation. Tags published up to `0.3.0-rc.3` are
-amd64 only.
+- `NOTARY_PORT=7047` explicitly, or there is no MPC-TLS listener.
+- `NOTARY_INTERNAL_PROXY_ROUTE=true` only if an in-cluster service uses
+  ProxyMode, with the Ingress refusing `/internal/*` by a fixed response
+  (`alb.ingress.kubernetes.io/actions.*` on that path, before the default
+  backend). Verify the rule from outside before turning the route on.
+- Only the public port goes behind the load balancer.
+- `NOTARY_CLIENT_IP_HEADER` follows the Cloudflare record: `x-forwarded-for`
+  while grey, `cf-connecting-ip` once orange.
+- `NOTARY_LIMITS_STORE`: `memory` at exactly one replica, a Postgres URL
+  beyond that.
+- `terminationGracePeriodSeconds` above `--setup-deadline-secs` +
+  `--connection-deadline-secs` (defaults: 315): SIGTERM drains the sessions
+  in flight, and a shorter grace period kills them mid-attestation. A second
+  SIGTERM ends the drain at once, still with exit 0.
+- ALB health check at `GET /healthcheck` on the public port; it answers 503
+  from SIGTERM until exit. An idle pod exits within milliseconds of SIGTERM,
+  so a `preStop` sleep of at least the health-check interval times the
+  unhealthy threshold is what lets the balancer see the 503 first.
 
 ## Browser wasm bundle
 
-Each release also ships `tlsn-wasm-<version>.tar.gz` as a release asset:
-`tlsn_wasm.js`, `tlsn_wasm_bg.wasm` and the generated
-`snippets/web-spawn-*/js/spawn.js`, built from TLSNotary's `crates/wasm` at the
-**exact tlsn revision this server pins** — prover and notary cannot drift onto
-different protocol versions. Mount the archive tree unchanged below any
-immutable asset path: the wrapper and worker resolve each other through their
-generated relative imports, without a root rewrite or generated-source edit.
-Unlike the npm `tlsn-js` build, this bundle includes `set_progress_callback`
-and reclaimed-channel `finish()`.
-
-To build locally: `./scripts/build-tlsn-wasm.sh --out <dir>` (needs rustup,
-wasm-pack 0.15.0, and a clang with a wasm32 backend — the script explains
-exactly what is missing if something is).
+Each release ships `tlsn-wasm-<version>.tar.gz`: `tlsn_wasm.js`,
+`tlsn_wasm_bg.wasm` and the generated `snippets/web-spawn-*/js/spawn.js`,
+built from TLSNotary's `crates/wasm` at the exact tlsn revision this server
+pins, so prover and notary cannot drift apart. Mount the tree unchanged below
+any immutable asset path; the files resolve each other by relative import.
+Unlike the npm `tlsn-js` build it includes `set_progress_callback` and
+reclaimed-channel `finish()`. To build locally:
+`./scripts/build-tlsn-wasm.sh --out <dir>` (rustup, wasm-pack 0.15.0, a clang
+with a wasm32 backend; the script names what is missing).
 
 ## Library use
 
 The crate also builds as a library: `notary::run` starts the server from a
-`NotaryServerConfig` (port `0` binds an ephemeral port, reported back through
-`NotaryServerHandle::local_addr`), which is how the smoke tests embed it. It
-carries no prover-side code. The keeper's JWKS prover and its mock live in the keeper, on
-libid-rs's primitives (`libid_tlsn::prover_generic` for the session,
-`libid_transcript` for the layout and the wire frame).
-
-Shared primitives (digests, wire protocol, transcript math, signers) come
-from [libID-rs](https://github.com/libid-org/libID-rs).
+`NotaryServerConfig`, and `NotaryServerHandle::local_addr` reports the bound
+port. It carries no prover-side code; provers build on
+[libID-rs](https://github.com/libid-org/libID-rs), which also provides the
+shared primitives (digests, wire protocol, transcript math, signers).
 
 ## License
 
