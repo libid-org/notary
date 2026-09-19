@@ -5,7 +5,7 @@ edition = "2021"
 # The real floor, inherited from libid-rs (and the original monorepo before it):
 #   * TLSNotary alpha.15's `mpz` graph declares Rust 1.95;
 #   * the AWS SDK crates (via libid-signer) declare 1.94.1.
-rust-version = "1.95"
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/libid-org/notary"
 description = "The libID notary service: MPC-TLS / zkTLS notarization of a prover's HTTPS session into one signed attestation, under one notary identity."
@@ -25,6 +25,12 @@ path = "src/main.rs"
 name = "notary-e2e"
 path = "src/bin/notary-e2e.rs"
 required-features = ["e2e"]
+
+[profile.release]
+# The MPC verifier is CPU-bound; whole-program optimisation is worth the
+# longer release build.
+lto = "fat"
+codegen-units = 1
 
 [features]
 # The binary the e2e suite runs: the production configuration plus where
@@ -102,7 +108,8 @@ tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8
 tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
 tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "550220ee18a8c0bb60217d58cb73f5fd2e74e441" }
 tokio = { version = "1", features = ["test-util"] }
-tokio-tungstenite = "0.30"
+# The same tungstenite axum uses, so the test graph carries one copy.
+tokio-tungstenite = "0.29"
 # The drain test sends the real binary a SIGTERM. Already in the graph
 # through tokio.
 libc = "0.2"
