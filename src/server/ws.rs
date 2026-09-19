@@ -153,6 +153,12 @@ impl NotaryState {
         peer: SocketAddr,
         headers: axum::http::HeaderMap,
     ) -> Response {
+        // What one WebSocket message may carry: the relay reads in
+        // RELAY_READ_BYTES and buffers a message whole, so a larger cap
+        // is memory a caller can take before the data cap sees a byte.
+        let ws = ws
+            .max_frame_size(RELAY_READ_BYTES)
+            .max_message_size(RELAY_PIPE_BYTES);
         // In flight from here, before the draining check: admission is two
         // store round trips, and an upgrade inside them when the drain starts
         // must be waited for, not raced. Every refusal below drops the guard.
