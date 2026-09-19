@@ -16,8 +16,6 @@ use std::{
     },
 };
 
-use async_trait::async_trait;
-
 use super::{
     Dimension,
     LeaseId,
@@ -145,7 +143,6 @@ impl Inner {
     }
 }
 
-#[async_trait]
 impl LimitStore for MemoryStore {
     async fn try_lease(
         &self,

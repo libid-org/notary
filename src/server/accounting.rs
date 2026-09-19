@@ -13,6 +13,7 @@ use crate::{
     store::{
         Dimension,
         LeaseId,
+        LimitStore,
         Store,
         WindowLimits,
     },

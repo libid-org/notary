@@ -89,6 +89,7 @@ use crate::{
     store::{
         self,
         Dimension,
+        LimitStore,
     },
 };
 
@@ -1113,8 +1114,8 @@ mod tests {
             },
             store::{
                 Dimension,
+                FakeStore,
                 LeaseId,
-                LimitStore,
                 Store,
                 StoreError,
                 WindowLimits,
@@ -1264,7 +1265,7 @@ mod tests {
         struct ParkedStore(Arc<Gate>);
 
         #[async_trait::async_trait]
-        impl LimitStore for ParkedStore {
+        impl FakeStore for ParkedStore {
             async fn try_lease(
                 &self,
                 _: &ClientKey,
@@ -1331,7 +1332,7 @@ mod tests {
         async fn an_upgrade_counts_as_in_flight_while_admission_runs() {
             let gate = Gate::new();
             let mut state = NotaryState::for_tests(test_signer().await);
-            state.limits = Store::from(ParkedStore(Arc::clone(&gate)));
+            state.limits = Store::fake(ParkedStore(Arc::clone(&gate)));
             let in_flight = state.in_flight.clone();
             let (notary_addr, notary_task) = serve(state).await;
 
@@ -1578,7 +1579,7 @@ mod tests {
         struct DownStore;
 
         #[async_trait::async_trait]
-        impl LimitStore for DownStore {
+        impl FakeStore for DownStore {
             async fn try_lease(
                 &self,
                 _: &ClientKey,
@@ -1636,7 +1637,7 @@ mod tests {
         struct PanickingStore;
 
         #[async_trait::async_trait]
-        impl LimitStore for PanickingStore {
+        impl FakeStore for PanickingStore {
             async fn try_lease(
                 &self,
                 _: &ClientKey,
@@ -1696,7 +1697,7 @@ mod tests {
         async fn a_store_that_cannot_answer_refuses_the_upgrade() {
             for (upgrades, bytes) in [("1/1h", ""), ("", "1KB/1h")] {
                 let mut state = NotaryState::for_tests(test_signer().await);
-                state.limits = Store::from(DownStore);
+                state.limits = Store::fake(DownStore);
                 state.per_ip_upgrades = upgrades.parse::<WindowLimits>().unwrap();
                 state.per_ip_bytes = bytes.parse::<WindowLimits>().unwrap();
                 let (notary_addr, notary_task) = serve(state).await;
@@ -1716,7 +1717,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn a_store_that_cannot_answer_refuses_the_session_with_1013() {
             let mut state = NotaryState::for_tests(test_signer().await);
-            state.limits = Store::from(DownStore);
+            state.limits = Store::fake(DownStore);
             state.per_ip_upgrades = WindowLimits::default();
             state.per_ip_bytes = WindowLimits::default();
             let (notary_addr, notary_task) = serve(state).await;
@@ -1759,7 +1760,7 @@ mod tests {
         async fn the_internal_route_never_touches_the_store() {
             let session_slot = ONE_SESSION_AT_A_TIME.lock().await;
             let mut state = NotaryState::for_tests(test_signer().await);
-            state.limits = Store::from(PanickingStore);
+            state.limits = Store::fake(PanickingStore);
             let (_, seen, notary_task) = complete_session(Tier::Internal, state).await;
             assert!(
                 seen.close.is_none(),

@@ -26,7 +26,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use sqlx::{
     postgres::{
         PgConnectOptions,
@@ -267,7 +266,6 @@ where
     Ok(())
 }
 
-#[async_trait]
 impl LimitStore for PostgresStore {
     async fn try_lease(
         &self,

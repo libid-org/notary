@@ -64,7 +64,6 @@ thiserror = "2"
 # The shared limits store. Postgres because it is already deployed; rustls
 # because RDS speaks TLS and the image has no OpenSSL.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono"] }
-async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -87,6 +86,8 @@ bytesize = "1"
 forwarded-header-value = "0.1.1"
 
 [dev-dependencies]
+# Boxes the test doubles' store calls; production dispatches statically.
+async-trait = "0.1"
 # Test-only HTTP client: it GETs the notary's own /info over plain HTTP on
 # loopback, so it needs no TLS backend. Leaving rustls on would pull
 # rustls-platform-verifier and its Android JNI tree into the lockfile for
