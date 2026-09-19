@@ -28,6 +28,16 @@ use tokio::io::{
 };
 use tracing::warn;
 
+/// Bytes one relay read takes from a socket at a time: a few TLS records.
+pub const RELAY_READ_BYTES: usize = 1 << 16;
+
+/// Capacity of the in-memory pipe between a WebSocket pump and the verifier:
+/// two reads, so one side can fill it while the other drains.
+pub const RELAY_PIPE_BYTES: usize = 2 * RELAY_READ_BYTES;
+
+/// Concurrent ProxyMode sessions a pool admits unless configured otherwise.
+pub const DEFAULT_MAX_SESSIONS: usize = 1024;
+
 /// A concurrency limit: an absolute count (`16`) or a multiple of the cores
 /// the process may use (`4x`). A multiplier is resolved once, at startup, so a
 /// container that is later resized keeps the number it started with.
@@ -297,11 +307,22 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for PeekedIo<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
+    use std::{
+        io,
+        num::NonZeroUsize,
+        pin::Pin,
+        task::{
+            Context,
+            Poll,
+        },
+    };
 
     use tokio::io::{
+        AsyncRead,
         AsyncReadExt,
+        AsyncWrite,
         AsyncWriteExt,
+        ReadBuf,
     };
 
     use super::{
@@ -376,6 +397,117 @@ mod tests {
         // Once crossed, every later operation fails too.
         assert!(capped.write_all(&[4; 1]).await.is_err());
         assert!(capped.read(&mut buf).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn capped_io_fails_on_the_crossing_write_and_counts_it() {
+        let cap = DataCap::new(10);
+        let (near, far) = tokio::io::duplex(64);
+        let mut capped = CappedIo::new(near, cap.clone());
+
+        capped.write_all(&[1; 6]).await.unwrap();
+        let error = capped.write_all(&[2; 5]).await.unwrap_err();
+        assert!(
+            error.to_string().contains("PROXY_DATA_CAP_EXCEEDED"),
+            "{error}"
+        );
+        assert!(cap.exceeded());
+        assert_eq!(cap.used(), 11, "the crossing write is counted whole");
+        assert!(capped.write_all(&[3; 1]).await.is_err());
+        drop(far);
+    }
+
+    #[tokio::test]
+    async fn capped_io_charges_only_what_the_inner_accepted() {
+        let cap = DataCap::new(100);
+        // A duplex of four takes four bytes of a ten-byte write.
+        let (near, far) = tokio::io::duplex(4);
+        let mut capped = CappedIo::new(near, cap.clone());
+
+        let written = capped.write(&[7; 10]).await.unwrap();
+        assert_eq!(written, 4);
+        assert_eq!(
+            cap.used(),
+            4,
+            "charged what went through, not what was offered"
+        );
+        drop(far);
+    }
+
+    /// An inner stream that fails every read and write.
+    struct Broken;
+
+    impl AsyncRead for Broken {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("broken")))
+        }
+    }
+
+    impl AsyncWrite for Broken {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::other("broken")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn capped_io_charges_nothing_for_a_failed_or_empty_operation() {
+        let cap = DataCap::new(10);
+        let mut capped = CappedIo::new(Broken, cap.clone());
+        let mut buf = [0u8; 4];
+        assert!(capped.read(&mut buf).await.is_err());
+        assert!(capped.write(&[1; 3]).await.is_err());
+        assert_eq!(cap.used(), 0, "a failed operation relayed nothing");
+
+        let cap = DataCap::new(10);
+        let (near, far) = tokio::io::duplex(64);
+        drop(far);
+        let mut capped = CappedIo::new(near, cap.clone());
+        assert_eq!(capped.read(&mut buf).await.unwrap(), 0, "end of stream");
+        assert_eq!(cap.used(), 0, "end of stream relayed nothing");
+    }
+
+    #[tokio::test]
+    async fn capped_io_flush_and_shutdown_pass_through_even_past_the_cap() {
+        let cap = DataCap::new(2);
+        let (near, mut far) = tokio::io::duplex(64);
+        let mut capped = CappedIo::new(near, cap.clone());
+
+        assert!(capped.write_all(&[1; 3]).await.is_err());
+        assert!(cap.exceeded());
+        capped.flush().await.unwrap();
+        capped.shutdown().await.unwrap();
+
+        let mut buf = [0u8; 8];
+        let n = far.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            &[1; 3],
+            "the crossing write reached the inner before it was refused"
+        );
+        assert_eq!(
+            far.read(&mut buf).await.unwrap(),
+            0,
+            "shutdown reached the inner"
+        );
     }
 
     #[tokio::test]
