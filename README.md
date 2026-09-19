@@ -141,6 +141,11 @@ carries either header is refused, because it came through a proxy.
 
 ### Where the counts live
 
+The Postgres schema is `migrations/`, applied by the notary at startup through
+sqlx's migrator: each file runs once, recorded in `_sqlx_migrations`, under an
+advisory lock so replicas starting together do not race. A schema change is a
+new numbered file, never an edit to an old one.
+
 The per-client counts — sessions held now, sessions started and bytes relayed
 per window — are kept in `--limits-store`, which takes one of two forms:
 

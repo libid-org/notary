@@ -63,7 +63,7 @@ serde_json = "1.0"
 thiserror = "2"
 # The shared limits store. Postgres because it is already deployed; rustls
 # because RDS speaks TLS and the image has no OpenSSL.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = [
     "rt-multi-thread",
