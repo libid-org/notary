@@ -71,7 +71,7 @@ fn every_limit_has_a_default() {
     assert_eq!(config.setup_deadline(), Duration::from_secs(15));
     assert_eq!(config.max_sessions_per_ip, 4);
     assert_eq!(config.client_ip_header, ClientIpHeader::XForwardedFor);
-    assert_eq!(config.limits_store, "");
+    assert_eq!(config.limits_store, None);
     // `parse` passes `--port 0`; unset is off.
     assert_eq!(config.port, Some(0));
     assert_eq!(

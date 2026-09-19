@@ -11,7 +11,7 @@ use crate::{
         DEFAULT_MAX_SESSIONS,
     },
     store::{
-        PostgresUrl,
+        LimitsStoreSpec,
         WindowLimits,
     },
 };
@@ -197,9 +197,9 @@ pub struct NotaryServerConfig {
     /// The load balancer spreads one client's connections across every
     /// replica, so a count kept in one process is a limit multiplied by the
     /// replica count. `memory` says that is understood. With a per-client
-    /// limit on a non-loopback address, an empty setting refuses to start.
-    #[arg(long, env = "NOTARY_LIMITS_STORE", default_value = "")]
-    pub limits_store: String,
+    /// limit on a non-loopback address, leaving it unset refuses to start.
+    #[arg(long, env = "NOTARY_LIMITS_STORE")]
+    pub limits_store: Option<LimitsStoreSpec>,
 }
 
 impl NotaryServerConfig {
@@ -213,34 +213,20 @@ impl NotaryServerConfig {
         std::time::Duration::from_secs(self.setup_deadline_secs)
     }
 
-    /// `--limits-store`, checked against the rest of the configuration.
-    ///
-    /// A limit counted in one process is silently multiplied by the replica
-    /// count, so on a non-loopback bind the choice has to be explicit:
-    /// `memory` for a single replica, or a Postgres URL.
+    /// The store as configured, or `memory` when unset -- which is refused
+    /// with per-client limits on a non-loopback bind, since counts kept in
+    /// one process multiply every limit by the replica count.
     pub fn limits_store(&self) -> Result<LimitsStoreSpec, String> {
-        let spec = self.limits_store.trim();
-        if spec.is_empty() {
-            if self.public_limits_in_force() && !self.bound_locally() {
-                return Err(
-                    "per-client limits are on but --limits-store is empty: counted in \
-                     one process, every limit is multiplied by the replica count. Set \
-                     a Postgres URL, or \"memory\" for a single replica"
-                        .into(),
-                );
-            }
-            return Ok(LimitsStoreSpec::Memory);
+        match &self.limits_store {
+            Some(spec) => Ok(spec.clone()),
+            None if self.public_limits_in_force() && !self.bound_locally() => Err(
+                "per-client limits are on but --limits-store is unset: counted in \
+                 one process, every limit is multiplied by the replica count. Set \
+                 a Postgres URL, or \"memory\" for a single replica"
+                    .into(),
+            ),
+            None => Ok(LimitsStoreSpec::Memory),
         }
-        if spec == "memory" {
-            return Ok(LimitsStoreSpec::Memory);
-        }
-        if spec.starts_with("postgres://") || spec.starts_with("postgresql://") {
-            return Ok(LimitsStoreSpec::Postgres(PostgresUrl::new(spec)));
-        }
-        Err(format!(
-            "--limits-store: expected \"memory\" or a postgres:// URL, got '{}'",
-            PostgresUrl::new(spec)
-        ))
     }
 
     /// Whether any per-client limit applies on the public port.
@@ -278,23 +264,5 @@ impl std::fmt::Display for ClientIpHeader {
             Self::CfConnectingIp => "cf-connecting-ip",
         };
         f.write_str(name)
-    }
-}
-
-/// Where the shared counts live.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LimitsStoreSpec {
-    /// In this process only. Correct for one replica; a multiplier otherwise.
-    Memory,
-    /// A Postgres URL.
-    Postgres(PostgresUrl),
-}
-
-impl std::fmt::Display for LimitsStoreSpec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Memory => f.write_str("memory"),
-            Self::Postgres(url) => write!(f, "postgres ({url})"),
-        }
     }
 }
