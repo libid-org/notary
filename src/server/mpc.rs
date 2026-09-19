@@ -57,7 +57,7 @@ impl NotaryState {
         };
         tokio::time::timeout(deadline, async {
             let slots = Arc::clone(&self.mpc_sessions);
-            let _slot = match slots.clone().try_acquire_owned() {
+            let slot = match slots.clone().try_acquire_owned() {
                 Ok(slot) => slot,
                 Err(TryAcquireError::Closed) => return Err(shutting_down()),
                 Err(TryAcquireError::NoPermits) => {
@@ -72,7 +72,9 @@ impl NotaryState {
                     slot
                 }
             };
-            session.await
+            let outcome = session.await;
+            drop(slot);
+            outcome
         })
         .await
         .map_err(|_| Error::NotaryServer {
@@ -200,7 +202,7 @@ mod tests {
         const TEST_KEY: &str =
             "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
-        let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
+        let session_slot = ONE_SESSION_AT_A_TIME.lock().await;
         let signer = SignerSource::from_spec(TEST_KEY)
             .unwrap()
             .build_managed(None)
@@ -313,6 +315,7 @@ mod tests {
             .expect("local MPC smoke timed out");
         notary_task.await.unwrap();
         fixture_task.await.unwrap();
+        drop(session_slot);
     }
 
     /// A connection that says nothing fails at the setup deadline, holds no
@@ -489,7 +492,7 @@ mod tests {
         /// real handler; the second is a real prover behind the same queue.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn mpc_prover_queues_behind_a_full_slot_and_then_succeeds() {
-            let _session_slot = ONE_SESSION_AT_A_TIME.lock().await;
+            let session_slot = ONE_SESSION_AT_A_TIME.lock().await;
             let mut state = NotaryState::for_tests(test_signer().await);
             state.mpc_sessions = Arc::new(Semaphore::new(1));
             let expected_pubkey = state.signer.compressed_public_key().to_vec();
@@ -606,6 +609,7 @@ mod tests {
                 .expect("the queued prover never finished after the slot freed");
             b_task.await.unwrap().expect("the queued session failed");
             fixture_task.await.unwrap();
+            drop(session_slot);
         }
 
         /// A queued prover is still under the connection deadline: it fails
@@ -615,7 +619,7 @@ mod tests {
         async fn queued_prover_hits_the_deadline_while_waiting() {
             let mut state = NotaryState::for_tests(test_signer().await);
             state.mpc_sessions = Arc::new(Semaphore::new(1));
-            let _running = Arc::clone(&state.mpc_sessions)
+            let running = Arc::clone(&state.mpc_sessions)
                 .acquire_owned()
                 .await
                 .unwrap();
@@ -627,6 +631,7 @@ mod tests {
                 .expect_err("a queued prover must not wait past the deadline");
             assert!(err.to_string().contains("deadline"), "got: {err}");
             assert!(started.elapsed() >= state.connection_deadline);
+            drop(running);
         }
 
         /// Shutdown closes the queue: a prover waiting for a slot fails at
@@ -636,7 +641,7 @@ mod tests {
         async fn queued_prover_fails_fast_when_the_queue_closes() {
             let mut state = NotaryState::for_tests(test_signer().await);
             state.mpc_sessions = Arc::new(Semaphore::new(1));
-            let _running = Arc::clone(&state.mpc_sessions)
+            let running = Arc::clone(&state.mpc_sessions)
                 .acquire_owned()
                 .await
                 .unwrap();
@@ -655,6 +660,7 @@ mod tests {
                 .unwrap()
                 .expect_err("a drained prover has no session to succeed");
             assert!(err.to_string().contains("shutting down"), "got: {err}");
+            drop(running);
         }
     }
 }

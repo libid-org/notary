@@ -858,7 +858,7 @@ async fn the_concurrency_cap_holds_across_two_replicas() {
     let client = fresh_client();
 
     let first = admitted(&a.public(), &xff(&client)).await;
-    let _second = admitted(&a.public(), &xff(&client)).await;
+    let second = admitted(&a.public(), &xff(&client)).await;
     until_leases(&lab.pool, &client, 2).await;
 
     let mut third = held_session(&b.public(), &xff(&client))
@@ -871,13 +871,15 @@ async fn the_concurrency_cap_holds_across_two_replicas() {
     drop(first);
     let url = b.public();
     let client = client.as_str();
-    let _reopened: Socket = poll(Duration::from_secs(10), "B admits", || async {
+    let reopened: Socket = poll(Duration::from_secs(10), "B admits", || async {
         let mut socket = held_session(&url, &xff(client)).await.expect("upgrade");
         holds(&mut socket, Duration::from_millis(200))
             .await
             .then_some(socket)
     })
     .await;
+    drop(reopened);
+    drop(second);
 }
 
 /// `--per-ip-upgrades` counts what a client started on every replica: three
@@ -891,9 +893,9 @@ async fn the_upgrades_window_holds_across_two_replicas() {
     let b = lab.spawn("B", &flags).await;
     let client = fresh_client();
 
-    let _one = admitted(&a.public(), &xff(&client)).await;
-    let _two = admitted(&a.public(), &xff(&client)).await;
-    let _three = admitted(&b.public(), &xff(&client)).await;
+    let one = admitted(&a.public(), &xff(&client)).await;
+    let two = admitted(&a.public(), &xff(&client)).await;
+    let three = admitted(&b.public(), &xff(&client)).await;
 
     for (label, url) in [("A", a.public()), ("B", b.public())] {
         let refused = upgrade(&url, &xff(&client))
@@ -909,7 +911,11 @@ async fn the_upgrades_window_holds_across_two_replicas() {
     }
 
     let other = fresh_client();
-    let _other = admitted(&b.public(), &xff(&other)).await;
+    let other = admitted(&b.public(), &xff(&other)).await;
+    drop(other);
+    drop(three);
+    drop(two);
+    drop(one);
 }
 
 /// `--per-ip-bytes` is charged with what a session really relayed. One
@@ -988,7 +994,7 @@ async fn the_global_pool_refuses_with_503() {
         .await;
     let client = fresh_client();
 
-    let _holder = admitted(&notary.public(), &xff(&client)).await;
+    let holder = admitted(&notary.public(), &xff(&client)).await;
     let url = notary.public();
     let client = client.as_str();
     let refused = poll(Duration::from_secs(5), "the pool refuses", || async {
@@ -997,6 +1003,7 @@ async fn the_global_pool_refuses_with_503() {
     .await;
     assert_eq!(refused.status, 503, "{refused:?}");
     assert_eq!(refused.retry_after, None);
+    drop(holder);
 }
 
 /// Every public limit at its minimum, and the internal route ignores them
@@ -1027,9 +1034,9 @@ async fn the_internal_route_ignores_every_limit() {
         rows(&lab.pool, "notary_windows").await,
     );
 
-    let _one = admitted(&notary.internal(), &[]).await;
-    let _two = admitted(&notary.internal(), &[]).await;
-    let _three = admitted(&notary.internal(), &[]).await;
+    let one = admitted(&notary.internal(), &[]).await;
+    let two = admitted(&notary.internal(), &[]).await;
+    let three = admitted(&notary.internal(), &[]).await;
     let outcome = run_session(&notary.internal(), &[])
         .await
         .expect("the internal route admits");
@@ -1065,6 +1072,9 @@ async fn the_internal_route_ignores_every_limit() {
         rows(&lab.pool, "notary_windows").await > before.1,
         "the public session left no window rows"
     );
+    drop(three);
+    drop(two);
+    drop(one);
 }
 
 /// With `--client-ip-header cf-connecting-ip` the client is that header and
@@ -1104,13 +1114,15 @@ async fn a_missing_header_is_400_and_cf_mode_switches_the_source() {
     until_leases(&lab.pool, &client, 0).await;
 
     let other = fresh_client();
-    let _same = admitted(&notary.public(), &cf(&client)).await;
-    let _other = admitted(&notary.public(), &cf(&other)).await;
+    let same = admitted(&notary.public(), &cf(&client)).await;
+    let other = admitted(&notary.public(), &cf(&other)).await;
     let mut again = held_session(&notary.public(), &cf(&client))
         .await
         .expect("the upgrade itself is not refused");
     let (code, reason) = close_reason(&mut again).await;
     assert_eq!(code, 1013, "{reason}");
+    drop(other);
+    drop(same);
 }
 
 /// The store cut off at runtime: the public port refuses with 503 naming the
@@ -1155,12 +1167,14 @@ async fn a_store_outage_fails_closed_and_recovers() {
         "{refused:?}"
     );
 
-    let _forwarder = Forwarder::start(port, upstream).await;
-    let _recovered: Socket =
+    let forwarder = Forwarder::start(port, upstream).await;
+    let recovered: Socket =
         poll(Duration::from_secs(10), "the upgrade recovers", || async {
             upgrade(&url, &xff(client)).await.ok()
         })
         .await;
+    drop(forwarder);
+    drop(recovered);
 }
 
 /// A replica killed with leases held: they expire on the connection
@@ -1181,8 +1195,8 @@ async fn limits_recover_when_a_replica_dies_holding_leases() {
     let b = lab.spawn("B", &flags).await;
     let client = fresh_client();
 
-    let _one = admitted(&a.public(), &xff(&client)).await;
-    let _two = admitted(&a.public(), &xff(&client)).await;
+    let one = admitted(&a.public(), &xff(&client)).await;
+    let two = admitted(&a.public(), &xff(&client)).await;
     until_leases(&lab.pool, &client, 2).await;
 
     a.signal(libc::SIGKILL);
@@ -1196,13 +1210,16 @@ async fn limits_recover_when_a_replica_dies_holding_leases() {
 
     let url = b.public();
     let client = client.as_str();
-    let _reopened: Socket = poll(Duration::from_secs(10), "B admits", || async {
+    let reopened: Socket = poll(Duration::from_secs(10), "B admits", || async {
         let mut socket = held_session(&url, &xff(client)).await.expect("upgrade");
         holds(&mut socket, Duration::from_millis(200))
             .await
             .then_some(socket)
     })
     .await;
+    drop(reopened);
+    drop(two);
+    drop(one);
 }
 
 /// SIGTERM with a session in flight: the session finishes with its

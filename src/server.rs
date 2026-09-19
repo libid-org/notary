@@ -449,10 +449,10 @@ pub async fn run_with(
                                 let s = tcp_state.clone();
                                 let in_flight = s.in_flight.token();
                                 tokio::spawn(async move {
-                                    let _in_flight = in_flight;
                                     if let Err(e) = s.handle_tcp_prover(stream).await {
                                         error!("TCP handler error for {}: {}", peer, e);
                                     }
+                                    drop(in_flight);
                                 });
                             }
                             Err(e) => error!("TCP accept failed: {}", e),
