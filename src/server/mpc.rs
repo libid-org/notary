@@ -212,7 +212,7 @@ mod tests {
         let state = NotaryState::for_tests(signer);
 
         let (prover_io, notary_io) = tokio::io::duplex(2 << 23);
-        let (target_io, fixture_io) = tokio::io::duplex(1 << 17);
+        let (target_io, fixture_io) = tokio::io::duplex(crate::limits::RELAY_PIPE_BYTES);
         let fixture_task = tokio::spawn(async move {
             tlsn_server_fixture::bind(fixture_io.compat())
                 .await
@@ -342,7 +342,7 @@ mod tests {
         let slots = state.mpc_sessions.available_permits();
 
         // The client half stays open and never writes a byte.
-        let (client, server) = tokio::io::duplex(1 << 16);
+        let (client, server) = tokio::io::duplex(crate::limits::RELAY_PIPE_BYTES);
 
         let started = tokio::time::Instant::now();
         let connection = {
@@ -500,7 +500,8 @@ mod tests {
 
             // A holds the only slot: it sent the byte that starts a session,
             // then said nothing more. Connecting alone would take no slot.
-            let (mut a_client, a_server) = tokio::io::duplex(1 << 16);
+            let (mut a_client, a_server) =
+                tokio::io::duplex(crate::limits::RELAY_PIPE_BYTES);
             let a_state = state.clone();
             let a_task =
                 tokio::spawn(async move { a_state.handle_tcp_prover(a_server).await });
@@ -516,7 +517,8 @@ mod tests {
 
             // B: a real prover, whose notary side goes through the queue.
             let (prover_io, notary_io) = tokio::io::duplex(2 << 23);
-            let (target_io, fixture_io) = tokio::io::duplex(1 << 17);
+            let (target_io, fixture_io) =
+                tokio::io::duplex(crate::limits::RELAY_PIPE_BYTES);
             let fixture_task = tokio::spawn(async move {
                 tlsn_server_fixture::bind(fixture_io.compat())
                     .await

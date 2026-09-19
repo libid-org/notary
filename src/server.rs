@@ -260,8 +260,10 @@ impl NotaryState {
         Self {
             public_key_hex: hex::encode(signer.compressed_public_key()),
             signer: Arc::new(signer),
-            proxy_sessions: Arc::new(Semaphore::new(1024)),
-            internal_proxy_sessions: Arc::new(Semaphore::new(1024)),
+            proxy_sessions: Arc::new(Semaphore::new(crate::limits::DEFAULT_MAX_SESSIONS)),
+            internal_proxy_sessions: Arc::new(Semaphore::new(
+                crate::limits::DEFAULT_MAX_SESSIONS,
+            )),
             max_sessions_per_ip: 4,
             limits: Store::memory(),
             per_ip_upgrades: "10/1m,60/30m,100/1h".parse::<WindowLimits>().unwrap(),

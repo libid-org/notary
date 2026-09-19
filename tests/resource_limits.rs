@@ -10,6 +10,7 @@ use std::{
     num::NonZeroUsize,
     time::Duration,
 };
+use tungstenite::protocol::frame::coding::CloseCode;
 
 use clap::Parser;
 use futures_util::{
@@ -61,7 +62,7 @@ fn nz(n: usize) -> NonZeroUsize {
 #[test]
 fn every_limit_has_a_default() {
     let config = parse(&[]).unwrap();
-    assert_eq!(config.max_sessions, 1024);
+    assert_eq!(config.max_sessions, notary::limits::DEFAULT_MAX_SESSIONS);
     assert_eq!(config.proxy_max_bytes, 10_000_000);
     assert_eq!(config.mpc_max_sessions, Concurrency::PerCore(nz(4)));
     assert_eq!(config.connection_deadline_secs, 300);
@@ -81,7 +82,10 @@ fn every_limit_has_a_default() {
     );
     assert_eq!(config.ws_port, 7048);
     assert!(!config.internal_proxy_route);
-    assert_eq!(config.internal_max_sessions, 1024);
+    assert_eq!(
+        config.internal_max_sessions,
+        notary::limits::DEFAULT_MAX_SESSIONS
+    );
     assert_eq!(
         config.per_ip_upgrades,
         "10/1m,60/30m,100/1h".parse::<WindowLimits>().unwrap()
@@ -399,7 +403,7 @@ async fn the_per_ip_cap_counts_the_rightmost_forwarded_address() {
         .await
         .expect("the upgrade itself is not refused");
     let (code, reason) = close_reason(&mut third).await;
-    assert_eq!(code, 1013, "reason: {reason}");
+    assert_eq!(code, u16::from(CloseCode::Again), "reason: {reason}");
     assert!(reason.contains("this client"), "{reason}");
 
     // A forged prefix does not buy a fresh budget: the balancer's entry is
@@ -407,7 +411,10 @@ async fn the_per_ip_cap_counts_the_rightmost_forwarded_address() {
     let mut forged = session_from(&url, "9.9.9.9, 203.0.113.7")
         .await
         .expect("upgrade");
-    assert_eq!(close_reason(&mut forged).await.0, 1013);
+    assert_eq!(
+        close_reason(&mut forged).await.0,
+        u16::from(CloseCode::Again)
+    );
 
     // Another client is unaffected -- the cap is per client, and the key is
     // the forwarded address rather than the peer every one of these shares.
@@ -585,7 +592,7 @@ async fn cf_connecting_ip_mode_keys_on_the_cloudflare_header() {
         .await
         .expect("the upgrade itself is not refused");
     let (code, reason) = close_reason(&mut same).await;
-    assert_eq!(code, 1013, "reason: {reason}");
+    assert_eq!(code, u16::from(CloseCode::Again), "reason: {reason}");
     assert!(reason.contains("this client"), "{reason}");
 
     handle.shutdown();

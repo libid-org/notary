@@ -82,6 +82,8 @@ use crate::{
     limits::{
         CappedIo,
         DataCap,
+        RELAY_PIPE_BYTES,
+        RELAY_READ_BYTES,
     },
     store::{
         self,
@@ -370,7 +372,7 @@ impl NotaryState {
             return;
         };
 
-        let (io_a, io_b) = tokio::io::duplex(1 << 17);
+        let (io_a, io_b) = tokio::io::duplex(RELAY_PIPE_BYTES);
         let (mut pipe_reader, mut pipe_writer) = tokio::io::split(io_a);
 
         // Keep inbound and outbound ownership separate. Whichever direction ends
@@ -397,7 +399,7 @@ impl NotaryState {
             let _ = pipe_writer.shutdown().await;
         }));
         let outbound_task = AbortOnDrop::new(tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
+            let mut buf = vec![0u8; RELAY_READ_BYTES];
             loop {
                 match pipe_reader.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
@@ -952,7 +954,7 @@ mod tests {
                 .await
                 .unwrap();
         let (mut ws_tx, mut ws_rx) = websocket.split();
-        let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
+        let (browser_io, pump_io) = tokio::io::duplex(crate::limits::RELAY_PIPE_BYTES);
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
         let pump_task = tokio::spawn(async move {
             let (mut pipe_reader, mut pipe_writer) = tokio::io::split(pump_io);
@@ -972,7 +974,7 @@ mod tests {
                 }
             };
             let pipe_to_ws = async {
-                let mut buf = vec![0u8; 65536];
+                let mut buf = vec![0u8; crate::limits::RELAY_READ_BYTES];
                 loop {
                     match pipe_reader.read(&mut buf).await.unwrap() {
                         0 => break,
@@ -1067,7 +1069,7 @@ mod tests {
                 .await
                 .unwrap();
         let (mut ws_tx, mut ws_rx) = websocket.split();
-        let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
+        let (browser_io, pump_io) = tokio::io::duplex(crate::limits::RELAY_PIPE_BYTES);
         let failed_pump = tokio::spawn(async move {
             let (mut pipe_reader, mut pipe_writer) = tokio::io::split(pump_io);
             let ws_to_pipe = async {
@@ -1085,7 +1087,7 @@ mod tests {
                 }
             };
             let pipe_to_ws = async {
-                let mut buf = vec![0u8; 65536];
+                let mut buf = vec![0u8; crate::limits::RELAY_READ_BYTES];
                 loop {
                     match pipe_reader.read(&mut buf).await.unwrap() {
                         0 => break,
@@ -1252,7 +1254,8 @@ mod tests {
                 .await
                 .unwrap();
             let (mut ws_tx, mut ws_rx) = websocket.split();
-            let (browser_io, pump_io) = tokio::io::duplex(1 << 17);
+            let (browser_io, pump_io) =
+                tokio::io::duplex(crate::limits::RELAY_PIPE_BYTES);
             let pump = tokio::spawn(async move {
                 let (mut pipe_reader, mut pipe_writer) = tokio::io::split(pump_io);
                 let mut seen = BrowserSide {
@@ -1281,7 +1284,7 @@ mod tests {
                     seen
                 };
                 let pipe_to_ws = async {
-                    let mut buf = vec![0u8; 65536];
+                    let mut buf = vec![0u8; crate::limits::RELAY_READ_BYTES];
                     loop {
                         match pipe_reader.read(&mut buf).await {
                             Ok(0) | Err(_) => break,
@@ -1826,7 +1829,12 @@ mod tests {
                 .await
                 .expect("the notary never closed the session")
                 .expect("closed without a close frame");
-            assert_eq!(u16::from(frame.code), 1013, "reason: {}", frame.reason);
+            assert_eq!(
+                u16::from(frame.code),
+                u16::from(CloseCode::Again),
+                "reason: {}",
+                frame.reason
+            );
             assert_eq!(frame.reason, "limits store unavailable");
 
             notary_task.abort();
