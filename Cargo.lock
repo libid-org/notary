@@ -3719,8 +3719,8 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libid-crypto"
-version = "0.5.0"
-source = "git+https://github.com/libid-org/libID-rs?tag=v0.5.0#bd6b5967cccaf1003c429b22075e42ff6ed5aba9"
+version = "0.6.0"
+source = "git+https://github.com/libid-org/libID-rs?tag=v0.6.0#4e49b414d81ef732bed153db8d574f8e4c5e39c1"
 dependencies = [
  "hex",
  "k256",
@@ -3731,14 +3731,14 @@ dependencies = [
 
 [[package]]
 name = "libid-profiles"
-version = "0.10.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b500f5875925c4bce39377730a0ffc8f66dd4d623fc7c1555411b48b2076530e"
+checksum = "76e8c3d3739085340d1dbc805d30d5c3f2c3967428fe0c51e5057a82dc459a9b"
 
 [[package]]
 name = "libid-signer"
-version = "0.5.0"
-source = "git+https://github.com/libid-org/libID-rs?tag=v0.5.0#bd6b5967cccaf1003c429b22075e42ff6ed5aba9"
+version = "0.6.0"
+source = "git+https://github.com/libid-org/libID-rs?tag=v0.6.0#4e49b414d81ef732bed153db8d574f8e4c5e39c1"
 dependencies = [
  "alloy",
  "aws-config",
@@ -3749,8 +3749,8 @@ dependencies = [
 
 [[package]]
 name = "libid-tlsn"
-version = "0.5.0"
-source = "git+https://github.com/libid-org/libID-rs?tag=v0.5.0#bd6b5967cccaf1003c429b22075e42ff6ed5aba9"
+version = "0.6.0"
+source = "git+https://github.com/libid-org/libID-rs?tag=v0.6.0#4e49b414d81ef732bed153db8d574f8e4c5e39c1"
 dependencies = [
  "http-body-util",
  "hyper 1.11.1",
@@ -3766,8 +3766,8 @@ dependencies = [
 
 [[package]]
 name = "libid-transcript"
-version = "0.5.0"
-source = "git+https://github.com/libid-org/libID-rs?tag=v0.5.0#bd6b5967cccaf1003c429b22075e42ff6ed5aba9"
+version = "0.6.0"
+source = "git+https://github.com/libid-org/libID-rs?tag=v0.6.0#4e49b414d81ef732bed153db8d574f8e4c5e39c1"
 dependencies = [
  "bincode 2.0.1",
  "httparse",

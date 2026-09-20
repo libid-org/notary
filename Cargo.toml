@@ -46,10 +46,10 @@ e2e = []
 # The upstream `tlsn` git rev is pinned by libid-tlsn and arrives the same way;
 # the direct `tlsn` entry below MUST name the same rev.
 #
-libid-crypto = { git = "https://github.com/libid-org/libID-rs", tag = "v0.5.0" }
-libid-signer = { git = "https://github.com/libid-org/libID-rs", tag = "v0.5.0" }
-libid-tlsn = { git = "https://github.com/libid-org/libID-rs", tag = "v0.5.0" }
-libid-transcript = { git = "https://github.com/libid-org/libID-rs", tag = "v0.5.0" }
+libid-crypto = { git = "https://github.com/libid-org/libID-rs", tag = "v0.6.0" }
+libid-signer = { git = "https://github.com/libid-org/libID-rs", tag = "v0.6.0" }
+libid-tlsn = { git = "https://github.com/libid-org/libID-rs", tag = "v0.6.0" }
+libid-transcript = { git = "https://github.com/libid-org/libID-rs", tag = "v0.6.0" }
 
 # Upstream TLSNotary. The pin MUST equal libid-tlsn's (same source →
 # cargo unifies to one copy; a divergent rev would produce two incompatible
