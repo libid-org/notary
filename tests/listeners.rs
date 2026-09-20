@@ -330,9 +330,11 @@ async fn a_connection_without_a_request_is_closed_at_the_setup_deadline() {
     let addr = handle.ws_local_addr().unwrap();
 
     for opening in ["", "GET /info HTTP/1.1\r\nHost: notary\r\n"] {
+        // The server's clock starts at accept, during the connect; taken
+        // any later, the lower bound below is off by that gap.
+        let started = std::time::Instant::now();
         let mut socket = TcpStream::connect(addr).await.unwrap();
         socket.write_all(opening.as_bytes()).await.unwrap();
-        let started = std::time::Instant::now();
         let reply = until_closed(&mut socket, deadline * 5).await;
         assert!(
             started.elapsed() >= deadline,
