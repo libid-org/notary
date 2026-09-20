@@ -135,6 +135,28 @@ impl Inner {
         }
     }
 
+    /// A new lease for `client` at `now`, or `None` when `limit` are live.
+    fn lease(
+        &mut self,
+        client: &ClientKey,
+        limit: usize,
+        ttl: Duration,
+        now: Instant,
+    ) -> Option<LeaseId> {
+        if self.live_leases(client, now) >= limit {
+            return None;
+        }
+        let id = LeaseId::new();
+        self.leases.insert(
+            id.clone(),
+            Lease {
+                client: *client,
+                expires_at: now + ttl,
+            },
+        );
+        Some(id)
+    }
+
     fn sweep(&mut self, now: Instant, unix: Duration) -> u64 {
         let before = self.leases.len() + self.windows.len();
         self.leases.retain(|_, l| l.expires_at > now);
@@ -150,20 +172,7 @@ impl LimitStore for MemoryStore {
         limit: usize,
         ttl: Duration,
     ) -> Result<Option<LeaseId>, StoreError> {
-        let now = Instant::now();
-        let mut inner = self.lock();
-        if inner.live_leases(client, now) >= limit {
-            return Ok(None);
-        }
-        let id = LeaseId::new();
-        inner.leases.insert(
-            id.clone(),
-            Lease {
-                client: *client,
-                expires_at: now + ttl,
-            },
-        );
-        Ok(Some(id))
+        Ok(self.lock().lease(client, limit, ttl, Instant::now()))
     }
 
     async fn release(&self, lease: &LeaseId) -> Result<(), StoreError> {
@@ -262,37 +271,30 @@ mod tests {
         assert!(inner.windows.is_empty());
     }
 
-    #[tokio::test]
-    async fn a_sweep_takes_exactly_the_expired() -> Result<(), StoreError> {
-        let store = MemoryStore::new();
+    #[test]
+    fn a_sweep_takes_exactly_the_expired() {
         let c = fresh_client();
+        let mut inner = Inner::default();
+        let t0 = Instant::now();
+        // Mid-hour, on a whole second: the 1s window ends inside the test,
+        // the 1h window does not.
+        let u0 = Duration::from_secs(3600 * 277 + 1800);
         let blink = Duration::from_millis(20);
-        store.try_lease(&c, 9, blink).await?.expect("lease");
-        store.try_lease(&c, 9, blink).await?.expect("lease");
-        let kept = store
-            .try_lease(&c, 9, Duration::from_secs(60))
-            .await?
+        inner.lease(&c, 9, blink, t0).expect("lease");
+        inner.lease(&c, 9, blink, t0).expect("lease");
+        let kept = inner
+            .lease(&c, 9, Duration::from_secs(60), t0)
             .expect("lease");
-        store
-            .charge(
-                &c,
-                Dimension::Bytes,
-                1,
-                &"1/1s".parse::<WindowLimits>().unwrap(),
-            )
-            .await?;
-        store
-            .charge(
-                &c,
-                Dimension::Bytes,
-                1,
-                &"1/1h".parse::<WindowLimits>().unwrap(),
-            )
-            .await?;
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        assert_eq!(store.sweep().await?, 3);
-        assert_eq!(store.sweep().await?, 0);
-        assert!(store.lock().leases.contains_key(&kept));
-        Ok(())
+        let second = "1/1s".parse::<WindowLimits>().unwrap();
+        let hour = "1/1h".parse::<WindowLimits>().unwrap();
+        inner.add(&c, Dimension::Bytes, 1, &second, u0);
+        inner.add(&c, Dimension::Bytes, 1, &hour, u0);
+        // Nothing is due while the blink and the second still run.
+        let early = Duration::from_millis(19);
+        assert_eq!(inner.sweep(t0 + early, u0 + Duration::from_secs(1)), 0);
+        let later = Duration::from_millis(1100);
+        assert_eq!(inner.sweep(t0 + later, u0 + later), 3);
+        assert_eq!(inner.sweep(t0 + later, u0 + later), 0);
+        assert!(inner.leases.contains_key(&kept));
     }
 }
