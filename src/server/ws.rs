@@ -1185,6 +1185,59 @@ mod tests {
             .unwrap_err();
     }
 
+    /// A browser that leaves after setup, before its first TLS byte, is a
+    /// client event: the session ends, and it does not end as a server error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prover_leaving_before_tls_is_not_a_server_error() {
+        use std::time::Duration;
+        use tlsn::Session;
+        use tokio::net::TcpListener;
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        let _slot = ONE_SESSION_AT_A_TIME.lock().await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state =
+            super::NotaryState::for_tests(crate::server::tests::test_signer().await);
+        state.proxy_server_addr = Some(target.local_addr().unwrap());
+        let (client, server) = tokio::io::duplex(super::RELAY_PIPE_BYTES);
+        let server_task = tokio::spawn(async move {
+            state
+                .run_proxy_verifier_session(server, &super::DataCap::new(100_000))
+                .await
+        });
+
+        let mut session = Session::new(client.compat());
+        let prover = session
+            .new_prover(
+                tlsn::config::prover::ProverConfig::builder()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let (driver, handle) = session.split();
+        let driver = tokio::spawn(driver);
+        let config = tlsn::config::tls_commit::proxy::ProxyTlsConfig::builder()
+            .server_name(tlsn_server_fixture_certs::SERVER_DOMAIN.try_into().unwrap())
+            .build()
+            .unwrap();
+        let prover = prover.commit(config).await.unwrap();
+        // Setup is done and no TLS byte was sent. The browser leaves: its
+        // session closes and its transport goes with it.
+        drop(prover);
+        handle.close();
+        drop(driver.await.unwrap().unwrap());
+
+        let error = tokio::time::timeout(Duration::from_secs(3), server_task)
+            .await
+            .expect("notary retained a session whose browser left")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            !matches!(error, crate::error::Error::NotaryServer { .. }),
+            "a browser leaving reads as a server error: {error}"
+        );
+    }
+
     /// The limits an operator sets, tripped for real: the ProxyMode data cap.
     /// (The ProxyMode 503 and the flag parsing are integration tests in
     /// `tests/resource_limits.rs`, through the public surface.)
@@ -1501,6 +1554,78 @@ mod tests {
                 .expect("the connection never left flight");
 
             notary_task.abort();
+        }
+
+        /// A target that refuses the connection ends the session the way the
+        /// data cap does: a close frame with code 1011 and a reason that names
+        /// the failure, and no attestation. The browser learns why, not just
+        /// that the notary hung up.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_refused_target_closes_the_websocket_with_a_named_reason() {
+            let session_slot = ONE_SESSION_AT_A_TIME.lock().await;
+            let prover_config = ProverConfig::builder(SERVER_DOMAIN)
+                .mode(ProverMode::Proxy)
+                .root_certs(vec![CA_CERT_DER.to_vec()])
+                .build()
+                .unwrap();
+            let refused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let refused_addr = refused.local_addr().unwrap();
+            drop(refused);
+
+            let mut state = NotaryState::for_tests(test_signer().await);
+            state.proxy_root_store = Arc::new(prover_config.root_store.clone());
+            state.proxy_server_addr = Some(refused_addr);
+            let (notary_addr, notary_task) = serve(state).await;
+
+            let (browser_io, mut pump) = browser(notary_addr, Tier::Internal).await;
+            let mut prover = SdkProver::new(prover_config).unwrap();
+            let session = async {
+                prover.setup(browser_io.compat()).await.unwrap();
+                prover
+                    .send_request_proxy(
+                        HttpRequest::get(format!(
+                            "https://{SERVER_DOMAIN}/bytes?size=16"
+                        ))
+                        .header("Host", SERVER_DOMAIN)
+                        .header("Connection", "close"),
+                    )
+                    .await
+            };
+            tokio::pin!(session);
+
+            let seen = tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::select! {
+                    outcome = &mut session => {
+                        assert!(outcome.is_err(), "a request to a refused target must not succeed");
+                        pump.await.unwrap()
+                    }
+                    seen = &mut pump => seen.unwrap(),
+                }
+            })
+            .await
+            .expect("the notary neither failed the request nor closed the WebSocket");
+            let (code, reason) = seen.close.expect("closed without a close frame");
+            assert_eq!(code, u16::from(CloseCode::Error), "reason: {reason}");
+            assert!(
+                reason.starts_with("UPSTREAM_CONNECT_FAILED: "),
+                "reason: {reason}"
+            );
+            assert!(
+                reason.len() <= 123,
+                "reason over the close-frame budget: {reason}"
+            );
+            for frame in &seen.binary {
+                let attested = frame.len() >= 4
+                    && u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize
+                        == frame.len() - 4
+                    && serde_json::from_slice::<AttestationWire>(&frame[4..]).is_ok();
+                assert!(
+                    !attested,
+                    "an attestation was sent for a session without a target"
+                );
+            }
+            notary_task.abort();
+            drop(session_slot);
         }
 
         /// A relay that crosses the cap is aborted mid-stream: the browser's
