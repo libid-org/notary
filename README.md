@@ -54,9 +54,10 @@ On the public port:
 | `WS /notarize-proxy` | ProxyMode session, then one binary message carrying the length-prefixed section 9.1 attestation |
 | `WS /internal/notarize-proxy` | The same session for our own services, no per-client limits, its own pool; `404` unless `--internal-proxy-route`, `403` behind a proxy header |
 
-ProxyMode connects to the target only when the prover sends its first TLS
-bytes. Completing setup does not establish target reachability; connection
-failures surface during the HTTP/send operation rather than as setup rejections.
+ProxyMode dials the target when the prover's first TLS bytes arrive, so a
+target the browser prepares slowly for sees no idle connection. A target that
+cannot be reached ends the session during the request: the WebSocket closes
+with code 1011 and a reason starting `UPSTREAM_CONNECT_FAILED`.
 
 ## Configuration
 
