@@ -780,15 +780,8 @@ async fn forward_upstream(
 /// A close-frame reason, `<CODE>: <authority>: <detail>`, cut to the
 /// 123 bytes a close frame carries, on a character boundary.
 fn close_reason(code: &str, authority: &str, detail: &str) -> String {
-    const BUDGET: usize = 123;
     let mut reason = format!("{code}: {authority}: {detail}");
-    if reason.len() > BUDGET {
-        let mut end = BUDGET;
-        while !reason.is_char_boundary(end) {
-            end -= 1;
-        }
-        reason.truncate(end);
-    }
+    reason.truncate(reason.floor_char_boundary(123));
     reason
 }
 
