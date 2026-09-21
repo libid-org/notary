@@ -1044,24 +1044,22 @@ mod tests {
             }
         });
         let mut prover = SdkProver::new(prover_config).unwrap();
-        let failed_session = async {
-            prover
-                .setup(browser_io.compat())
-                .await
-                .map_err(|error| error.to_string())?;
-            prover
-                .send_request_proxy(
-                    HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
-                        .header("Host", SERVER_DOMAIN)
-                        .header("Connection", "close"),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        };
-        let result = tokio::time::timeout(Duration::from_secs(3), failed_session)
+        // Cryptographic setup has the same budget as the successful session;
+        // the shorter deadline measures failure propagation after setup.
+        tokio::time::timeout(Duration::from_secs(30), prover.setup(browser_io.compat()))
             .await
-            .expect("server connect failure was not propagated to the prover");
+            .expect("refused-target setup timed out")
+            .expect("setup must succeed before dialing the refused target");
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            prover.send_request_proxy(
+                HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
+                    .header("Host", SERVER_DOMAIN)
+                    .header("Connection", "close"),
+            ),
+        )
+        .await
+        .expect("server connect failure was not propagated to the prover");
         // Setup is accepted before dialing; a refused target now fails the
         // HTTP operation through the closed transport, not a setup rejection.
         assert!(result.is_err(), "refused target must fail the session");
