@@ -190,8 +190,7 @@ impl NotaryServerHandle {
 /// the request, decides whether the per-client limits apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tier {
-    /// `/notarize-proxy`: browsers behind the load balancer; every limit
-    /// applies.
+    /// `/notarize-proxy`: public browser clients; every limit applies.
     Public,
     /// `/internal/notarize-proxy`, with `--internal-proxy-route`: our own
     /// services; no per-client limit, no client address header keyed on,
@@ -235,8 +234,8 @@ struct NotaryState {
     per_ip_upgrades: WindowLimits,
     /// Bytes one public client may relay per window.
     per_ip_bytes: WindowLimits,
-    /// Which header names the client on the public route. Never keyed on
-    /// for the internal route.
+    /// How the public client is identified for limits. Never consulted for
+    /// the internal route.
     client_ip_header: ClientIpHeader,
     /// Bytes one ProxyMode session may relay, both directions combined.
     proxy_max_bytes: usize,

@@ -32,8 +32,8 @@ pub struct NotaryServerConfig {
     #[arg(long, env = "NOTARY_PORT")]
     pub port: Option<u16>,
 
-    /// The public HTTP/WebSocket port: browser ProxyMode, behind the load
-    /// balancer, with every per-client limit in force. `0` disables it.
+    /// The public HTTP/WebSocket port: browser ProxyMode, directly or behind
+    /// a load balancer, with every per-client limit in force. `0` disables it.
     #[arg(long, env = "NOTARY_WS_PORT", default_value_t = 7048)]
     pub ws_port: u16,
 
@@ -161,10 +161,10 @@ pub struct NotaryServerConfig {
     )]
     pub per_ip_bytes: WindowLimits,
 
-    /// Which header names the client on the public port. Every per-client
-    /// limit counts against it, and a public upgrade without it is refused
-    /// with 400: behind a load balancer the socket peer is the balancer, so
-    /// there is nothing else to key on.
+    /// How public requests are attributed for every per-client limit.
+    /// `none` uses the socket peer and ignores forwarded headers; use it
+    /// when clients connect directly. Header modes refuse missing, repeated
+    /// or malformed client headers with 400, never falling back to the peer.
     ///
     /// `x-forwarded-for`: the client is the RIGHTMOST `X-Forwarded-For`
     /// entry -- the address that connected to the load balancer, which the
@@ -176,7 +176,7 @@ pub struct NotaryServerConfig {
     /// (orange cloud); with it set while the record is grey, every public
     /// request is a 400, which is loud rather than wrong.
     ///
-    /// The limitation: nothing verifies who wrote the header. Anything that
+    /// In header modes, nothing verifies who wrote the header. Anything that
     /// can reach the public port directly can set it and choose its own
     /// key, so the public port must be reachable only through the load
     /// balancer. That is the deployment's job, not the notary's. The
@@ -244,9 +244,11 @@ impl NotaryServerConfig {
     }
 }
 
-/// Which header names the client on the public port; `--client-ip-header`.
+/// Client attribution on the public port; `--client-ip-header`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ClientIpHeader {
+    /// Use the socket peer directly, ignoring all forwarded headers.
+    None,
     /// The rightmost `X-Forwarded-For` entry: what the load balancer
     /// appended, which is the address that connected to it. For a notary
     /// directly behind the ALB (Cloudflare DNS-only, grey cloud).
@@ -260,6 +262,7 @@ pub enum ClientIpHeader {
 impl std::fmt::Display for ClientIpHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
+            Self::None => "none",
             Self::XForwardedFor => "x-forwarded-for",
             Self::CfConnectingIp => "cf-connecting-ip",
         };

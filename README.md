@@ -27,7 +27,7 @@ Nothing a caller sends moves it between the two tiers.
 | Port | Flag | Env | Default | Who | Policy |
 |---|---|---|---|---|---|
 | **7047** | `--port` | `NOTARY_PORT` | off unless set | Rust provers inside the cluster, MPC-TLS over TCP | Internal: no per-client limits |
-| **7048** | `--ws-port` | `NOTARY_WS_PORT` | `7048` | Browsers, ProxyMode over WebSocket, behind the load balancer | Public: every per-client limit in force |
+| **7048** | `--ws-port` | `NOTARY_WS_PORT` | `7048` | Browsers, ProxyMode over WebSocket | Public: every per-client limit in force |
 | 7048, `/internal/notarize-proxy` | `--internal-proxy-route` | `NOTARY_INTERNAL_PROXY_ROUTE` | off unless set | Our own services, ProxyMode over WebSocket | Internal: no per-client limits, no client header read |
 
 The internal endpoints are off unless set because they have no limits. The
@@ -74,7 +74,7 @@ Flags or environment variables:
 | `--max-sessions-per-ip` | `NOTARY_MAX_SESSIONS_PER_IP` | `4` | Concurrent public sessions one client may hold; past it close code 1013. One browser identity flow opens two. `0` disables |
 | `--per-ip-upgrades` | `NOTARY_PER_IP_UPGRADES` | `10/1m,60/30m,100/1h` | Sessions one client may start per window, `<count>/<window>`; every window must have room. Empty disables |
 | `--per-ip-bytes` | `NOTARY_PER_IP_BYTES` | `100MB/1m,600MB/30m,1GB/1h` | Bytes one client may relay per window, `<size>/<window>`; charged when a session ends, refused at the next upgrade. Empty disables |
-| `--client-ip-header` | `NOTARY_CLIENT_IP_HEADER` | `x-forwarded-for` | Which header names the client on the public port; a public upgrade without it is refused with 400 |
+| `--client-ip-header` | `NOTARY_CLIENT_IP_HEADER` | `x-forwarded-for` | Client attribution: `none` uses the socket peer; header modes require the selected header |
 | `--limits-store` | `NOTARY_LIMITS_STORE` | — | Where the per-client counts live: a `postgres://` URL, or `memory` for a single replica |
 
 Windows are `<limit>/<window>` lists: a count, or bytes with a `KB`/`MB`/`GB`
@@ -92,10 +92,12 @@ The limits in force are logged once at startup as `resource limits in force`.
 
 ### Who a session counts against
 
-Behind a load balancer every request arrives from the balancer, so the socket
-peer is never the key. `--client-ip-header` says what is:
+`--client-ip-header` selects the source for every public per-client limit:
 
-- `x-forwarded-for`: the **rightmost** `X-Forwarded-For` entry, which the
+- `none`: the socket peer. For direct connections, including local Docker
+  development; forwarded headers are ignored. Behind a proxy or NAT, all
+  clients sharing its source address share a budget.
+- `x-forwarded-for` (default): the **rightmost** `X-Forwarded-For` entry, which the
   balancer appended; everything left of it was written by the caller and is
   ignored. For a notary directly behind the ALB, with the Cloudflare record
   DNS-only (grey) or no Cloudflare at all.
@@ -103,11 +105,12 @@ peer is never the key. `--client-ip-header` says what is:
   proxied (orange) record; with a grey record every public upgrade becomes a
   400.
 
-A public upgrade without the header, or with it sent twice, is refused with
-400. Nothing verifies who wrote the header, so the public port must be
-reachable only through the load balancer; that is the deployment's job. IPv6
-clients are keyed by their /48 (a residential allocation is a /56); a
-`::ffff:a.b.c.d` address is keyed as `a.b.c.d`. Our own workloads are not
+In header modes, a public upgrade with a missing, repeated or malformed
+header is refused with 400; there is no fallback to the peer. Nothing verifies
+who wrote the header, so those modes require the public port to be reachable
+only through the load balancer. In all modes, IPv6 clients are keyed by their
+/48 (a residential allocation is a /56); a `::ffff:a.b.c.d` address is keyed as
+`a.b.c.d`. Our own workloads are not
 exempted by address: they use the MPC-TLS port or the internal route, which
 read no header.
 
@@ -150,10 +153,9 @@ docker run --rm \
   ghcr.io/libid-org/notary:latest
 ```
 
-That is the public port only, expecting a balancer in front: every upgrade
-needs the client header. For local work without one, mount the internal route
-(`-e NOTARY_INTERNAL_PROXY_ROUTE=true`) and use
-`ws://localhost:7048/internal/notarize-proxy`. A Rust prover needs
+That expects a balancer in front. For local work without one, add
+`-e NOTARY_CLIENT_IP_HEADER=none` and use `ws://localhost:7048/notarize-proxy`.
+The public limits remain in force, keyed by the socket peer. A Rust prover needs
 `-e NOTARY_PORT=7047 -p 7047:7047`.
 
 The image runs as uid 10001. Its `HEALTHCHECK` GETs `/healthcheck` on

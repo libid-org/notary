@@ -96,15 +96,15 @@ fn every_limit_has_a_default() {
     );
 }
 
-/// `--client-ip-header` takes either header and defaults to
-/// `x-forwarded-for`; anything else is a startup error naming both.
+/// Attribution is explicit; the default continues to require X-Forwarded-For.
 #[test]
-fn the_client_ip_header_is_one_of_two_and_defaults_to_x_forwarded_for() {
+fn client_attribution_defaults_to_x_forwarded_for() {
     assert_eq!(
         parse(&[]).unwrap().client_ip_header,
         ClientIpHeader::XForwardedFor
     );
     for (value, expected) in [
+        ("none", ClientIpHeader::None),
         ("x-forwarded-for", ClientIpHeader::XForwardedFor),
         ("cf-connecting-ip", ClientIpHeader::CfConnectingIp),
     ] {
@@ -534,12 +534,80 @@ async fn an_unattributable_request_is_refused_at_the_upgrade() {
     };
     assert_eq!(response.status(), 400);
 
+    let malformed = connect_async(upgrade_from(&url, "not-an-ip"))
+        .await
+        .expect_err("an invalid header must not fall back to the peer");
+    let tungstenite::Error::Http(response) = malformed else {
+        panic!("expected an HTTP refusal, got: {malformed}");
+    };
+    assert_eq!(response.status(), 400);
+
     let (named, response) = connect_async(upgrade_from(&url, A_CLIENT))
         .await
         .expect("the same upgrade with the header is admitted");
     assert_eq!(response.status(), 101);
     drop(named);
 
+    handle.shutdown();
+}
+
+/// Direct clients need no forwarding header, and forged headers cannot buy
+/// another peer's upgrade-window budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_mode_keys_the_upgrade_window_on_the_peer() {
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&[
+            "--ws-port",
+            &ws_port.to_string(),
+            "--client-ip-header",
+            "none",
+            "--per-ip-upgrades",
+            "4/1h",
+        ])
+        .unwrap()
+    })
+    .await;
+    let url = format!(
+        "ws://{}/notarize-proxy",
+        handle.ws_local_addr().expect("ws server enabled")
+    );
+    let (first, response) = connect_async(&url)
+        .await
+        .expect("a direct browser needs no custom headers");
+    assert_eq!(response.status(), 101);
+    drop(first);
+
+    let mut forged = upgrade_from(&url, "203.0.113.7");
+    forged
+        .headers_mut()
+        .insert("cf-connecting-ip", HeaderValue::from_static("198.51.100.4"));
+    let mut malformed = upgrade_from(&url, "not-an-ip");
+    malformed
+        .headers_mut()
+        .insert("cf-connecting-ip", HeaderValue::from_static("invalid"));
+    let mut repeated = forged.clone();
+    repeated
+        .headers_mut()
+        .append("x-forwarded-for", HeaderValue::from_static("9.9.9.9"));
+    repeated
+        .headers_mut()
+        .append("cf-connecting-ip", HeaderValue::from_static("8.8.8.8"));
+
+    for request in [forged, malformed, repeated] {
+        let (socket, response) = connect_async(request).await.expect(
+            "direct mode ignores forwarded headers even when malformed or repeated",
+        );
+        assert_eq!(response.status(), 101);
+        drop(socket);
+    }
+
+    let refused = connect_async(upgrade_from(&url, "192.0.2.1"))
+        .await
+        .expect_err("all four upgrades count against the socket peer");
+    let tungstenite::Error::Http(response) = refused else {
+        panic!("expected an HTTP refusal, got: {refused}");
+    };
+    assert_eq!(response.status(), 429);
     handle.shutdown();
 }
 
