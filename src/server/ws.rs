@@ -978,10 +978,10 @@ mod tests {
             .unwrap();
             assert_eq!(recovered.to_encoded_point(true).as_bytes(), expected_pubkey);
             assert_eq!(io.read(&mut [0]).await.unwrap(), 0);
-            target_task
+            target_task.await.unwrap();
         };
 
-        let target_task = tokio::time::timeout(Duration::from_secs(30), protocol)
+        tokio::time::timeout(Duration::from_secs(30), protocol)
             .await
             .expect("local ProxyMode smoke timed out");
         pump_task.await.unwrap();
@@ -995,7 +995,6 @@ mod tests {
         assert_eq!(declared_len, attestation_frame.len() - 4);
         serde_json::from_slice::<super::AttestationWire>(&attestation_frame[4..])
             .expect("the final WebSocket message is not an attestation");
-        target_task.await.unwrap();
 
         // The target listener is now gone. A second session exercises the
         // same TcpStream::connect error path as a DNS failure and must close
