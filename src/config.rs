@@ -161,10 +161,14 @@ pub struct NotaryServerConfig {
     )]
     pub per_ip_bytes: WindowLimits,
 
-    /// Which header names the client on the public port. Every per-client
-    /// limit counts against it, and a public upgrade without it is refused
-    /// with 400: behind a load balancer the socket peer is the balancer, so
-    /// there is nothing else to key on.
+    /// Who the client of a public request is, for every per-client limit.
+    /// A public upgrade the mode cannot attribute is refused with 400,
+    /// never keyed on something else.
+    ///
+    /// `peer`: the socket peer, for a notary that clients reach directly,
+    /// local Docker included. A request that carries `X-Forwarded-For` or
+    /// `CF-Connecting-IP` came through a proxy the configuration does not
+    /// know about, and the peer would be that proxy: refused.
     ///
     /// `x-forwarded-for`: the client is the RIGHTMOST `X-Forwarded-For`
     /// entry -- the address that connected to the load balancer, which the
@@ -176,9 +180,9 @@ pub struct NotaryServerConfig {
     /// (orange cloud); with it set while the record is grey, every public
     /// request is a 400, which is loud rather than wrong.
     ///
-    /// The limitation: nothing verifies who wrote the header. Anything that
-    /// can reach the public port directly can set it and choose its own
-    /// key, so the public port must be reachable only through the load
+    /// In the header modes nothing verifies who wrote the header. Anything
+    /// that can reach the public port directly can set it and choose its
+    /// own key, so the public port must be reachable only through the load
     /// balancer. That is the deployment's job, not the notary's. The
     /// internal route keys on no header; a request there carrying one is
     /// refused.
@@ -244,9 +248,13 @@ impl NotaryServerConfig {
     }
 }
 
-/// Which header names the client on the public port; `--client-ip-header`.
+/// Who the client of a public request is; `--client-ip-header`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ClientIpHeader {
+    /// The socket peer, for a notary that clients reach directly. A
+    /// request carrying a proxy's header is refused: the peer would be
+    /// the proxy.
+    Peer,
     /// The rightmost `X-Forwarded-For` entry: what the load balancer
     /// appended, which is the address that connected to it. For a notary
     /// directly behind the ALB (Cloudflare DNS-only, grey cloud).
@@ -260,6 +268,7 @@ pub enum ClientIpHeader {
 impl std::fmt::Display for ClientIpHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
+            Self::Peer => "peer",
             Self::XForwardedFor => "x-forwarded-for",
             Self::CfConnectingIp => "cf-connecting-ip",
         };

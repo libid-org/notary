@@ -97,14 +97,15 @@ fn every_limit_has_a_default() {
 }
 
 /// `--client-ip-header` takes either header and defaults to
-/// `x-forwarded-for`; anything else is a startup error naming both.
+/// `x-forwarded-for`; anything else is a startup error naming all three.
 #[test]
-fn the_client_ip_header_is_one_of_two_and_defaults_to_x_forwarded_for() {
+fn the_client_ip_header_is_one_of_three_and_defaults_to_x_forwarded_for() {
     assert_eq!(
         parse(&[]).unwrap().client_ip_header,
         ClientIpHeader::XForwardedFor
     );
     for (value, expected) in [
+        ("peer", ClientIpHeader::Peer),
         ("x-forwarded-for", ClientIpHeader::XForwardedFor),
         ("cf-connecting-ip", ClientIpHeader::CfConnectingIp),
     ] {
@@ -122,7 +123,9 @@ fn the_client_ip_header_is_one_of_two_and_defaults_to_x_forwarded_for() {
         .to_string();
     assert!(error.contains("--client-ip-header"), "{error}");
     assert!(
-        error.contains("x-forwarded-for") && error.contains("cf-connecting-ip"),
+        error.contains("peer")
+            && error.contains("x-forwarded-for")
+            && error.contains("cf-connecting-ip"),
         "{error}"
     );
 }
@@ -200,6 +203,64 @@ fn upgrade_with(
 /// The upgrade request for `url` naming `client` in `X-Forwarded-For`.
 fn upgrade_from(url: &str, client: &str) -> tungstenite::http::Request<()> {
     upgrade_with(url, "x-forwarded-for", client)
+}
+
+/// With `peer`, a direct upgrade needs no header and the windows count the
+/// socket peer; a request that carries a proxy's header is refused with
+/// 400 naming that header, before anything is counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_mode_keys_on_the_socket_and_refuses_a_proxied_request() {
+    let (handle, _) = common::start_server(|ws_port| {
+        parse(&[
+            "--ws-port",
+            &ws_port.to_string(),
+            "--client-ip-header",
+            "peer",
+            "--per-ip-upgrades",
+            "3/1h",
+        ])
+        .unwrap()
+    })
+    .await;
+    let url = format!(
+        "ws://{}/notarize-proxy",
+        handle.ws_local_addr().expect("ws server enabled")
+    );
+
+    for (header, request) in [
+        ("x-forwarded-for", upgrade_from(&url, "203.0.113.7")),
+        (
+            "cf-connecting-ip",
+            upgrade_with(&url, "cf-connecting-ip", "203.0.113.7"),
+        ),
+    ] {
+        let refused = connect_async(request)
+            .await
+            .expect_err("a proxied request must not be keyed on the peer");
+        let tungstenite::Error::Http(response) = refused else {
+            panic!("expected an HTTP refusal, got: {refused}");
+        };
+        assert_eq!(response.status(), 400, "{header}");
+        let body =
+            String::from_utf8_lossy(response.body().as_deref().unwrap_or_default());
+        assert!(body.contains(header), "{header}: {body}");
+    }
+
+    for _ in 0..3 {
+        let (socket, response) = connect_async(&url)
+            .await
+            .expect("a direct upgrade needs no header");
+        assert_eq!(response.status(), 101);
+        drop(socket);
+    }
+    let refused = connect_async(&url)
+        .await
+        .expect_err("the fourth upgrade in the window is over the peer's budget");
+    let tungstenite::Error::Http(response) = refused else {
+        panic!("expected an HTTP refusal, got: {refused}");
+    };
+    assert_eq!(response.status(), 429);
+    handle.shutdown();
 }
 
 /// Past `--max-sessions`, the upgrade is refused with 503 -- not queued --

@@ -209,12 +209,6 @@ impl Tier {
     }
 }
 
-/// The headers a load balancer adds to name the client that connected to
-/// it. The public route keys its limits on one of them; the internal route
-/// refuses a request carrying either, because our own services reach it
-/// inside the cluster and never through the balancer.
-const PROXIED_BY: [&str; 2] = ["x-forwarded-for", "cf-connecting-ip"];
-
 #[derive(Clone)]
 struct NotaryState {
     /// Notary signing identity (local hex key or AWS KMS).
