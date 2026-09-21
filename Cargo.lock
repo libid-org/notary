@@ -6211,7 +6211,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 [[package]]
 name = "tlsn"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 dependencies = [
  "aes 0.8.4",
  "ctr 0.9.2",
@@ -6259,7 +6259,7 @@ dependencies = [
 [[package]]
 name = "tlsn-attestation"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 dependencies = [
  "bcs",
  "blake3",
@@ -6277,7 +6277,7 @@ dependencies = [
 [[package]]
 name = "tlsn-cipher"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 dependencies = [
  "aes 0.8.4",
  "async-trait",
@@ -6290,7 +6290,7 @@ dependencies = [
 [[package]]
 name = "tlsn-core"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 dependencies = [
  "bimap",
  "blake3",
@@ -6319,7 +6319,7 @@ dependencies = [
 [[package]]
 name = "tlsn-deap"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 dependencies = [
  "async-trait",
  "futures",
@@ -6336,7 +6336,7 @@ dependencies = [
 [[package]]
 name = "tlsn-hmac-sha256"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 dependencies = [
  "mpz-circuits",
  "mpz-core",
@@ -6350,7 +6350,7 @@ dependencies = [
 [[package]]
 name = "tlsn-key-exchange"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 dependencies = [
  "async-trait",
  "derive_builder 0.12.0",
@@ -6373,7 +6373,7 @@ dependencies = [
 [[package]]
 name = "tlsn-mpc-tls"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -6423,7 +6423,7 @@ dependencies = [
 [[package]]
 name = "tlsn-sdk-core"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 dependencies = [
  "bytes",
  "futures",
@@ -6449,7 +6449,7 @@ dependencies = [
 [[package]]
 name = "tlsn-server-fixture"
 version = "0.0.0"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 dependencies = [
  "anyhow",
  "axum",
@@ -6470,12 +6470,12 @@ dependencies = [
 [[package]]
 name = "tlsn-server-fixture-certs"
 version = "0.0.0"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 
 [[package]]
 name = "tlsn-tls-core"
 version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/libid-org/tlsn?rev=95b4f04cdd509caf645c4dfb2eeb695909b4179e#95b4f04cdd509caf645c4dfb2eeb695909b4179e"
+source = "git+https://github.com/libid-org/tlsn?rev=da0f8488dfc55db8ed4271f817124306a2c07c09#da0f8488dfc55db8ed4271f817124306a2c07c09"
 dependencies = [
  "futures",
  "hmac 0.12.1",
