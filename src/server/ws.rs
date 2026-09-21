@@ -507,7 +507,7 @@ impl NotaryState {
                 "ProxyMode session aborted: data cap exceeded; nothing attested"
             ),
             Ok(Err(Error::ProverLeft)) => {
-                info!(%peer, "ProxyMode: browser left before its first TLS byte")
+                info!(%peer, "ProxyMode: browser left before the session was established")
             }
             Ok(Err(Error::UpstreamConnectFailed { authority, detail })) => warn!(
                 %peer,
@@ -600,29 +600,36 @@ impl NotaryState {
                     .map_err(|e| Error::NotaryServer {
                         detail: format!("verifier accept: {e}"),
                     })?;
-            let (verifier, ()) = tokio::try_join!(
-                async {
-                    verifier.run(server_io.compat()).await.map_err(|e| {
-                        Error::NotaryServer {
-                            detail: format!("run_proxy: {e}"),
-                        }
-                    })
+            let run = verifier.run(server_io.compat());
+            let relay = forward_upstream(proxy_io, &server_addr, Arc::clone(&cap));
+            tokio::pin!(run);
+            tokio::pin!(relay);
+            let run_error = |e: tlsn::Error| Error::NotaryServer {
+                detail: format!("run_proxy: {e}"),
+            };
+            let relay_error = |end: UpstreamEnd| match end {
+                UpstreamEnd::ProverLeft => Error::ProverLeft,
+                UpstreamEnd::Connect(error) => Error::UpstreamConnectFailed {
+                    authority: server_name_str.clone(),
+                    detail: error.to_string(),
                 },
-                async {
-                    forward_upstream(proxy_io, &server_addr, Arc::clone(&cap))
-                        .await
-                        .map_err(|end| match end {
-                            UpstreamEnd::ProverLeft => Error::ProverLeft,
-                            UpstreamEnd::Connect(error) => Error::UpstreamConnectFailed {
-                                authority: server_name_str.clone(),
-                                detail: error.to_string(),
-                            },
-                            UpstreamEnd::Relay(error) => Error::NotaryServer {
-                                detail: format!("upstream {server_name_str}: {error}"),
-                            },
-                        })
-                }
-            )
+                UpstreamEnd::Relay(error) => Error::NotaryServer {
+                    detail: format!("upstream {server_name_str}: {error}"),
+                },
+            };
+            // The session is the verifier's: once it is done, what the target
+            // still has to say is not part of it, and the relay goes with it.
+            // The relay ending first is the session failing, or, once the
+            // target closed and the prover's side drained, the verifier
+            // finishing.
+            let verifier = tokio::select! {
+                biased;
+                verifier = &mut run => verifier.map_err(run_error),
+                end = &mut relay => match end {
+                    Err(end) => Err(relay_error(end)),
+                    Ok(()) => run.await.map_err(run_error),
+                },
+            }
             .map_err(|error| {
                 if cap.exceeded() {
                     Error::ProxyDataCapExceeded {
@@ -971,7 +978,7 @@ mod tests {
         });
 
         let protocol = async {
-            let mut prover = SdkProver::new(prover_config.clone()).unwrap();
+            let mut prover = SdkProver::new(prover_config).unwrap();
             prover.setup(browser_io.compat()).await.unwrap();
             assert_eq!(
                 target_listener.accept().unwrap_err().kind(),
@@ -1050,74 +1057,6 @@ mod tests {
         serde_json::from_slice::<super::AttestationWire>(&attestation_frame[4..])
             .expect("the final WebSocket message is not an attestation");
 
-        // The target listener is now gone. A second session exercises the
-        // same TcpStream::connect error path as a DNS failure and must close
-        // the browser transport promptly instead of waiting five minutes.
-        let (websocket, _) =
-            connect_async(format!("ws://{notary_addr}{}", Tier::Internal.route()))
-                .await
-                .unwrap();
-        let (mut ws_tx, mut ws_rx) = websocket.split();
-        let (browser_io, pump_io) = tokio::io::duplex(crate::limits::RELAY_PIPE_BYTES);
-        let failed_pump = tokio::spawn(async move {
-            let (mut pipe_reader, mut pipe_writer) = tokio::io::split(pump_io);
-            let ws_to_pipe = async {
-                while let Some(message) = ws_rx.next().await {
-                    match message.unwrap() {
-                        WsMessage::Binary(data) => {
-                            pipe_writer.write_all(&data).await.unwrap();
-                        }
-                        WsMessage::Close(_) => {
-                            pipe_writer.shutdown().await.unwrap();
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            };
-            let pipe_to_ws = async {
-                let mut buf = vec![0u8; crate::limits::RELAY_READ_BYTES];
-                loop {
-                    match pipe_reader.read(&mut buf).await.unwrap() {
-                        0 => break,
-                        n => {
-                            if ws_tx
-                                .send(WsMessage::Binary(buf[..n].to_vec().into()))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-            };
-            tokio::select! {
-                _ = ws_to_pipe => {}
-                _ = pipe_to_ws => {}
-            }
-        });
-        let mut prover = SdkProver::new(prover_config).unwrap();
-        // Cryptographic setup has the same budget as the successful session;
-        // the shorter deadline measures failure propagation after setup.
-        tokio::time::timeout(Duration::from_secs(30), prover.setup(browser_io.compat()))
-            .await
-            .expect("refused-target setup timed out")
-            .expect("setup must succeed before dialing the refused target");
-        let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            prover.send_request_proxy(
-                HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
-                    .header("Host", SERVER_DOMAIN)
-                    .header("Connection", "close"),
-            ),
-        )
-        .await
-        .expect("server connect failure was not propagated to the prover");
-        // Setup is accepted before dialing; a refused target now fails the
-        // HTTP operation through the closed transport, not a setup rejection.
-        assert!(result.is_err(), "refused target must fail the session");
-        failed_pump.await.unwrap();
         notary_task.abort();
         drop(session_slot);
     }

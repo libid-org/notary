@@ -31,8 +31,8 @@ pub enum Error {
         /// The connect error, as the operating system put it.
         detail: String,
     },
-    /// The browser left after setup and before its first TLS byte.
-    #[error("ProxyMode browser left before its first TLS byte")]
+    /// The browser left after setup and before the session was established.
+    #[error("ProxyMode browser left before the session was established")]
     ProverLeft,
     /// The revealed HTTP request line could not be parsed.
     #[error("malformed request line: {detail}")]
