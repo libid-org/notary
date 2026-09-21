@@ -1,5 +1,12 @@
 //! Which client a public request came from.
 //!
+//! A notary that clients reach directly keys on the socket peer
+//! (`--client-ip-header peer`). A request there that carries a proxy's
+//! header came through a proxy the configuration does not know about, so
+//! the peer would be the proxy; it is refused.
+//!
+//! Behind a load balancer the picture is the reverse.
+//!
 //! A per-client limit is only as good as the identity it counts against, and
 //! behind a load balancer the socket peer is the balancer: every browser in
 //! the world shares it. The client is named in a header instead, and
@@ -43,6 +50,10 @@ const FORWARDED_FOR: &str = "x-forwarded-for";
 
 /// The `CF-Connecting-IP` field name, lowercased as `HeaderMap` stores it.
 const CF_CONNECTING_IP: &str = "cf-connecting-ip";
+
+/// The headers a proxy names the client in. One of them on a request means
+/// the request came through a proxy.
+pub const PROXIED_BY: [&str; 2] = [FORWARDED_FOR, CF_CONNECTING_IP];
 
 /// An upper bound on the `X-Forwarded-For` chain. A header is not evidence
 /// about a hundred hops; past this it is someone trying to make the split
@@ -108,21 +119,27 @@ pub enum Unattributed {
     /// The entry read was not an IP address, or the `X-Forwarded-For` chain
     /// was longer than `MAX_HOPS` (64).
     Malformed,
+    /// A proxy's header on a port whose client is the socket peer. The
+    /// request came through a proxy the configuration does not know about,
+    /// and keying on the peer would count every client behind it as one.
+    Proxied(&'static str),
 }
 
 impl std::fmt::Display for Unattributed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let reason = match self {
-            Self::Missing => "no client address header",
-            Self::Repeated => "more than one client address header",
-            Self::Malformed => "malformed client address header",
-        };
-        f.write_str(reason)
+        match self {
+            Self::Missing => f.write_str("no client address header"),
+            Self::Repeated => f.write_str("more than one client address header"),
+            Self::Malformed => f.write_str("malformed client address header"),
+            Self::Proxied(header) => {
+                write!(f, "{header} on a port whose client is the socket peer")
+            }
+        }
     }
 }
 
-/// How a public request is attributed to a client: which header names it,
-/// and which entry of that header is the balancer's word.
+/// A header a proxy names the client in: which header, and which entry of
+/// it is the proxy's word.
 pub trait ClientSource {
     /// The header that names the client.
     fn header(&self) -> &'static str;
@@ -150,47 +167,91 @@ pub trait ClientSource {
     }
 }
 
-impl ClientSource for ClientIpHeader {
+/// The rightmost `X-Forwarded-For` entry: the address that connected to the
+/// load balancer, which the balancer appended last.
+pub struct XForwardedFor;
+
+impl ClientSource for XForwardedFor {
     fn header(&self) -> &'static str {
-        match self {
-            Self::XForwardedFor => FORWARDED_FOR,
-            Self::CfConnectingIp => CF_CONNECTING_IP,
-        }
+        FORWARDED_FOR
     }
 
     fn entry<'a>(&self, line: &'a str) -> Result<&'a str, Unattributed> {
+        // The balancer appended last, so the last entry is its word and the
+        // ones before it are the caller's: not read, only counted, so that a
+        // chain past `MAX_HOPS` is refused.
+        let mut entries = line.rsplit(',');
+        let last = entries.next().unwrap_or("");
+        if entries.count() >= MAX_HOPS {
+            return Err(Unattributed::Malformed);
+        }
+        Ok(last)
+    }
+}
+
+/// The `CF-Connecting-IP` value Cloudflare sets to the address that connected
+/// to its edge.
+pub struct CfConnectingIp;
+
+impl ClientSource for CfConnectingIp {
+    fn header(&self) -> &'static str {
+        CF_CONNECTING_IP
+    }
+
+    fn entry<'a>(&self, line: &'a str) -> Result<&'a str, Unattributed> {
+        Ok(line)
+    }
+}
+
+impl ClientIpHeader {
+    /// The client a public request from `peer` with `headers` counts against.
+    ///
+    /// `Peer` is the socket peer, provided no proxy's header is present: one
+    /// means the request came through a proxy, and the peer is then the proxy.
+    /// A header mode is its source's word, and never the peer.
+    pub fn client(
+        &self,
+        peer: IpAddr,
+        headers: &HeaderMap,
+    ) -> Result<ClientKey, Unattributed> {
         match self {
-            Self::XForwardedFor => {
-                // The balancer appended last, so the last entry is its word and
-                // the ones before it are the caller's: not read, only counted,
-                // so that a chain past `MAX_HOPS` is refused.
-                let mut entries = line.rsplit(',');
-                let last = entries.next().unwrap_or("");
-                if entries.count() >= MAX_HOPS {
-                    return Err(Unattributed::Malformed);
-                }
-                Ok(last)
-            }
-            Self::CfConnectingIp => Ok(line),
+            Self::Peer => match PROXIED_BY
+                .into_iter()
+                .find(|header| headers.contains_key(*header))
+            {
+                Some(header) => Err(Unattributed::Proxied(header)),
+                None => Ok(ClientKey::from_ip(peer)),
+            },
+            Self::XForwardedFor => XForwardedFor.resolve(headers),
+            Self::CfConnectingIp => CfConnectingIp.resolve(headers),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::{
+        IpAddr,
+        Ipv4Addr,
+    };
+
     use axum::http::{
         HeaderMap,
         HeaderValue,
     };
 
     use super::{
+        CfConnectingIp,
         ClientIpHeader,
         ClientKey,
         ClientSource,
         Unattributed,
+        XForwardedFor,
         CF_CONNECTING_IP,
         FORWARDED_FOR,
     };
+
+    const PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
 
     fn xff(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -212,7 +273,7 @@ mod tests {
     #[test]
     fn a_single_entry_is_the_client() {
         assert_eq!(
-            ClientIpHeader::XForwardedFor.resolve(&xff("203.0.113.7")),
+            XForwardedFor.resolve(&xff("203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
     }
@@ -222,8 +283,7 @@ mod tests {
     #[test]
     fn the_rightmost_entry_wins_over_a_forged_prefix() {
         assert_eq!(
-            ClientIpHeader::XForwardedFor
-                .resolve(&xff("9.9.9.9, 10.60.5.90, 203.0.113.7")),
+            XForwardedFor.resolve(&xff("9.9.9.9, 10.60.5.90, 203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
     }
@@ -234,11 +294,11 @@ mod tests {
     #[test]
     fn a_malformed_entry_left_of_the_last_is_ignored() {
         assert_eq!(
-            ClientIpHeader::XForwardedFor.resolve(&xff("not-an-ip, 203.0.113.7")),
+            XForwardedFor.resolve(&xff("not-an-ip, 203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
         assert_eq!(
-            ClientIpHeader::XForwardedFor.resolve(&xff(", 203.0.113.7")),
+            XForwardedFor.resolve(&xff(", 203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
     }
@@ -247,11 +307,11 @@ mod tests {
     #[test]
     fn a_missing_header_is_refused() {
         assert_eq!(
-            ClientIpHeader::XForwardedFor.resolve(&HeaderMap::new()),
+            XForwardedFor.resolve(&HeaderMap::new()),
             Err(Unattributed::Missing)
         );
         assert_eq!(
-            ClientIpHeader::CfConnectingIp.resolve(&HeaderMap::new()),
+            CfConnectingIp.resolve(&HeaderMap::new()),
             Err(Unattributed::Missing)
         );
     }
@@ -263,14 +323,14 @@ mod tests {
         let mut repeated = xff("203.0.113.7");
         repeated.append(FORWARDED_FOR, HeaderValue::from_static("9.9.9.9"));
         assert_eq!(
-            ClientIpHeader::XForwardedFor.resolve(&repeated),
+            XForwardedFor.resolve(&repeated),
             Err(Unattributed::Repeated)
         );
 
         let mut repeated = cf("203.0.113.7");
         repeated.append(CF_CONNECTING_IP, HeaderValue::from_static("9.9.9.9"));
         assert_eq!(
-            ClientIpHeader::CfConnectingIp.resolve(&repeated),
+            CfConnectingIp.resolve(&repeated),
             Err(Unattributed::Repeated)
         );
     }
@@ -288,7 +348,7 @@ mod tests {
             "203.0.113.7, 999.1.1.1",
         ] {
             assert_eq!(
-                ClientIpHeader::XForwardedFor.resolve(&xff(bad)),
+                XForwardedFor.resolve(&xff(bad)),
                 Err(Unattributed::Malformed),
                 "{bad:?}"
             );
@@ -299,13 +359,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         assert_eq!(
-            ClientIpHeader::XForwardedFor.resolve(&xff(&long)),
+            XForwardedFor.resolve(&xff(&long)),
             Err(Unattributed::Malformed)
         );
 
         for bad in ["not-an-ip", "", "9.9.9.9, 203.0.113.7"] {
             assert_eq!(
-                ClientIpHeader::CfConnectingIp.resolve(&cf(bad)),
+                CfConnectingIp.resolve(&cf(bad)),
                 Err(Unattributed::Malformed),
                 "{bad:?}"
             );
@@ -323,12 +383,12 @@ mod tests {
             ("2001:db8::1", "2001:db8::"),
         ] {
             assert_eq!(
-                ClientIpHeader::XForwardedFor.resolve(&xff(entry)),
+                XForwardedFor.resolve(&xff(entry)),
                 Ok(key(expected)),
                 "{entry:?}"
             );
             assert_eq!(
-                ClientIpHeader::CfConnectingIp.resolve(&cf(entry)),
+                CfConnectingIp.resolve(&cf(entry)),
                 Ok(key(expected)),
                 "{entry:?}"
             );
@@ -342,21 +402,15 @@ mod tests {
     fn cf_mode_reads_cf_connecting_ip_and_ignores_x_forwarded_for() {
         let mut both = cf("203.0.113.7");
         both.insert(FORWARDED_FOR, HeaderValue::from_static("9.9.9.9"));
-        assert_eq!(
-            ClientIpHeader::CfConnectingIp.resolve(&both),
-            Ok(key("203.0.113.7"))
-        );
-        assert_eq!(
-            ClientIpHeader::XForwardedFor.resolve(&both),
-            Ok(key("9.9.9.9"))
-        );
+        assert_eq!(CfConnectingIp.resolve(&both), Ok(key("203.0.113.7")));
+        assert_eq!(XForwardedFor.resolve(&both), Ok(key("9.9.9.9")));
 
         assert_eq!(
-            ClientIpHeader::CfConnectingIp.resolve(&xff("9.9.9.9")),
+            CfConnectingIp.resolve(&xff("9.9.9.9")),
             Err(Unattributed::Missing)
         );
         assert_eq!(
-            ClientIpHeader::XForwardedFor.resolve(&cf("203.0.113.7")),
+            XForwardedFor.resolve(&cf("203.0.113.7")),
             Err(Unattributed::Missing)
         );
     }
@@ -379,12 +433,77 @@ mod tests {
         assert_ne!(key("::ffff:203.0.113.7"), key("::"));
 
         assert_eq!(
-            ClientIpHeader::XForwardedFor.resolve(&xff("9.9.9.9, ::ffff:203.0.113.7")),
+            XForwardedFor.resolve(&xff("9.9.9.9, ::ffff:203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
         assert_eq!(
-            ClientIpHeader::CfConnectingIp.resolve(&cf("::ffff:203.0.113.7")),
+            CfConnectingIp.resolve(&cf("::ffff:203.0.113.7")),
             Ok(key("203.0.113.7"))
         );
+    }
+
+    /// On a port reached directly, the peer is the client: keyed as any
+    /// address is, with nothing in the headers read.
+    #[test]
+    fn the_peer_is_the_client_on_a_port_reached_directly() {
+        assert_eq!(
+            ClientIpHeader::Peer.client(PEER, &HeaderMap::new()),
+            Ok(key("203.0.113.7"))
+        );
+        for (peer, expected) in [
+            ("::ffff:203.0.113.7", "203.0.113.7"),
+            ("2001:db8:abcd:1234::1", "2001:db8:abcd::"),
+        ] {
+            assert_eq!(
+                ClientIpHeader::Peer.client(peer.parse().unwrap(), &HeaderMap::new()),
+                Ok(key(expected)),
+                "{peer:?}"
+            );
+        }
+    }
+
+    /// A proxy's header on that port means the request came through a proxy
+    /// the configuration does not know about, so the peer would be the
+    /// proxy: refused, whichever header, and never keyed on the peer.
+    #[test]
+    fn a_proxied_request_on_a_peer_keyed_port_is_refused() {
+        assert_eq!(
+            ClientIpHeader::Peer.client(PEER, &xff("9.9.9.9")),
+            Err(Unattributed::Proxied(FORWARDED_FOR))
+        );
+        assert_eq!(
+            ClientIpHeader::Peer.client(PEER, &cf("9.9.9.9")),
+            Err(Unattributed::Proxied(CF_CONNECTING_IP))
+        );
+        let mut both = xff("9.9.9.9");
+        both.insert(CF_CONNECTING_IP, HeaderValue::from_static("8.8.8.8"));
+        assert!(matches!(
+            ClientIpHeader::Peer.client(PEER, &both),
+            Err(Unattributed::Proxied(_))
+        ));
+    }
+
+    /// A header mode is its source's word: the peer is never read, and a
+    /// request the source cannot attribute is refused, not keyed on the peer.
+    #[test]
+    fn a_header_mode_is_its_sources_word_and_never_the_peer() {
+        assert_eq!(
+            ClientIpHeader::XForwardedFor.client(PEER, &xff("9.9.9.9, 198.51.100.4")),
+            Ok(key("198.51.100.4"))
+        );
+        assert_eq!(
+            ClientIpHeader::CfConnectingIp.client(PEER, &cf("198.51.100.4")),
+            Ok(key("198.51.100.4"))
+        );
+        for mode in [
+            ClientIpHeader::XForwardedFor,
+            ClientIpHeader::CfConnectingIp,
+        ] {
+            assert_eq!(
+                mode.client(PEER, &HeaderMap::new()),
+                Err(Unattributed::Missing),
+                "{mode}"
+            );
+        }
     }
 }
