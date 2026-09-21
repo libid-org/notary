@@ -104,9 +104,9 @@ async-trait = "0.1"
 # rustls-platform-verifier and its Android JNI tree into the lockfile for
 # nothing.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
-tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "95b4f04cdd509caf645c4dfb2eeb695909b4179e" }
-tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "95b4f04cdd509caf645c4dfb2eeb695909b4179e" }
-tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "95b4f04cdd509caf645c4dfb2eeb695909b4179e" }
+tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "da0f8488dfc55db8ed4271f817124306a2c07c09" }
+tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "da0f8488dfc55db8ed4271f817124306a2c07c09" }
+tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "da0f8488dfc55db8ed4271f817124306a2c07c09" }
 tokio = { version = "1", features = ["test-util"] }
 # The same tungstenite axum uses, so the test graph carries one copy.
 tokio-tungstenite = "0.29"
@@ -115,13 +115,14 @@ tokio-tungstenite = "0.29"
 libc = "0.2"
 
 # libid-org/tlsn#3 (merged) moved that branch onto libid-org/mpz 4db9454 and the
-# typed KOS `InstanceId` from libid-org/mpz#1. This pin extends that integration
-# with proxy EOF and SDK session-closure handling; keep the MPZ block matched.
+# typed KOS `InstanceId` from libid-org/mpz#1, and libid-org/tlsn#4 fails a proxy
+# session its peer or target interrupted. This pin is the merge commit on
+# integration/notary-alpha15, and it and the MPZ block below move together.
 [patch."https://github.com/tlsnotary/tlsn"]
 # WIP: TLSNotary #1178 reclaims the channel, #1179 preserves hash-opening
 # order, #1173 fixes RCOT preprocessing deadlocks, and libid-org/tlsn#2 bounds
 # verifier transcript allocation. Return to a release containing the fixes.
-tlsn = { git = "https://github.com/libid-org/tlsn", rev = "95b4f04cdd509caf645c4dfb2eeb695909b4179e" }
+tlsn = { git = "https://github.com/libid-org/tlsn", rev = "da0f8488dfc55db8ed4271f817124306a2c07c09" }
 
 # TLSNotary #1173 also needs privacy-ethereum/mpz#446 KOS instance-domain
 # separation. libid-org/mpz carries that on top of alpha.6, plus libid-org/mpz#2
