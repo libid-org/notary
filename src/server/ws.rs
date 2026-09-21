@@ -470,6 +470,18 @@ impl NotaryState {
                         limit,
                     })
                 }
+                Err(Error::UpstreamConnectFailed { authority, detail }) => {
+                    let _ = end_tx.send(SessionEnd::Aborted(CloseFrame {
+                        code: CloseCode::Error.into(),
+                        reason: close_reason(
+                            "UPSTREAM_CONNECT_FAILED",
+                            &authority,
+                            &detail,
+                        )
+                        .into(),
+                    }));
+                    Err(Error::UpstreamConnectFailed { authority, detail })
+                }
                 Err(error) => {
                     drop(end_tx);
                     Err(error)
@@ -493,6 +505,15 @@ impl NotaryState {
                 used,
                 limit,
                 "ProxyMode session aborted: data cap exceeded; nothing attested"
+            ),
+            Ok(Err(Error::ProverLeft)) => {
+                info!(%peer, "ProxyMode: browser left before its first TLS byte")
+            }
+            Ok(Err(Error::UpstreamConnectFailed { authority, detail })) => warn!(
+                %peer,
+                authority,
+                detail,
+                "ProxyMode: target unreachable; nothing attested"
             ),
             Ok(Err(e)) => error!(%peer, "ProxyMode verifier error: {}", e),
             Err(_) => error!(
@@ -590,8 +611,15 @@ impl NotaryState {
                 async {
                     forward_upstream(proxy_io, &server_addr, Arc::clone(&cap))
                         .await
-                        .map_err(|e| Error::NotaryServer {
-                            detail: format!("upstream {server_name_str}: {e}"),
+                        .map_err(|end| match end {
+                            UpstreamEnd::ProverLeft => Error::ProverLeft,
+                            UpstreamEnd::Connect(error) => Error::UpstreamConnectFailed {
+                                authority: server_name_str.clone(),
+                                detail: error.to_string(),
+                            },
+                            UpstreamEnd::Relay(error) => Error::NotaryServer {
+                                detail: format!("upstream {server_name_str}: {error}"),
+                            },
                         })
                 }
             )
@@ -714,25 +742,54 @@ impl NotaryState {
     }
 }
 
-/// Do not expose an idle provider connection while the prover prepares TLS.
-/// The bounded pipe holds the first bytes until the target connection is ready.
+/// How the upstream relay ended without a session: the prover left before
+/// its first TLS byte, the target could not be dialled, or the relay that had
+/// started failed.
+#[derive(Debug)]
+enum UpstreamEnd {
+    ProverLeft,
+    Connect(std::io::Error),
+    Relay(std::io::Error),
+}
+
+/// Relay the prover's TLS bytes to the target, dialling it on the first byte.
+/// Until then the target sees nothing, so it cannot drop an idle connection
+/// while the prover prepares.
 async fn forward_upstream(
     socket: tokio::io::DuplexStream,
     server_addr: &str,
     cap: Arc<DataCap>,
-) -> std::io::Result<()> {
+) -> std::result::Result<(), UpstreamEnd> {
     let mut socket = tokio::io::BufReader::new(socket);
-    if socket.fill_buf().await?.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "prover closed before starting TLS",
-        ));
+    match socket.fill_buf().await {
+        Ok([]) => return Err(UpstreamEnd::ProverLeft),
+        Ok(_) => {}
+        Err(error) => return Err(UpstreamEnd::Relay(error)),
     }
     info!("ProxyMode: connecting to {server_addr}");
-    let server = tokio::net::TcpStream::connect(server_addr).await?;
+    let server = tokio::net::TcpStream::connect(server_addr)
+        .await
+        .map_err(UpstreamEnd::Connect)?;
     let mut server = CappedIo::new(server, cap);
-    tokio::io::copy_bidirectional(&mut socket, &mut server).await?;
+    tokio::io::copy_bidirectional(&mut socket, &mut server)
+        .await
+        .map_err(UpstreamEnd::Relay)?;
     Ok(())
+}
+
+/// A close-frame reason, `<CODE>: <authority>: <detail>`, cut to the
+/// 123 bytes a close frame carries, on a character boundary.
+fn close_reason(code: &str, authority: &str, detail: &str) -> String {
+    const BUDGET: usize = 123;
+    let mut reason = format!("{code}: {authority}: {detail}");
+    if reason.len() > BUDGET {
+        let mut end = BUDGET;
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+    }
+    reason
 }
 
 /// How a ProxyMode WebSocket ends once the session is over: with the
@@ -773,12 +830,16 @@ async fn first_relayed_bytes(
 fn driver_finished_early<T, E: std::fmt::Display>(
     result: std::result::Result<std::result::Result<T, E>, tokio::task::JoinError>,
 ) -> Error {
-    let detail = match result {
-        Ok(Ok(_)) => "driver task finished before the session completed".into(),
-        Ok(Err(e)) => format!("driver task: {e}"),
-        Err(e) => format!("driver task join: {e}"),
-    };
-    Error::NotaryServer { detail }
+    match result {
+        // The mux closed cleanly before a session: the browser went away.
+        Ok(Ok(_)) => Error::ProverLeft,
+        Ok(Err(e)) => Error::NotaryServer {
+            detail: format!("driver task: {e}"),
+        },
+        Err(e) => Error::NotaryServer {
+            detail: format!("driver task join: {e}"),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1121,7 +1182,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(matches!(error, super::UpstreamEnd::ProverLeft));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1233,8 +1294,8 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(
-            !matches!(error, crate::error::Error::NotaryServer { .. }),
-            "a browser leaving reads as a server error: {error}"
+            matches!(error, crate::error::Error::ProverLeft),
+            "a browser leaving reads as something else: {error}"
         );
     }
 

@@ -23,6 +23,17 @@ pub enum Error {
         /// The configured cap.
         limit: usize,
     },
+    /// The ProxyMode target could not be dialled; nothing was relayed.
+    #[error("ProxyMode target {authority} unreachable: {detail}")]
+    UpstreamConnectFailed {
+        /// The server name the browser asked for.
+        authority: String,
+        /// The connect error, as the operating system put it.
+        detail: String,
+    },
+    /// The browser left after setup and before its first TLS byte.
+    #[error("ProxyMode browser left before its first TLS byte")]
+    ProverLeft,
     /// The revealed HTTP request line could not be parsed.
     #[error("malformed request line: {detail}")]
     MalformedRequestLine {
