@@ -53,6 +53,7 @@ use tlsn::{
     Session,
 };
 use tokio::io::{
+    AsyncBufReadExt,
     AsyncReadExt,
     AsyncWriteExt,
 };
@@ -530,8 +531,6 @@ impl NotaryState {
         let established = AtomicBool::new(false);
         let established = &established;
 
-        // An inner error means a rejection was sent and the driver must be joined
-        // before returning; an outer error can abort the guarded driver.
         let setup = async {
             let verifier = handle
                 .new_verifier(
@@ -561,26 +560,11 @@ impl NotaryState {
 
             let server_name_str =
                 proxy_verifier.config().server_name().as_str().to_string();
-            info!("ProxyMode: connecting to {server_name_str}:443");
-
             let server_addr = self
                 .proxy_server_addr
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|| format!("{server_name_str}:443"));
-            let server_tcp = match tokio::net::TcpStream::connect(server_addr).await {
-                Ok(server_tcp) => server_tcp,
-                Err(error) => {
-                    let detail = format!("TCP connect to {server_name_str}: {error}");
-                    proxy_verifier
-                        .reject(Some("UPSTREAM_CONNECT_FAILED"))
-                        .await
-                        .map_err(|error| Error::NotaryServer {
-                            detail: format!("send connection rejection: {error}"),
-                        })?;
-                    handle.close();
-                    return Ok(Err(Error::NotaryServer { detail }));
-                }
-            };
+            let (server_io, proxy_io) = tokio::io::duplex(RELAY_PIPE_BYTES);
 
             // The relay is the only unbounded thing in ProxyMode: tlsn buffers
             // every relayed byte for the tag check that follows, so the cap on the
@@ -588,27 +572,40 @@ impl NotaryState {
             // the relay mid-stream; the transcript is never shortened, because a
             // shortened one would attest as complete.
             let cap = Arc::clone(relayed);
-            let verifier = proxy_verifier
-                .accept()
-                .await
-                .map_err(|e| Error::NotaryServer {
-                    detail: format!("verifier accept: {e}"),
-                })?
-                .run(CappedIo::new(server_tcp, Arc::clone(&cap)).compat())
-                .await
-                .map_err(|e| {
-                    if cap.exceeded() {
-                        Error::ProxyDataCapExceeded {
-                            authority: server_name_str.clone(),
-                            used: cap.used(),
-                            limit: cap.limit(),
-                        }
-                    } else {
+            let verifier =
+                proxy_verifier
+                    .accept()
+                    .await
+                    .map_err(|e| Error::NotaryServer {
+                        detail: format!("verifier accept: {e}"),
+                    })?;
+            let (verifier, ()) = tokio::try_join!(
+                async {
+                    verifier.run(server_io.compat()).await.map_err(|e| {
                         Error::NotaryServer {
                             detail: format!("run_proxy: {e}"),
                         }
+                    })
+                },
+                async {
+                    forward_upstream(proxy_io, &server_addr, Arc::clone(&cap))
+                        .await
+                        .map_err(|e| Error::NotaryServer {
+                            detail: format!("upstream {server_name_str}: {e}"),
+                        })
+                }
+            )
+            .map_err(|error| {
+                if cap.exceeded() {
+                    Error::ProxyDataCapExceeded {
+                        authority: server_name_str.clone(),
+                        used: cap.used(),
+                        limit: cap.limit(),
                     }
-                })?;
+                } else {
+                    error
+                }
+            })?;
             established.store(true, Ordering::Release);
 
             let verifier = verifier.verify().await.map_err(|e| Error::NotaryServer {
@@ -641,7 +638,7 @@ impl NotaryState {
             })?;
             handle.close();
 
-            Ok::<_, Error>(Ok((server_name, transcript, transcript_commitments)))
+            Ok::<_, Error>((server_name, transcript, transcript_commitments))
         };
         tokio::pin!(setup);
 
@@ -664,29 +661,19 @@ impl NotaryState {
                 (&mut setup).await?
             }
         };
-        let join_driver = |driver_task: AbortOnDrop<_>| async move {
-            match finished_driver {
-                Some(res) => res,
-                None => driver_task.into_inner().await,
-            }
-        };
-        let (server_name, transcript, transcript_commitments) = match setup_outcome {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = join_driver(driver_task).await;
-                return Err(error);
-            }
-        };
+        let (server_name, transcript, transcript_commitments) = setup_outcome;
 
-        let io = join_driver(driver_task)
-            .await
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("driver join: {e}"),
-            })?
-            .map_err(|e| Error::NotaryServer {
-                detail: format!("driver: {e}"),
-            })?
-            .into_inner();
+        let io = match finished_driver {
+            Some(res) => res,
+            None => driver_task.into_inner().await,
+        }
+        .map_err(|e| Error::NotaryServer {
+            detail: format!("driver join: {e}"),
+        })?
+        .map_err(|e| Error::NotaryServer {
+            detail: format!("driver: {e}"),
+        })?
+        .into_inner();
         drop(io);
 
         // The host is attested, not restricted: the record carries the
@@ -725,6 +712,27 @@ impl NotaryState {
         info!("ProxyMode: attestation ready for {domain}");
         Ok(attestation)
     }
+}
+
+/// Do not expose an idle provider connection while the prover prepares TLS.
+/// The bounded pipe holds the first bytes until the target connection is ready.
+async fn forward_upstream(
+    socket: tokio::io::DuplexStream,
+    server_addr: &str,
+    cap: Arc<DataCap>,
+) -> std::io::Result<()> {
+    let mut socket = tokio::io::BufReader::new(socket);
+    if socket.fill_buf().await?.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "prover closed before starting TLS",
+        ));
+    }
+    info!("ProxyMode: connecting to {server_addr}");
+    let server = tokio::net::TcpStream::connect(server_addr).await?;
+    let mut server = CappedIo::new(server, cap);
+    tokio::io::copy_bidirectional(&mut socket, &mut server).await?;
+    Ok(())
 }
 
 /// How a ProxyMode WebSocket ends once the session is over: with the
@@ -776,6 +784,7 @@ fn driver_finished_early<T, E: std::fmt::Display>(
 #[cfg(test)]
 mod tests {
     use crate::server::tests::ONE_SESSION_AT_A_TIME;
+    use std::sync::Arc;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_protocol_returns_attestation_on_the_reclaimed_websocket() {
@@ -838,12 +847,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target_listener.set_nonblocking(true).unwrap();
         let target_addr = target_listener.local_addr().unwrap();
-        let target_task = tokio::spawn(async move {
-            let (socket, _) = target_listener.accept().await.unwrap();
-            tlsn_server_fixture::bind(socket.compat()).await.unwrap();
-        });
 
         let signer = SignerSource::from_spec(TEST_KEY)
             .unwrap()
@@ -913,6 +919,16 @@ mod tests {
         let protocol = async {
             let mut prover = SdkProver::new(prover_config.clone()).unwrap();
             prover.setup(browser_io.compat()).await.unwrap();
+            assert_eq!(
+                target_listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "setup exposed an idle connection to the target"
+            );
+            let target_listener = TcpListener::from_std(target_listener).unwrap();
+            let target_task = tokio::spawn(async move {
+                let (socket, _) = target_listener.accept().await.unwrap();
+                tlsn_server_fixture::bind(socket.compat()).await.unwrap();
+            });
             let response = prover
                 .send_request_proxy(
                     HttpRequest::get(format!("https://{SERVER_DOMAIN}/bytes?size=16"))
@@ -962,9 +978,10 @@ mod tests {
             .unwrap();
             assert_eq!(recovered.to_encoded_point(true).as_bytes(), expected_pubkey);
             assert_eq!(io.read(&mut [0]).await.unwrap(), 0);
+            target_task
         };
 
-        tokio::time::timeout(Duration::from_secs(30), protocol)
+        let target_task = tokio::time::timeout(Duration::from_secs(30), protocol)
             .await
             .expect("local ProxyMode smoke timed out");
         pump_task.await.unwrap();
@@ -1046,13 +1063,129 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(3), failed_session)
             .await
             .expect("server connect failure was not propagated to the prover");
-        assert!(
-            result.unwrap_err().contains("UPSTREAM_CONNECT_FAILED"),
-            "server connect failure lost its public diagnostic"
-        );
+        // Setup is accepted before dialing; a refused target now fails the
+        // HTTP operation through the closed transport, not a setup rejection.
+        assert!(result.is_err(), "refused target must fail the session");
         failed_pump.await.unwrap();
         notary_task.abort();
         drop(session_slot);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upstream_waits_for_tls_and_closes_when_cancelled() {
+        use std::time::Duration;
+        use tokio::{
+            io::{
+                AsyncReadExt,
+                AsyncWriteExt,
+            },
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let cap = super::DataCap::new(1024);
+        let (mut prover, relay) = tokio::io::duplex(32);
+        let count = Arc::clone(&cap);
+        let pump =
+            tokio::spawn(
+                async move { super::forward_upstream(relay, &address, count).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), listener.accept())
+                .await
+                .is_err()
+        );
+        prover.write_all(b"TLS").await.unwrap();
+        let (mut target, _) = listener.accept().await.unwrap();
+        let mut bytes = [0; 3];
+        target.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"TLS");
+        target.write_all(b"OK").await.unwrap();
+        prover.read_exact(&mut bytes[..2]).await.unwrap();
+        assert_eq!(&bytes[..2], b"OK");
+        assert_eq!(cap.used(), 5);
+        pump.abort();
+        assert!(pump.await.unwrap_err().is_cancelled());
+        assert_eq!(target.read(&mut bytes).await.unwrap(), 0);
+        assert_eq!(prover.read(&mut bytes).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_tls_does_not_dial_the_target() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (prover, relay) = tokio::io::duplex(32);
+        drop(prover);
+        let error = super::forward_upstream(
+            relay,
+            &listener.local_addr().unwrap().to_string(),
+            super::DataCap::new(1024),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upstream_eof_during_handshake_reaches_the_prover() {
+        use std::time::Duration;
+        use tlsn_sdk_core::{
+            HttpRequest,
+            ProverConfig,
+            ProverMode,
+            SdkProver,
+        };
+        use tlsn_server_fixture_certs::{
+            CA_CERT_DER,
+            SERVER_DOMAIN,
+        };
+        use tokio::{
+            io::AsyncReadExt,
+            net::TcpListener,
+        };
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        let _slot = ONE_SESSION_AT_A_TIME.lock().await;
+        let config = ProverConfig::builder(SERVER_DOMAIN)
+            .mode(ProverMode::Proxy)
+            .root_certs(vec![CA_CERT_DER.to_vec()])
+            .build()
+            .unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state =
+            super::NotaryState::for_tests(crate::server::tests::test_signer().await);
+        state.proxy_root_store = Arc::new(config.root_store.clone());
+        state.proxy_server_addr = Some(target.local_addr().unwrap());
+        let target_task = tokio::spawn(async move {
+            let (mut socket, _) = target.accept().await.unwrap();
+            assert!(socket.read(&mut [0; 1024]).await.unwrap() > 0);
+            // TCP succeeded and ClientHello arrived, but no ServerHello follows.
+        });
+        let (client, server) = tokio::io::duplex(super::RELAY_PIPE_BYTES);
+        let server_task = tokio::spawn(async move {
+            state
+                .run_proxy_verifier_session(server, &super::DataCap::new(100_000))
+                .await
+        });
+        let mut prover = SdkProver::new(config).unwrap();
+        prover.setup(client.compat()).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            prover.send_request_proxy(
+                HttpRequest::get(format!("https://{SERVER_DOMAIN}/"))
+                    .header("Host", SERVER_DOMAIN),
+            ),
+        )
+        .await
+        .expect("early upstream EOF left the HTTP operation pending");
+        assert!(result.is_err());
+        target_task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server_task)
+            .await
+            .expect("notary retained a failed session")
+            .unwrap()
+            .unwrap_err();
     }
 
     /// The limits an operator sets, tripped for real: the ProxyMode data cap.
