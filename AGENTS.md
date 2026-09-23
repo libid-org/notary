@@ -30,3 +30,27 @@
 - Use semantic types such as `feat`, `fix`, `docs`, `refactor`, `test`, `build`,
   `ci`, `chore`, `perf`, or `revert`.
 - Mark breaking changes with `!` before `:` or a `BREAKING CHANGE:` footer.
+
+## Scope discipline
+
+- Keep each change focused. Do not bundle unrelated cleanup, refactoring, or
+  redesign with the requested work.
+- Preserve existing behavior outside the requested scope.
+- Reuse existing project patterns before adding new abstractions or dependencies.
+- Edit source files rather than generated output. If generated artifacts are
+  tracked, regenerate them with the repository's documented workflow.
+
+## Verification
+
+- Run the repository-documented formatting, linting, type checks, tests, and
+  builds relevant to the change.
+- Review the final diff and report any checks that were skipped or blocked.
+- For UI changes, review affected views at narrow and wide widths and preserve
+  keyboard access, visible focus, readable contrast, navigation, and assets.
+
+## Pull requests and releases
+
+- Unless the user explicitly asks otherwise, work on a focused, short-lived
+  branch and open or update a pull request. Use the repository's pull request
+  template when one exists.
+- Do not merge, release, publish, or deploy without explicit user authorization.
