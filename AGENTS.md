@@ -21,3 +21,12 @@
 - Preserve existing sign-offs during rebases, amendments, and cherry-picks.
 - Before pushing, verify every outgoing commit contains the required matching
   trailer.
+
+## Commit messages
+
+- Every commit you create must follow
+  [Conventional Commits](https://www.conventionalcommits.org/):
+  `<type>[optional scope][!]: <description>`.
+- Use semantic types such as `feat`, `fix`, `docs`, `refactor`, `test`, `build`,
+  `ci`, `chore`, `perf`, or `revert`.
+- Mark breaking changes with `!` before `:` or a `BREAKING CHANGE:` footer.
