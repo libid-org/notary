@@ -139,6 +139,12 @@ jobs:
           missing=0
           for sha in $(git rev-list --no-merges "$range"); do
             author=$(git log -1 --format='%an <%ae>' "$sha")
+            # Dependabot signs off with its support address, not its author address.
+            if [ "$author" = 'dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>' ] \
+              && git log -1 --format=%B "$sha" \
+                | grep -Fxiq 'Signed-off-by: dependabot[bot] <support@github.com>'; then
+              continue
+            fi
             if git log -1 --format=%B "$sha" \
               | grep -Fxiq "Signed-off-by: $author"; then
               continue
