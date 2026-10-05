@@ -732,8 +732,9 @@ impl NotaryState {
             );
         }
 
-        // What the prover revealed is not read or judged here: which ranges a
-        // profile expects is the Platform Verifier's (REQ-COMMON-33).
+        // What the prover revealed is not read or judged here (REQ-COMMON-33):
+        // which ranges a profile expects is the Platform Verifier's
+        // (REQ-COMMON-18A).
         let Some(partial) = partial_transcript else {
             return Err(Error::NotaryServer {
                 detail: "session revealed no transcript".into(),

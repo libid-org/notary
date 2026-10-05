@@ -32,7 +32,7 @@
 //! session it describes.
 //!
 //! Its signature alone registers nothing. A contract on the Consumer Chain
-//! authenticates it -- the Notary Service, spec section 9.1 --
+//! authenticates it -- the Notary Service, ceremony-common section 9.1 --
 //! and NOT the proving circuit: an attestation is authenticated on chain, and
 //! the circuit proves only what cannot be read from authenticated evidence.
 
