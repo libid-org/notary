@@ -20,7 +20,7 @@ The libID notary service. One binary, one signing identity, one record.
 The notary is the MPC-TLS or ProxyMode verifier for a prover's HTTPS session
 and signs the attested data of the authenticated transcript, laid out in
 section 4.1 of libID's
-[platform-ceremonies specification](https://github.com/libid-org/libID/blob/main/specs/platform-ceremonies.md).
+[platform-ceremonies specification](https://github.com/libid-org/libID/blob/main/specs/platform-ceremonies.md#41-attested-data).
 Every session gets the same record, `{ attested_data, notary_signature }`,
 whatever the prover talked to: the record carries the certificate-verified
 server name, and the contract that reads it pins the authority it expects. Its
