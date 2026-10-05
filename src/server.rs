@@ -2,10 +2,10 @@
 //!
 //! # Endpoints
 //!
-//! - **TCP** (`--port`): MPC-TLS verifier for Rust backend provers. The section
-//!   9.1 attestation is written back down the socket the prover
-//!   opened. Nothing here dispatches on the server name: the record carries
-//!   it, and the contract that reads the record pins it.
+//! - **TCP** (`--port`): MPC-TLS verifier for Rust backend provers. The
+//!   attestation of platform-ceremonies section 4.1 is written back down the
+//!   socket the prover opened. Nothing here dispatches on the server name: the
+//!   record carries it, and the contract that reads the record pins it.
 //! - **GET  /info**: returns `{version, publicKey}` — compatible with tlsn-js.
 //! - **GET  /healthcheck**: `{"status":"ok"}`, or 503 `{"status":"draining"}`
 //!   once the process has been told to stop.
@@ -27,9 +27,9 @@
 //!
 //! The notary is one half of a 2-of-2 trust scheme. Having taken part as the
 //! MPC-TLS or ProxyMode verifier, it signs what it observed, and one thing
-//! only: the section 9.1 attested data. Both transports produce the same
-//! record, because the transport says nothing about the TLS session it
-//! describes.
+//! only: the attested data of platform-ceremonies section 4.1. Both transports
+//! produce the same record, because the transport says nothing about the TLS
+//! session it describes.
 //!
 //! Its signature alone registers nothing. A contract on the Consumer Chain
 //! authenticates it -- the Notary Service, spec section 9.1 --
