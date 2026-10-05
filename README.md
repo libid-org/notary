@@ -18,12 +18,14 @@ revisions would lose those fixes. The exact revisions are pinned in
 The libID notary service. One binary, one signing identity, one record.
 
 The notary is the MPC-TLS or ProxyMode verifier for a prover's HTTPS session
-and signs the section 9.1 attested data of the authenticated transcript. Every
-session gets the same record, `{ attested_data, notary_signature }`, whatever
-the prover talked to: the record carries the certificate-verified server name,
-and the contract that reads it pins the authority it expects. Its signature
-registers nothing by itself; the on-chain `NotaryService` authenticates it, and
-the public key is served at `/info`.
+and signs the attested data of the authenticated transcript, laid out in
+section 4.1 of libID's
+[platform-ceremonies specification](https://github.com/libid-org/libID/blob/main/specs/platform-ceremonies.md).
+Every session gets the same record, `{ attested_data, notary_signature }`,
+whatever the prover talked to: the record carries the certificate-verified
+server name, and the contract that reads it pins the authority it expects. Its
+signature registers nothing by itself; the on-chain `NotaryService`
+authenticates it, and the public key is served at `/info`.
 
 ## Listeners
 
@@ -57,7 +59,7 @@ On the public port:
 |---|---|
 | `GET /info` | `{version, publicKey}`: compressed SEC1 notary public key, hex |
 | `GET /healthcheck` | `200` while serving; `503` from SIGTERM until the process exits. Point health checks here, not at `/` |
-| `WS /notarize-proxy` | ProxyMode session, then one binary message carrying the length-prefixed section 9.1 attestation |
+| `WS /notarize-proxy` | ProxyMode session, then one binary message carrying the length-prefixed attestation of platform-ceremonies section 4.1 |
 | `WS /internal/notarize-proxy` | The same session for our own services, no per-client limits, its own pool; `404` unless `--internal-proxy-route`, `403` behind a proxy header |
 
 ProxyMode dials the target when the prover's first TLS bytes arrive, so a

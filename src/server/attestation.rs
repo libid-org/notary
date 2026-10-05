@@ -1,8 +1,9 @@
-//! The section 9.1 attestation: the attested data for what a
-//! session observed, and the notary's signature over its keccak256.
+//! The attestation of platform-ceremonies section 4.1: the attested data
+//! for what a session observed, and the notary's signature over its
+//! keccak256.
 //!
 //! The record carries nothing the notary derived by applying a profile
-//! rule -- no handle, account, client or chain address (REQ-COMMON-61).
+//! rule -- no handle, account, client or chain address.
 //! Each is derivable from the revealed ranges, and a second signed
 //! representation could disagree with the bytes it was taken from.
 
@@ -29,8 +30,8 @@ use crate::error::{
 };
 
 impl NotaryState {
-    /// Build the section 9.1 attested data for one completed session, stamped
-    /// with the notary's own clock, and sign it.
+    /// Build the attested data of platform-ceremonies section 4.1 for one
+    /// completed session, stamped with the notary's own clock, and sign it.
     ///
     /// Both transports end here and receive the same record on their reclaimed
     /// channel, because transport says nothing about the TLS session it
@@ -58,7 +59,7 @@ impl NotaryState {
         })?;
 
         // The notary signs `keccak256(attestedData)` and no other preimage
-        // (REQ-COMMON-47).
+        // (platform-ceremonies section 4.1).
         let notary_signature = self
             .signer
             .sign_claim(&libid_crypto::keccak256(&encoded))
