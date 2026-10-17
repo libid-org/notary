@@ -39,17 +39,16 @@ e2e = []
 
 [dependencies]
 # ── libid-rs shared crates ──────────────────────────────────────────────────
-# All five ride the same git source, at the same tag, so their intra-workspace
-# `path` deps unify. libid-tlsn is git-only (upstream tlsn is not on crates.io)
-# and exposes sibling-crate types, so mixing the crates.io copies with the git
-# copy would put two incompatible versions of the same types in the graph.
-# The upstream `tlsn` git rev is pinned by libid-tlsn and arrives the same way;
-# the direct `tlsn` entry below MUST name the same rev.
-#
-libid-crypto = { git = "https://github.com/libid-org/libID-rs", rev = "6473d545f84b7bbeda57c28fe8d4e54853db4edc" }
-libid-signer = { git = "https://github.com/libid-org/libID-rs", rev = "6473d545f84b7bbeda57c28fe8d4e54853db4edc" }
-libid-tlsn = { git = "https://github.com/libid-org/libID-rs", rev = "6473d545f84b7bbeda57c28fe8d4e54853db4edc" }
-libid-transcript = { git = "https://github.com/libid-org/libID-rs", rev = "6473d545f84b7bbeda57c28fe8d4e54853db4edc" }
+# libid-tlsn is git-only (upstream tlsn is not on crates.io); the other three
+# come from crates.io at the same release. libid-tlsn exposes libid-transcript
+# types, so the `[patch]` below points its libid-transcript at the crates.io
+# copy: one copy of every type in the graph. The upstream `tlsn` git rev is
+# pinned by libid-tlsn and arrives the same way; the direct `tlsn` entry below
+# MUST name the same rev.
+libid-crypto = "0.7"
+libid-signer = "0.7"
+libid-tlsn = { git = "https://github.com/libid-org/libID-rs", tag = "v0.7.0" }
+libid-transcript = "0.7"
 
 # TLSNotary main plus tlsnotary/tlsn#1200, on libid-org/tlsn
 # `integration/upstream-main`. The pin MUST equal libid-tlsn's (same source →
@@ -114,3 +113,8 @@ tokio-tungstenite = "0.29"
 # The drain test sends the real binary a SIGTERM. Already in the graph
 # through tokio.
 libc = "0.2"
+
+# libid-tlsn's dependency on libid-transcript resolves inside its git
+# workspace; this points it at the crates.io copy the notary names above.
+[patch."https://github.com/libid-org/libID-rs"]
+libid-transcript = "0.7"
