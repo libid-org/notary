@@ -3,8 +3,6 @@
 //! the release binary and the one the e2e suite runs, so a signal is handled
 //! the same way in both.
 
-use tracing::info;
-
 use crate::{
     server::{
         self,
@@ -34,18 +32,18 @@ pub fn serve(
         .build()?
         .block_on(async {
             let handle = server::run_with(config, upstream).await?;
-            info!(
+            tracing::info!(
                 mpc = ?handle.local_addr(),
                 ws = ?handle.ws_local_addr(),
                 "Notary server up"
             );
             let mut signals = StopSignals::new()?;
             let signal = signals.next().await;
-            info!(signal, "stop requested; draining");
+            tracing::info!(signal, "stop requested; draining");
             tokio::select! {
                 () = handle.drain() => {}
                 signal = signals.next() => {
-                    info!(signal, "second signal: stopping without waiting");
+                    tracing::info!(signal, "second signal: stopping without waiting");
                     handle.shutdown();
                 }
             }
