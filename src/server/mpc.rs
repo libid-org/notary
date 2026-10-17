@@ -98,12 +98,10 @@ impl NotaryState {
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
     {
         let transcript = &result.partial_transcript;
-        let sent = transcript.sent_unsafe();
-        let recv = transcript.received_unsafe();
         info!(
             "Verification complete: {} sent, {} recv bytes",
-            sent.len(),
-            recv.len()
+            transcript.len_sent(),
+            transcript.len_received()
         );
 
         let ServerName::Dns(ref dns_name) = result.server_name;
