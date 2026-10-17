@@ -58,11 +58,6 @@ use tokio::io::{
     AsyncWriteExt,
 };
 use tokio_util::compat::TokioAsyncReadCompatExt;
-use tracing::{
-    error,
-    info,
-    warn,
-};
 use tungstenite::protocol::frame::coding::CloseCode;
 
 use super::{
@@ -127,7 +122,7 @@ pub(super) async fn internal_notarize_proxy_ws_handler(
         .into_iter()
         .find(|header| headers.contains_key(*header))
     {
-        warn!(
+        tracing::warn!(
             %peer,
             header,
             "ProxyMode (internal): request arrived through a proxy; refused with 403. \
@@ -167,7 +162,7 @@ impl NotaryState {
         // Nothing new once the process is stopping; the sessions already
         // running finish, and the balancer has been told by the health check.
         if self.draining.load(Ordering::SeqCst) {
-            info!(%peer, "ProxyMode: upgrade refused, notary is draining");
+            tracing::info!(%peer, "ProxyMode: upgrade refused, notary is draining");
             return (StatusCode::SERVICE_UNAVAILABLE, "notary is draining")
                 .into_response();
         }
@@ -178,7 +173,7 @@ impl NotaryState {
         let client = match tier {
             Tier::Internal => {
                 if self.internal_proxy_sessions.available_permits() == 0 {
-                    info!(%peer, "ProxyMode (internal): all session slots busy; upgrade refused with 503");
+                    tracing::info!(%peer, "ProxyMode (internal): all session slots busy; upgrade refused with 503");
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
                 None
@@ -210,7 +205,7 @@ impl NotaryState {
         let client = match self.client_ip_header.client(peer.ip(), headers) {
             Ok(client) => client,
             Err(reason) => {
-                info!(%peer, %reason, "ProxyMode: upgrade refused, client unidentified");
+                tracing::info!(%peer, %reason, "ProxyMode: upgrade refused, client unidentified");
                 return Err((StatusCode::BAD_REQUEST, reason.to_string()).into_response());
             }
         };
@@ -221,7 +216,7 @@ impl NotaryState {
         // No slot is reserved here; it is taken on the browser's first relayed
         // bytes, so an upgraded socket that stays silent holds nothing.
         if self.proxy_sessions.available_permits() == 0 {
-            info!(%peer, "ProxyMode: all session slots busy; upgrade refused with 503");
+            tracing::info!(%peer, "ProxyMode: all session slots busy; upgrade refused with 503");
             return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
 
@@ -229,11 +224,11 @@ impl NotaryState {
         // cannot answer is a refusal: a limit that fails open under a store
         // outage is a limit an attacker can switch off.
         let store_down = |error: store::StoreError| {
-            warn!(%peer, %client, %error, "ProxyMode: upgrade refused, limits store unavailable");
+            tracing::warn!(%peer, %client, %error, "ProxyMode: upgrade refused, limits store unavailable");
             (StatusCode::SERVICE_UNAVAILABLE, "limits store unavailable").into_response()
         };
         let too_many = |what: &str| {
-            info!(%peer, %client, "ProxyMode: upgrade refused with 429, {what} window full");
+            tracing::info!(%peer, %client, window = what, "ProxyMode: upgrade refused with 429, window full");
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(RETRY_AFTER, RETRY_AFTER_SECS)],
@@ -287,14 +282,14 @@ impl NotaryState {
         {
             Ok(Some(first)) => first,
             Ok(None) => {
-                info!(%peer, "ProxyMode: browser closed before starting a session");
+                tracing::info!(%peer, "ProxyMode: browser closed before starting a session");
                 return;
             }
             Err(_) => {
-                info!(
+                tracing::info!(
                     %peer,
-                    "ProxyMode: no session data within the {}s setup deadline; closing",
-                    self.setup_deadline.as_secs()
+                    setup_deadline = ?self.setup_deadline,
+                    "ProxyMode: no session data within the setup deadline; closing"
                 );
                 let _ = ws_tx
                     .send(Message::Close(Some(CloseFrame {
@@ -331,10 +326,10 @@ impl NotaryState {
                     {
                         Ok(Some(lease)) => Some(lease),
                         Ok(None) => {
-                            info!(
+                            tracing::info!(
                                 %peer, %client,
-                                "ProxyMode: client already running {} sessions; refused with 1013",
-                                self.max_sessions_per_ip
+                                max_sessions = self.max_sessions_per_ip,
+                                "ProxyMode: client already running its maximum sessions; refused with 1013"
                             );
                             let _ = ws_tx
                                 .send(Message::Close(Some(CloseFrame {
@@ -346,7 +341,7 @@ impl NotaryState {
                             return;
                         }
                         Err(error) => {
-                            warn!(%peer, %client, %error, "ProxyMode: session refused, limits store unavailable");
+                            tracing::warn!(%peer, %client, %error, "ProxyMode: session refused, limits store unavailable");
                             let _ = ws_tx
                                 .send(Message::Close(Some(CloseFrame {
                                     code: CloseCode::Again.into(),
@@ -364,7 +359,7 @@ impl NotaryState {
 
         // Held for the session lifetime; dropping it returns the slot.
         let Ok(permit) = Arc::clone(pool).try_acquire_owned() else {
-            info!(%peer, "ProxyMode: all session slots busy; session refused with 1013");
+            tracing::info!(%peer, "ProxyMode: all session slots busy; session refused with 1013");
             let _ = ws_tx
                 .send(Message::Close(Some(CloseFrame {
                     code: CloseCode::Again.into(),
@@ -487,7 +482,7 @@ impl NotaryState {
                 }
             };
             if let Err(error) = outbound_task.into_inner().await {
-                error!("ProxyMode WebSocket outbound pump join error: {error}");
+                tracing::error!(%error, "ProxyMode WebSocket outbound pump join error");
             }
             result
         };
@@ -498,7 +493,7 @@ impl NotaryState {
                 authority,
                 used,
                 limit,
-            })) => error!(
+            })) => tracing::error!(
                 %peer,
                 authority,
                 used,
@@ -506,19 +501,21 @@ impl NotaryState {
                 "ProxyMode session aborted: data cap exceeded; nothing attested"
             ),
             Ok(Err(Error::ProverLeft)) => {
-                info!(%peer, "ProxyMode: browser left before the session was established")
+                tracing::info!(%peer, "ProxyMode: browser left before the session was established")
             }
-            Ok(Err(Error::UpstreamConnectFailed { authority, detail })) => warn!(
+            Ok(Err(Error::UpstreamConnectFailed { authority, detail })) => {
+                tracing::warn!(
+                    %peer,
+                    authority,
+                    detail,
+                    "ProxyMode: target unreachable; nothing attested"
+                )
+            }
+            Ok(Err(e)) => tracing::error!(%peer, error = %e, "ProxyMode verifier error"),
+            Err(_) => tracing::error!(
                 %peer,
-                authority,
-                detail,
-                "ProxyMode: target unreachable; nothing attested"
-            ),
-            Ok(Err(e)) => error!(%peer, "ProxyMode verifier error: {}", e),
-            Err(_) => error!(
-                %peer,
-                "ProxyMode session exceeded the {}s connection deadline; aborting",
-                self.connection_deadline.as_secs()
+                connection_deadline = ?self.connection_deadline,
+                "ProxyMode session exceeded the connection deadline; aborting"
             ),
         }
 
@@ -721,14 +718,16 @@ impl NotaryState {
 
         let partial_transcript = transcript;
         if let Some(ref pt) = partial_transcript {
-            info!(
-                "ProxyMode verified: {} sent, {} recv bytes for {domain}",
-                pt.sent_unsafe().len(),
-                pt.received_unsafe().len()
+            tracing::info!(
+                %domain,
+                sent = pt.len_sent(),
+                recv = pt.len_received(),
+                "ProxyMode verified"
             );
         } else {
-            info!(
-                "ProxyMode verified: no transcript revealed for {domain} (commits only)"
+            tracing::info!(
+                %domain,
+                "ProxyMode verified: no transcript revealed (commits only)"
             );
         }
 
@@ -744,7 +743,7 @@ impl NotaryState {
         let attestation = self
             .attest(&partial, dns_name.as_str(), &transcript_commitments)
             .await?;
-        info!("ProxyMode: attestation ready for {domain}");
+        tracing::info!(%domain, "ProxyMode: attestation ready");
         Ok(attestation)
     }
 }
@@ -773,7 +772,7 @@ async fn forward_upstream(
         Ok(_) => {}
         Err(error) => return Err(UpstreamEnd::Relay(error)),
     }
-    info!("ProxyMode: connecting to {server_addr}");
+    tracing::info!(%server_addr, "ProxyMode: connecting");
     let server = tokio::net::TcpStream::connect(server_addr)
         .await
         .map_err(UpstreamEnd::Connect)?;

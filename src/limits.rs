@@ -26,7 +26,6 @@ use tokio::io::{
     AsyncWrite,
     ReadBuf,
 };
-use tracing::warn;
 
 /// Bytes one relay read takes from a socket at a time: a few TLS records.
 pub const RELAY_READ_BYTES: usize = 1 << 16;
@@ -115,7 +114,7 @@ pub fn available_cores() -> Option<NonZeroUsize> {
     match std::thread::available_parallelism() {
         Ok(cores) => Some(cores),
         Err(error) => {
-            warn!(
+            tracing::warn!(
                 %error,
                 "cannot determine the available core count; a per-core limit \
                  resolves as for one core -- set a raw value to override"

@@ -76,12 +76,6 @@ use tokio::{
 };
 use tokio_util::task::TaskTracker;
 use tower::Service;
-use tracing::{
-    debug,
-    error,
-    info,
-    warn,
-};
 
 use crate::{
     config::{
@@ -170,14 +164,14 @@ impl NotaryServerHandle {
         let _ = self.phase.send(Phase::Draining);
         self.in_flight.close();
         let open = self.in_flight.len();
-        info!(
+        tracing::info!(
             sessions = open,
             deadline_secs = self.drain_deadline.as_secs(),
             "draining: no new sessions; waiting for the ones in flight"
         );
         match tokio::time::timeout(self.drain_deadline, self.in_flight.wait()).await {
-            Ok(()) => info!("drained: every session finished"),
-            Err(_) => warn!(
+            Ok(()) => tracing::info!("drained: every session finished"),
+            Err(_) => tracing::warn!(
                 sessions = self.in_flight.len(),
                 "drain deadline reached with sessions still running; stopping anyway"
             ),
@@ -332,7 +326,7 @@ pub async fn run_with(
         .map_err(|detail| Error::NotaryServer { detail })?;
     let mut proxy_root_store = libid_tlsn::root_store();
     let proxy_upstream = upstream.map(|upstream| {
-        warn!(
+        tracing::warn!(
             addr = %upstream.addr,
             extra_root = upstream.ca.is_some(),
             "every ProxyMode session dials the upstream override"
@@ -354,7 +348,7 @@ pub async fn run_with(
     let signer = SignerSource::from_spec(&config.signing_key)?
         .build_managed(None)
         .await?;
-    info!(
+    tracing::info!(
         notary = %signer.address(),
         via = %signer.describe(),
         "notary signer ready"
@@ -367,7 +361,7 @@ pub async fn run_with(
     // before any MPC work is done, and they are not tunable from here.
     let cores = available_cores();
     let mpc_max_sessions = config.mpc_max_sessions.resolve(cores);
-    info!(
+    tracing::info!(
         proxy_max_sessions = config.max_sessions,
         internal_max_sessions = config.internal_max_sessions,
         proxy_max_bytes = config.proxy_max_bytes,
@@ -416,8 +410,8 @@ pub async fn run_with(
     };
     let local_addr = tcp_listener.as_ref().and_then(|l| l.local_addr().ok());
     match local_addr {
-        Some(addr) => info!("Notary MPC-TLS listening on {addr} (internal)"),
-        None => info!("Notary MPC-TLS port off (--port not set)"),
+        Some(addr) => tracing::info!(%addr, "Notary MPC-TLS listening (internal)"),
+        None => tracing::info!("Notary MPC-TLS port off (--port not set)"),
     }
 
     // ── Public HTTP/WebSocket server (browser / tlsn-js) ──────────────
@@ -429,20 +423,20 @@ pub async fn run_with(
     };
     let ws_local_addr = ws_listener.as_ref().and_then(|l| l.local_addr().ok());
     match ws_local_addr {
-        Some(addr) => info!("Notary WebSocket listening on {addr} (public)"),
-        None => info!("Notary public WebSocket port off (--ws-port 0)"),
+        Some(addr) => tracing::info!(%addr, "Notary WebSocket listening (public)"),
+        None => tracing::info!("Notary public WebSocket port off (--ws-port 0)"),
     }
     // The internal route rides the public port; the balancer has to block
     // it, and this line is what an operator checks against that config.
     if config.internal_proxy_route {
-        info!(
+        tracing::info!(
             internal_proxy_route = true,
             route = Tier::Internal.route(),
             "internal ProxyMode route mounted on the public port; no per-client \
              limits, the load balancer must answer 403 for /internal/*"
         );
     } else {
-        info!(
+        tracing::info!(
             internal_proxy_route = false,
             "internal ProxyMode route off (--internal-proxy-route not set)"
         );
@@ -457,22 +451,22 @@ pub async fn run_with(
                     result = tcp_listener.accept() => {
                         match result {
                             Ok((stream, peer)) => {
-                                info!("TCP connection from {}", peer);
+                                tracing::info!(%peer, "TCP connection");
                                 let s = tcp_state.clone();
                                 let in_flight = s.in_flight.token();
                                 tokio::spawn(async move {
                                     if let Err(e) = s.handle_tcp_prover(stream).await {
-                                        error!("TCP handler error for {}: {}", peer, e);
+                                        tracing::error!(%peer, error = %e, "TCP handler error");
                                     }
                                     drop(in_flight);
                                 });
                             }
-                            Err(e) => error!("TCP accept failed: {}", e),
+                            Err(e) => tracing::error!(error = %e, "TCP accept failed"),
                         }
                     }
                     // Any change is at least Draining: stop accepting.
                     _ = tcp_phase.changed() => {
-                        info!("Notary TCP shutting down");
+                        tracing::info!("Notary TCP shutting down");
                         // Provers still waiting for a slot fail now with a clear
                         // error; the ones holding a slot keep it to the end.
                         tcp_state.mpc_sessions.close();
@@ -501,8 +495,8 @@ pub async fn run_with(
             tokio::select! {
                 () = tokio::time::sleep(SWEEP_EVERY) => {
                     match sweep_store.sweep().await {
-                        Ok(rows) => debug!(rows, "limits store swept"),
-                        Err(error) => warn!(%error, "limits store sweep failed"),
+                        Ok(rows) => tracing::debug!(rows, "limits store swept"),
+                        Err(error) => tracing::warn!(%error, "limits store sweep failed"),
                     }
                 }
                 _ = sweep_phase.changed() => break,
@@ -551,7 +545,7 @@ fn spawn_http_server(
                     Ok(accepted) => accepted,
                     Err(error) if is_peer_error(&error) => continue,
                     Err(error) => {
-                        error!(%error, "HTTP accept failed");
+                        tracing::error!(%error, "HTTP accept failed");
                         tokio::time::sleep(ACCEPT_RETRY).await;
                         continue;
                     }
@@ -609,7 +603,7 @@ async fn serve_connection(
         }
     };
     if let Err(error) = served {
-        debug!(%peer, %error, "HTTP connection ended");
+        tracing::debug!(%peer, %error, "HTTP connection ended");
     }
 }
 

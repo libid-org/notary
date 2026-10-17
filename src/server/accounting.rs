@@ -4,8 +4,6 @@
 
 use std::sync::Arc;
 
-use tracing::warn;
-
 use super::NotaryState;
 use crate::{
     client_ip::ClientKey,
@@ -79,7 +77,7 @@ impl Drop for Accounting {
             }
             // The runtime itself is going away; the lease expires by itself.
             Err(_) => {
-                warn!(client = %bill.client, "ProxyMode: no runtime to settle a session's accounting")
+                tracing::warn!(client = %bill.client, "ProxyMode: no runtime to settle a session's accounting")
             }
         }
     }
@@ -94,12 +92,12 @@ impl Bill {
                 .charge(&self.client, Dimension::Bytes, used as u64, &self.windows)
                 .await
             {
-                warn!(client = %self.client, used, %error, "ProxyMode: relayed bytes not charged");
+                tracing::warn!(client = %self.client, used, %error, "ProxyMode: relayed bytes not charged");
             }
         }
         if let Some(lease) = self.lease {
             if let Err(error) = self.store.release(&lease).await {
-                warn!(client = %self.client, %error, "ProxyMode: session lease not released; it expires by itself");
+                tracing::warn!(client = %self.client, %error, "ProxyMode: session lease not released; it expires by itself");
             }
         }
     }

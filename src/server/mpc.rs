@@ -15,7 +15,6 @@ use tokio::{
     io::AsyncReadExt,
     sync::TryAcquireError,
 };
-use tracing::info;
 
 use super::NotaryState;
 use crate::{
@@ -61,11 +60,11 @@ impl NotaryState {
                 Ok(slot) => slot,
                 Err(TryAcquireError::Closed) => return Err(shutting_down()),
                 Err(TryAcquireError::NoPermits) => {
-                    info!("MPC-TLS: all session slots busy; prover queued");
+                    tracing::info!("MPC-TLS: all session slots busy; prover queued");
                     let queued = Instant::now();
                     let slot =
                         slots.acquire_owned().await.map_err(|_| shutting_down())?;
-                    info!(
+                    tracing::info!(
                         waited_ms = queued.elapsed().as_millis(),
                         "MPC-TLS: prover left the queue and starts its session"
                     );
@@ -98,17 +97,15 @@ impl NotaryState {
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
     {
         let transcript = &result.partial_transcript;
-        let sent = transcript.sent_unsafe();
-        let recv = transcript.received_unsafe();
-        info!(
-            "Verification complete: {} sent, {} recv bytes",
-            sent.len(),
-            recv.len()
+        tracing::info!(
+            sent = transcript.len_sent(),
+            recv = transcript.len_received(),
+            "Verification complete"
         );
 
         let ServerName::Dns(ref dns_name) = result.server_name;
         let domain = dns_name.as_str().to_string();
-        info!("Domain from SNI: {}", domain);
+        tracing::info!(%domain, "Domain from SNI");
 
         // One record whatever host the session reached: whether that host was
         // wanted is the reading contract's decision, not the notary's
@@ -123,7 +120,7 @@ impl NotaryState {
 
         let mut io = result.recovered_io;
         write_msg(&mut io, &attestation).await?;
-        info!("attestation sent to prover");
+        tracing::info!("attestation sent to prover");
 
         Ok(())
     }
