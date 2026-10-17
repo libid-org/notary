@@ -723,8 +723,8 @@ impl NotaryState {
         if let Some(ref pt) = partial_transcript {
             info!(
                 "ProxyMode verified: {} sent, {} recv bytes for {domain}",
-                pt.sent_unsafe().len(),
-                pt.received_unsafe().len()
+                pt.len_sent(),
+                pt.len_received()
             );
         } else {
             info!(
