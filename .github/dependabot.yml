@@ -14,11 +14,20 @@ updates:
       - dependency-type: "all"
     patterns: ["*"]
     multi-ecosystem-group: "dependencies"
+    cooldown:
+      default-days: 14
+    ignore:
+      - dependency-name: "alloy*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "docker"
     directory: "/"
     patterns: ["*"]
     multi-ecosystem-group: "dependencies"
+    cooldown:
+      default-days: 14
   - package-ecosystem: "github-actions"
     directory: "/"
     patterns: ["*"]
     multi-ecosystem-group: "dependencies"
+    cooldown:
+      default-days: 14
