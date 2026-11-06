@@ -38,6 +38,7 @@ use axum::{
     },
 };
 use futures_util::{
+    FutureExt,
     SinkExt,
     StreamExt,
 };
@@ -620,7 +621,15 @@ impl NotaryState {
             // finishing.
             let verifier = tokio::select! {
                 biased;
-                verifier = &mut run => verifier.map_err(run_error),
+                verifier = &mut run => verifier.map_err(|error| {
+                    // A prover leaving before its first TLS byte ends `run` as
+                    // well, short of the `ProxyFinished` it never sent; the
+                    // relay, which never dialled, tells the two apart.
+                    match (&mut relay).now_or_never() {
+                        Some(Err(UpstreamEnd::ProverLeft)) => Error::ProverLeft,
+                        _ => run_error(error),
+                    }
+                }),
                 end = &mut relay => match end {
                     Err(end) => Err(relay_error(end)),
                     Ok(()) => run.await.map_err(run_error),
