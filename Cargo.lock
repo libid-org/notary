@@ -3674,9 +3674,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libid-crypto"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff8dc4fd83ed2d2c72ccb9a6d6b4f676cf219d9930c9be5ca2e7e70cf2e54a5c"
+checksum = "7dd245f43dfe19ac2e511d9a13d421c8b2543f990614ea1687346e87d566c03b"
 dependencies = [
  "hex",
  "k256",
@@ -3693,9 +3693,9 @@ checksum = "5f714719f6dfceaee491304487cbeb92c4b95c7a03fdd3135fe4872c5b2e770f"
 
 [[package]]
 name = "libid-signer"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "457ce8cc5e54d6a6beac191d9d76675cb4de84a612d1f445742439d08dd34ffa"
+checksum = "a1bbe030fc32f2b2febaa471192ed15b2a5160e803048171113a215b7d30c28d"
 dependencies = [
  "alloy",
  "aws-config",
@@ -3706,8 +3706,8 @@ dependencies = [
 
 [[package]]
 name = "libid-tlsn"
-version = "0.7.0"
-source = "git+https://github.com/libid-org/libID-rs?rev=7334b569cabc3c7732d54d96222d21071fed716c#7334b569cabc3c7732d54d96222d21071fed716c"
+version = "0.8.0"
+source = "git+https://github.com/libid-org/libID-rs?tag=v0.8.0#d49c02ee58eeff0ff7bf90dc25fd8df03f7e87cb"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -3723,9 +3723,9 @@ dependencies = [
 
 [[package]]
 name = "libid-transcript"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44bde04e43bd33da1a3c4304f759818ad77d626fb879b3b6e0a94ae2295a6399"
+checksum = "469a8a681058eef1c0ef404080582b01abd1d148d89a2da8a9369fc8ff194f6a"
 dependencies = [
  "bincode 2.0.1",
  "httparse",
