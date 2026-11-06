@@ -9,11 +9,9 @@ MPC-TLS and to browser clients over HTTP/WebSocket, including ProxyMode. We
 are grateful to the TLSNotary contributors for building and sharing the
 excellent protocol that makes this service possible.
 
-Builds use [`tlsn`](https://github.com/libid-org/tlsn) from the
-`integration/upstream-main` branch: TLSNotary's `main` plus
-[tlsnotary/tlsn#1200](https://github.com/tlsnotary/tlsn/pull/1200), which fails
-a ProxyMode handshake when the server closes instead of hanging. The exact
-revision is pinned in `Cargo.toml` and `Cargo.lock`.
+Builds use [`tlsn`](https://github.com/tlsnotary/tlsn) from TLSNotary's `main`,
+which has cut no release since `v0.1.0-alpha.15`. The exact revision is pinned in
+`Cargo.toml` and `Cargo.lock`.
 
 The libID notary service. One binary, one signing identity, one record.
 

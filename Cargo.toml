@@ -47,16 +47,15 @@ e2e = []
 # MUST name the same rev.
 libid-crypto = "0.7"
 libid-signer = "0.7"
-libid-tlsn = { git = "https://github.com/libid-org/libID-rs", tag = "v0.7.0" }
+libid-tlsn = { git = "https://github.com/libid-org/libID-rs", rev = "7334b569cabc3c7732d54d96222d21071fed716c" }
 libid-transcript = "0.7"
 
-# TLSNotary main plus tlsnotary/tlsn#1200, on libid-org/tlsn
-# `integration/upstream-main`. The pin MUST equal libid-tlsn's (same source →
-# cargo unifies to one copy; a divergent rev would produce two incompatible
-# `tlsn` crates and type errors at the libid-tlsn boundary). The wasm bundle
-# script reads this pin back out of Cargo.lock so the browser prover can
-# never drift onto a different tlsn version than the server.
-tlsn = { git = "https://github.com/libid-org/tlsn", rev = "fa50b0d5ca6145a04fba167125c56c3631fe24ff" }
+# TLSNotary main at tlsnotary/tlsn#1209. The pin MUST equal libid-tlsn's
+# (same source → cargo unifies to one copy; a divergent rev would produce two
+# incompatible `tlsn` crates and type errors at the libid-tlsn boundary). The
+# wasm bundle script reads this pin back out of Cargo.lock so the browser
+# prover can never drift onto a different tlsn version than the server.
+tlsn = { git = "https://github.com/tlsnotary/tlsn", rev = "01fab038b10d0ed0c8865c0afe1f6d14559fb90e" }
 
 # ── server ──────────────────────────────────────────────────────────────────
 anyhow = "1.0"
@@ -104,9 +103,9 @@ async-trait = "0.1"
 # rustls-platform-verifier and its Android JNI tree into the lockfile for
 # nothing.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
-tlsn-sdk-core = { git = "https://github.com/libid-org/tlsn", rev = "fa50b0d5ca6145a04fba167125c56c3631fe24ff" }
-tlsn-server-fixture = { git = "https://github.com/libid-org/tlsn", rev = "fa50b0d5ca6145a04fba167125c56c3631fe24ff" }
-tlsn-server-fixture-certs = { git = "https://github.com/libid-org/tlsn", rev = "fa50b0d5ca6145a04fba167125c56c3631fe24ff" }
+tlsn-sdk-core = { git = "https://github.com/tlsnotary/tlsn", rev = "01fab038b10d0ed0c8865c0afe1f6d14559fb90e" }
+tlsn-server-fixture = { git = "https://github.com/tlsnotary/tlsn", rev = "01fab038b10d0ed0c8865c0afe1f6d14559fb90e" }
+tlsn-server-fixture-certs = { git = "https://github.com/tlsnotary/tlsn", rev = "01fab038b10d0ed0c8865c0afe1f6d14559fb90e" }
 tokio = { version = "1", features = ["test-util"] }
 # The same tungstenite axum uses, so the test graph carries one copy.
 tokio-tungstenite = "0.29"
