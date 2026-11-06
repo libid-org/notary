@@ -660,13 +660,15 @@ mod tests {
         store.release(&a).await?; // twice is not an error
         store.release(&LeaseId::new()).await?; // nor is an unknown lease
 
-        // An expired lease no longer counts.
+        // An expired lease no longer counts. A zero ttl expires the lease as
+        // it is taken, so no wait races a slow runner.
         let c = fresh_client();
-        let short = Duration::from_millis(50);
-        assert!(store.try_lease(&c, 1, short).await?.is_some());
-        assert!(store.try_lease(&c, 1, short).await?.is_none());
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(store.try_lease(&c, 1, short).await?.is_some(), "expired");
+        assert!(store.try_lease(&c, 1, Duration::ZERO).await?.is_some());
+        assert!(store.try_lease(&c, 1, long).await?.is_some(), "expired");
+        assert!(
+            store.try_lease(&c, 1, long).await?.is_none(),
+            "the live lease counts"
+        );
 
         // A count is refused when any window is full, and then counts in no
         // window: the 2h window still has room afterwards.
@@ -753,7 +755,10 @@ mod tests {
         // a lease with time left, a window that is still open.
         let c = fresh_client();
         for _ in 0..3 {
-            store.try_lease(&c, 3, short).await?.expect("lease");
+            store
+                .try_lease(&c, 3, Duration::ZERO)
+                .await?
+                .expect("lease");
         }
         let second = "10/1s".parse::<WindowLimits>().unwrap();
         store.charge(&c, Dimension::Bytes, 1, &second).await?;
