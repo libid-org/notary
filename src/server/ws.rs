@@ -623,10 +623,11 @@ impl NotaryState {
                 biased;
                 verifier = &mut run => verifier.map_err(|error| {
                     // A prover leaving before its first TLS byte ends `run` as
-                    // well, short of the `ProxyFinished` it never sent; the
-                    // relay, which never dialled, tells the two apart.
+                    // well, with an I/O error for the `ProxyFinished` it never
+                    // sent; the relay, which never dialled, tells the two apart.
+                    // Any other error is the notary's own.
                     match (&mut relay).now_or_never() {
-                        Some(Err(UpstreamEnd::ProverLeft)) => Error::ProverLeft,
+                        Some(Err(UpstreamEnd::ProverLeft)) if error.is_io() => Error::ProverLeft,
                         _ => run_error(error),
                     }
                 }),
