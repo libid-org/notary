@@ -1,6 +1,7 @@
 name: CI
 
-# Three PR jobs: rust (fmt/clippy/test), dco, and scripts (bash syntax).
+# Four PR jobs: rust (fmt/clippy/test), dco, scripts (bash syntax) and
+# tlsn-lock (Cargo.lock's tlsn commit).
 # Releases run their own workflow (release.yml) which re-runs the rust checks
 # before publishing anything.
 #
@@ -80,7 +81,7 @@ jobs:
         run: cargo +"$NIGHTLY" fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Tests
         env:
@@ -89,7 +90,7 @@ jobs:
           # the job instead of skipping them. The user is a superuser: one
           # test ALTERs the database's default isolation and resets it.
           NOTARY_TEST_DATABASE_URL: postgres://postgres:notary@localhost:5432/postgres
-        run: cargo test --all --features e2e
+        run: cargo test --locked --all --features e2e
 
   # ---------------------------------------------------------------------------
   # DCO: every commit carries a Signed-off-by trailer, as CONTRIBUTING.md
@@ -176,3 +177,18 @@ jobs:
           set -euo pipefail
           find scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
           echo "All scripts parse."
+
+  # ---------------------------------------------------------------------------
+  # The manifest pins tlsn by tag, and a tag can move. The lock holds every
+  # tlsnotary/tlsn crate to the commit the tag named when it was pinned; the
+  # wasm bundle script builds the browser prover from that same commit.
+  # ---------------------------------------------------------------------------
+  tlsn-lock:
+    name: tlsn lock commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Every tlsn crate resolves to v0.1.0-beta.1's commit
+        run: ./scripts/tlsn-lock.sh 40a069565a2eaecbb5e691dbc634be20e8498daf
