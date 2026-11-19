@@ -53,9 +53,9 @@ libid-transcript = "0.8"
 # TLSNotary release v0.1.0-beta.1, commit 40a0695. The pin MUST equal
 # libid-tlsn's (same source → cargo unifies to one copy; a divergent pin would
 # produce two incompatible `tlsn` crates and type errors at the libid-tlsn
-# boundary). The
-# wasm bundle script reads this pin back out of Cargo.lock so the browser
-# prover can never drift onto a different tlsn version than the server.
+# boundary). The wasm bundle script reads this pin back out of Cargo.lock so
+# the browser prover can never drift onto a different tlsn version than the
+# server.
 tlsn = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-beta.1" }
 
 # ── server ──────────────────────────────────────────────────────────────────
