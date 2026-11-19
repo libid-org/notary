@@ -464,7 +464,7 @@ checksum = "9edb8520f2f94275e1caa73c85207dcc78ec402a9a4c429240f9a0783a8f16c0"
 dependencies = [
  "alloy-sol-macro-input",
  "const-hex",
- "heck 0.5.0",
+ "heck",
  "indexmap 2.14.2",
  "proc-macro-error3",
  "proc-macro2",
@@ -482,7 +482,7 @@ checksum = "66af2d9344882172993be5f5cbfd349fdfa52cb548f7af8715b446fb35ef6001"
 dependencies = [
  "const-hex",
  "dunce",
- "heck 0.5.0",
+ "heck",
  "macro-string",
  "proc-macro2",
  "quote",
@@ -1665,26 +1665,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7575182f7272186991736b70173b0ea045398f984bf5ebbb3804736ce1330c9d"
 
 [[package]]
-name = "bytemuck"
-version = "1.25.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
-dependencies = [
- "bytemuck_derive",
-]
-
-[[package]]
-name = "bytemuck_derive"
-version = "1.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a1f896587b6f2c069c73d2f0913e2d590c3990285cd2f0b6aa02b786b4c679c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.6",
-]
-
-[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1802,7 +1782,6 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
 dependencies = [
- "block-buffer 0.12.1",
  "crypto-common 0.2.2",
  "inout 0.2.2",
 ]
@@ -1835,7 +1814,7 @@ version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9c751b79415d4e559e3d1fcf128e09e720eb673a06d26cf6f392d37d75b66e0"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "proc-macro2",
  "quote",
  "syn 3.0.6",
@@ -1849,12 +1828,12 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "clmul"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
- "bytemuck",
  "cfg-if",
  "cpufeatures 0.3.1",
+ "zerocopy",
 ]
 
 [[package]]
@@ -2004,15 +1983,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.5.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2113,15 +2083,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
 dependencies = [
  "cipher 0.4.4",
-]
-
-[[package]]
-name = "ctr"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baaca1c4b237092596f64d571e9db6ce4109c4ef9742e27590f1709594461f21"
-dependencies = [
- "cipher 0.5.2",
 ]
 
 [[package]]
@@ -2605,18 +2566,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "enum-try-as-inner"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c448fc2753338b04aa344ead5a6bdda26f2df2dcd85b65c86dd15b16819369e"
-dependencies = [
- "heck 0.4.1",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3051,12 +3000,6 @@ checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
 dependencies = [
  "hashbrown 0.15.5",
 ]
-
-[[package]]
-name = "heck"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95505c38b4572b2d910cecb0281560f54b440a19336cbbcb27bf6ce6adc6f5a8"
 
 [[package]]
 name = "heck"
@@ -3707,7 +3650,7 @@ dependencies = [
 [[package]]
 name = "libid-tlsn"
 version = "0.8.0"
-source = "git+https://github.com/libid-org/libID-rs?tag=v0.8.0#d49c02ee58eeff0ff7bf90dc25fd8df03f7e87cb"
+source = "git+https://github.com/libid-org/libID-rs?rev=e4353e018e02a723117b7c9aac07cee17a78c84f#e4353e018e02a723117b7c9aac07cee17a78c84f"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -3814,8 +3757,8 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "matrix-transpose"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "thiserror 2.0.20",
 ]
@@ -3855,8 +3798,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-circuits"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "mpz-circuits-core",
  "mpz-circuits-data",
@@ -3864,8 +3807,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-circuits-core"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "bincode 1.3.3",
  "itybity 0.3.3",
@@ -3879,8 +3822,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-circuits-data"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "bincode 1.3.3",
  "mpz-circuits-core",
@@ -3888,22 +3831,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "mpz-cointoss"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
-dependencies = [
- "futures",
- "mpz-cointoss-core",
- "mpz-common",
- "mpz-core",
- "serio",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "mpz-cointoss-core"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "mpz-core",
  "opaque-debug",
@@ -3913,14 +3843,12 @@ dependencies = [
 
 [[package]]
 name = "mpz-common"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "async-task",
  "async-trait",
  "bytes",
- "cfg-if",
- "crossbeam-channel",
  "crossbeam-deque",
  "crossbeam-utils",
  "futures",
@@ -3935,14 +3863,13 @@ dependencies = [
 
 [[package]]
 name = "mpz-core"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "aes 0.9.3",
  "bcs 0.2.1",
  "bitvec",
  "blake3",
- "bytemuck",
  "cfg-if",
  "cipher 0.5.2",
  "clmul",
@@ -3951,24 +3878,26 @@ dependencies = [
  "once_cell",
  "opaque-debug",
  "rand 0.10.3",
- "rand_chacha 0.10.0",
  "rand_core 0.10.1",
  "rayon",
  "serde",
  "thiserror 2.0.20",
+ "zerocopy",
 ]
 
 [[package]]
 name = "mpz-fields"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
+ "cpufeatures 0.3.1",
  "crypto-bigint 0.7.5",
  "hybrid-array",
  "itybity 0.3.3",
  "mpz-core",
  "opaque-debug",
  "rand 0.10.3",
+ "rayon",
  "serde",
  "thiserror 2.0.20",
  "typenum",
@@ -3977,8 +3906,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-garble"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "async-trait",
  "derive_builder 0.20.2",
@@ -4003,8 +3932,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-garble-core"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "aes 0.9.3",
  "bitvec",
@@ -4018,7 +3947,6 @@ dependencies = [
  "mpz-core",
  "mpz-memory-core",
  "mpz-ot-core",
- "mpz-vm-core",
  "once_cell",
  "opaque-debug",
  "rand 0.10.3",
@@ -4034,8 +3962,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-hash"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "blake3",
  "itybity 0.3.3",
@@ -4047,8 +3975,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ideal-vm"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "async-trait",
  "futures",
@@ -4064,8 +3992,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-memory-core"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "blake3",
  "futures",
@@ -4079,8 +4007,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-ole"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "async-trait",
  "futures",
@@ -4097,11 +4025,10 @@ dependencies = [
 
 [[package]]
 name = "mpz-ole-core"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "hybrid-array",
- "itybity 0.3.3",
  "mpz-common",
  "mpz-core",
  "mpz-fields",
@@ -4113,15 +4040,13 @@ dependencies = [
 
 [[package]]
 name = "mpz-ot"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "async-trait",
  "cfg-if",
- "enum-try-as-inner",
  "futures",
  "itybity 0.3.3",
- "mpz-cointoss",
  "mpz-common",
  "mpz-core",
  "mpz-ot-core",
@@ -4136,24 +4061,23 @@ dependencies = [
 
 [[package]]
 name = "mpz-ot-core"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "aes 0.9.3",
  "blake3",
- "bytemuck",
  "cfg-if",
  "cipher 0.5.2",
  "clmul",
- "ctr 0.10.1",
  "curve25519-dalek",
  "derive_builder 0.20.2",
- "enum-try-as-inner",
  "futures",
  "itybity 0.3.3",
  "matrix-transpose",
+ "mpz-cointoss-core",
  "mpz-common",
  "mpz-core",
+ "mpz-fields",
  "opaque-debug",
  "rand 0.10.3",
  "rand_chacha 0.10.0",
@@ -4167,8 +4091,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-share-conversion"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "async-trait",
  "mpz-common",
@@ -4183,8 +4107,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-share-conversion-core"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "mpz-common",
  "mpz-core",
@@ -4197,8 +4121,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-vm-core"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "async-trait",
  "futures",
@@ -4210,8 +4134,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-zk"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4228,8 +4152,8 @@ dependencies = [
 
 [[package]]
 name = "mpz-zk-core"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/mpz2?rev=23e2cc08ed11ae86d71f72fb968f1273d70c9e88#23e2cc08ed11ae86d71f72fb968f1273d70c9e88"
 dependencies = [
  "blake3",
  "cfg-if",
@@ -4237,7 +4161,6 @@ dependencies = [
  "mpz-circuits",
  "mpz-core",
  "mpz-memory-core",
- "mpz-vm-core",
  "rand_chacha 0.10.0",
  "rangeset",
  "rayon",
@@ -5784,7 +5707,7 @@ checksum = "19a9c1841124ac5a61741f96e1d9e2ec77424bf323962dd894bdb93f37d5219b"
 dependencies = [
  "dotenvy",
  "either",
- "heck 0.5.0",
+ "heck",
  "hex",
  "once_cell",
  "proc-macro2",
@@ -6158,8 +6081,8 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tlsn"
-version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 dependencies = [
  "aes 0.8.4",
  "ctr 0.9.2",
@@ -6206,8 +6129,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-attestation"
-version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 dependencies = [
  "bcs 0.1.6",
  "blake3",
@@ -6224,8 +6147,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-cipher"
-version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 dependencies = [
  "aes 0.8.4",
  "async-trait",
@@ -6237,8 +6160,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-core"
-version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 dependencies = [
  "bimap",
  "blake3",
@@ -6266,8 +6189,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-deap"
-version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 dependencies = [
  "async-trait",
  "futures",
@@ -6283,8 +6206,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-hmac-sha256"
-version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 dependencies = [
  "mpz-circuits",
  "mpz-core",
@@ -6297,8 +6220,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-key-exchange"
-version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 dependencies = [
  "async-trait",
  "derive_builder 0.12.0",
@@ -6320,8 +6243,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-mpc-tls"
-version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -6370,8 +6293,8 @@ dependencies = [
 
 [[package]]
 name = "tlsn-sdk-core"
-version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 dependencies = [
  "bytes",
  "futures",
@@ -6397,7 +6320,7 @@ dependencies = [
 [[package]]
 name = "tlsn-server-fixture"
 version = "0.0.0"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 dependencies = [
  "anyhow",
  "axum",
@@ -6418,12 +6341,12 @@ dependencies = [
 [[package]]
 name = "tlsn-server-fixture-certs"
 version = "0.0.0"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 
 [[package]]
 name = "tlsn-tls-core"
-version = "0.1.0-alpha.16-pre"
-source = "git+https://github.com/tlsnotary/tlsn?rev=01fab038b10d0ed0c8865c0afe1f6d14559fb90e#01fab038b10d0ed0c8865c0afe1f6d14559fb90e"
+version = "0.1.0-beta.1"
+source = "git+https://github.com/tlsnotary/tlsn?tag=v0.1.0-beta.1#40a069565a2eaecbb5e691dbc634be20e8498daf"
 dependencies = [
  "futures",
  "hmac 0.12.1",
