@@ -80,16 +80,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # No required status check guards main, so a lock merged past a red
+      # tlsn-lock job would still release; the release checks it again.
+      - name: Every tlsn crate resolves to v0.1.0-beta.1's commit
+        run: ./scripts/tlsn-lock.sh 40a069565a2eaecbb5e691dbc634be20e8498daf
+
       - name: Formatting (nightly rustfmt)
         run: cargo +"$NIGHTLY" fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Tests
         env:
           NOTARY_TEST_DATABASE_URL: postgres://postgres:notary@localhost:5432/postgres
-        run: cargo test --all --features e2e
+        run: cargo test --locked --all --features e2e
 
   # Each platform compiles on a runner of its own architecture and pushes an
   # untagged image addressed only by digest; `docker-manifest` then joins the
