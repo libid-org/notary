@@ -1227,7 +1227,9 @@ mod tests {
         // session closes and its transport goes with it.
         drop(prover);
         handle.close();
-        drop(driver.await.unwrap().unwrap());
+        // The prover's driver may end on a broken pipe when the notary closes
+        // the transport first; only the notary's outcome is under test.
+        drop(driver.await.unwrap());
 
         let error = tokio::time::timeout(Duration::from_secs(3), server_task)
             .await
