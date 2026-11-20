@@ -45,10 +45,10 @@ e2e = []
 # copy: one copy of every type in the graph. The upstream `tlsn` git tag is
 # pinned by libid-tlsn and arrives the same way; the direct `tlsn` entry below
 # MUST name the same tag.
-libid-crypto = "0.8"
-libid-signer = "0.8"
-libid-tlsn = { git = "https://github.com/libid-org/libID-rs", rev = "e4353e018e02a723117b7c9aac07cee17a78c84f" }
-libid-transcript = "0.8"
+libid-crypto = "0.9"
+libid-signer = "0.9"
+libid-tlsn = { git = "https://github.com/libid-org/libID-rs", tag = "v0.9.0" }
+libid-transcript = "0.9"
 
 # TLSNotary release v0.1.0-beta.1, commit 40a0695. The pin MUST equal
 # libid-tlsn's (same source → cargo unifies to one copy; a divergent pin would
@@ -117,4 +117,4 @@ libc = "0.2"
 # libid-tlsn's dependency on libid-transcript resolves inside its git
 # workspace; this points it at the crates.io copy the notary names above.
 [patch."https://github.com/libid-org/libID-rs"]
-libid-transcript = "0.8"
+libid-transcript = "0.9"
