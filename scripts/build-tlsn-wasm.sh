@@ -19,8 +19,9 @@
 #
 # Outputs tlsn_wasm.js, tlsn_wasm_bg.wasm and the generated
 # snippets/web-spawn-*/js/spawn.js module into the --out dir (default:
-# tlsn-wasm/ in the repo root; gitignored). Set TLSN_WASM_CACHE to relocate the
-# tlsn checkout + cargo target dir (default: system temp).
+# tlsn-wasm/ in the repo root; gitignored), with a .tlsn-rev stamp naming the
+# tlsn commit it was built from. Set TLSN_WASM_CACHE to relocate the tlsn
+# checkout + cargo target dir (default: system temp).
 
 set -euo pipefail
 
@@ -44,21 +45,6 @@ done
 CACHE_DIR="${TLSN_WASM_CACHE:-${TMPDIR:-/tmp}/libid-tlsn-wasm}"
 IN_CI="${CI:-}"
 
-# This crate is far too slow to rebuild casually, so a bundle that is already
-# staged AND carries the API and worker tree we need is accepted as-is.
-shopt -s nullglob
-STAGED_SPAWNS=("$OUT_DIR"/snippets/web-spawn-*/js/spawn.js)
-if [ -z "${TLSN_WASM_FORCE:-}" ] \
-   && [ -f "$OUT_DIR/tlsn_wasm_bg.wasm" ] \
-   && grep -q "set_progress_callback" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null \
-   && grep -q "finish()" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null \
-   && [ "${#STAGED_SPAWNS[@]}" -eq 1 ] \
-   && [ -f "${STAGED_SPAWNS[0]}" ] \
-   && [ ! -e "$OUT_DIR/spawn.js" ]; then
-    echo "[tlsn-wasm] already staged — skipping (TLSN_WASM_FORCE=1 to rebuild)"
-    exit 0
-fi
-
 # ONE source of truth for the revision: the source this workspace's Cargo.lock
 # already resolved (it arrives via libid-tlsn and the direct dependency, which
 # cargo unifies), so the browser prover and the notary cannot drift onto
@@ -80,6 +66,23 @@ if [ "$(wc -l <<<"$TLSN_SOURCE")" -ne 1 ]; then
     exit 1
 fi
 read -r TLSN_REPO TLSN_REV <<<"$TLSN_SOURCE"
+
+# This crate is far too slow to rebuild casually, so a bundle that is already
+# staged, was built from the lock's tlsn commit (its .tlsn-rev stamp) AND
+# carries the API and worker tree we need is accepted as-is.
+shopt -s nullglob
+STAGED_SPAWNS=("$OUT_DIR"/snippets/web-spawn-*/js/spawn.js)
+if [ -z "${TLSN_WASM_FORCE:-}" ] \
+   && [ "$(cat "$OUT_DIR/.tlsn-rev" 2>/dev/null)" = "$TLSN_REV" ] \
+   && [ -f "$OUT_DIR/tlsn_wasm_bg.wasm" ] \
+   && grep -q "set_progress_callback" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null \
+   && grep -q "finish()" "$OUT_DIR/tlsn_wasm.js" 2>/dev/null \
+   && [ "${#STAGED_SPAWNS[@]}" -eq 1 ] \
+   && [ -f "${STAGED_SPAWNS[0]}" ] \
+   && [ ! -e "$OUT_DIR/spawn.js" ]; then
+    echo "[tlsn-wasm] already staged from tlsn @ ${TLSN_REV:0:8} — skipping (TLSN_WASM_FORCE=1 to rebuild)"
+    exit 0
+fi
 
 # rustup's bin must come FIRST: some CI images ship a non-rustup cargo that
 # cannot add targets, and if that one wins the build fails confusingly.
@@ -217,11 +220,13 @@ if ! grep -q "finish()" "$PKG/tlsn_wasm.js"; then
 fi
 
 mkdir -p "$OUT_DIR"
-rm -f "$OUT_DIR/spawn.js"
+rm -f "$OUT_DIR/.tlsn-rev" "$OUT_DIR/spawn.js"
 rm -rf "$OUT_DIR/snippets"
 mkdir -p "$OUT_DIR/$(dirname "$SPAWN_REL")"
 cp "$PKG/tlsn_wasm.js" "$PKG/tlsn_wasm_bg.wasm" "$OUT_DIR/"
 cp "$SPAWN" "$OUT_DIR/$SPAWN_REL"
+# Written last: a stamp names a bundle that was staged whole.
+printf '%s\n' "$TLSN_REV" > "$OUT_DIR/.tlsn-rev"
 
 echo ""
 echo "[tlsn-wasm] staged from tlsn @ ${TLSN_REV:0:8} into $OUT_DIR:"
